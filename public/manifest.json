@@ -1,0 +1,47 @@
+{
+  "manifest_version": 3,
+  "name": "Tranlithion 字幕翻译",
+  "version": "0.3.0",
+  "description": "视频字幕 DeepL；网页选中/全页走本机 LibreTranslate；浏览器内 3D 精灵冒泡。",
+  "permissions": ["storage", "activeTab", "scripting"],
+  "host_permissions": [
+    "https://www.youtube.com/*",
+    "https://www.youtube-nocookie.com/*",
+    "https://www.netflix.com/*",
+    "https://netflix.com/*",
+    "https://x.com/*",
+    "https://twitter.com/*",
+    "http://127.0.0.1/*",
+    "http://localhost/*"
+  ],
+  "optional_host_permissions": [
+    "https://*/*",
+    "http://*/*"
+  ],
+  "background": {
+    "service_worker": "background/index.js",
+    "type": "module"
+  },
+  "action": {
+    "default_title": "Tranlithion 字幕翻译",
+    "default_popup": "popup.html"
+  },
+  "options_page": "options.html",
+  "content_scripts": [
+    {
+      "matches": [
+        "https://www.youtube.com/*",
+        "https://www.youtube-nocookie.com/*",
+        "https://www.netflix.com/*",
+        "https://netflix.com/*",
+        "https://x.com/*",
+        "https://twitter.com/*"
+      ],
+      "js": ["content/index.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "content_security_policy": {
+    "extension_pages": "script-src 'self'; object-src 'self'; connect-src 'self' https: wss: http://127.0.0.1:* http://localhost:* ws://localhost:*"
+  }
+}

@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tranlithion 字幕翻译</title>
+    <link rel="stylesheet" href="popup/popup.css" />
+  </head>
+  <body>
+    <main class="popup-shell" aria-labelledby="popup-title">
+      <header class="popup-header">
+        <div class="brand-lockup">
+          <span class="brand-mark" aria-hidden="true"><i></i><i></i></span>
+          <div>
+            <h1 id="popup-title">Tranlithion</h1>
+            <p>日语字幕 → 中文</p>
+          </div>
+        </div>
+        <button
+          id="enabled-toggle"
+          class="switch"
+          type="button"
+          role="switch"
+          aria-checked="true"
+          aria-label="开启翻译"
+        >
+          <span class="switch-track"><span class="switch-knob"></span></span>
+          <span id="enabled-label">已开启</span>
+        </button>
+      </header>
+
+      <section class="runtime-status" aria-labelledby="runtime-heading">
+        <div class="status-heading">
+          <span id="status-dot" class="status-dot" data-state="searching" aria-hidden="true"></span>
+          <p id="runtime-heading">当前页面</p>
+        </div>
+        <p id="runtime-message" class="runtime-message" aria-live="polite">正在读取播放器…</p>
+        <p id="runtime-detail" class="runtime-detail">请在 YouTube 或 Netflix 播放器中开启日文字幕。</p>
+      </section>
+
+      <section class="quick-controls" aria-label="网页翻译">
+        <button id="enable-hosts" class="secondary-button" type="button">启用全站</button>
+        <button id="translate-page" class="secondary-button" type="button">全页翻译</button>
+        <button id="restore-page" class="secondary-button" type="button">恢复原文</button>
+      </section>
+
+      <section class="quick-controls" aria-label="字幕显示控制">
+        <div class="control-copy">
+          <p>显示日文原文</p>
+          <span>中文译文始终优先显示</span>
+        </div>
+        <label class="check-control" aria-label="显示日文原文">
+          <input id="show-original" type="checkbox" />
+          <span aria-hidden="true"></span>
+        </label>
+      </section>
+
+      <section class="service-summary" aria-labelledby="service-heading">
+        <div>
+          <p id="service-heading">翻译服务</p>
+          <strong id="service-name">正在检查配置</strong>
+        </div>
+        <button id="open-options" class="text-button" type="button">设置</button>
+      </section>
+
+      <footer class="popup-footer">
+        <a href="demo.html" target="_blank" rel="noreferrer">查看字幕演示</a>
+        <span aria-hidden="true">·</span>
+        <a href="https://www.youtube.com" target="_blank" rel="noreferrer">YouTube</a>
+        <span aria-hidden="true">·</span>
+        <a href="https://www.netflix.com/browse" target="_blank" rel="noreferrer">Netflix</a>
+      </footer>
+    </main>
+    <script type="module" src="popup/index.js"></script>
+  </body>
+</html>

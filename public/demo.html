@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tranlithion 字幕演示</title>
+    <link rel="stylesheet" href="demo/demo.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="wordmark" href="popup.html" aria-label="Tranlithion 首页">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i></span>
+        <span>Tranlithion</span>
+      </a>
+      <a class="header-link" href="options.html">设置</a>
+    </header>
+
+    <main class="demo-shell">
+      <section class="intro" aria-labelledby="demo-title">
+        <p class="path">同步方式 / 演示</p>
+        <h1 id="demo-title">译文应当出现得恰到好处。</h1>
+        <p>这是 Overlay 的视觉预览。真实页面中，字幕会由 YouTube 的文本字幕或播放器字幕轨道触发。</p>
+      </section>
+
+      <section class="player-demo" aria-label="字幕叠加演示">
+        <div class="screen">
+          <div class="screen-metadata">
+            <span>日语节目片段</span>
+            <span id="progress-label">00:00</span>
+          </div>
+          <div id="caption-preview" class="caption-preview" data-bilingual="false">
+            <p id="translated-caption" class="translated-caption" lang="zh-CN"></p>
+            <p id="source-caption" class="source-caption" lang="ja"></p>
+          </div>
+          <div class="screen-controls" aria-hidden="true"><span></span><span></span><span></span></div>
+        </div>
+        <div class="demo-controls">
+          <button id="previous-cue" type="button">上一句</button>
+          <button id="play-toggle" class="primary-button" type="button" aria-pressed="true">暂停演示</button>
+          <button id="next-cue" type="button">下一句</button>
+          <label class="bilingual-toggle">
+            <input id="bilingual-toggle" type="checkbox" />
+            <span>显示日文原文</span>
+          </label>
+        </div>
+      </section>
+
+      <section class="how-it-works" aria-labelledby="test-title">
+        <div>
+          <h2 id="test-title">在真实视频中测试</h2>
+          <ol>
+            <li>执行 <code>npm run build</code>，在 Chrome 的扩展程序页面加载 <code>dist</code>。</li>
+            <li>打开 Tranlithion 设置，保存 API Key 并授权对应服务域名。</li>
+            <li>打开带日文字幕的 YouTube 视频并开启 CC；扩展会优先读取字幕轨道，再回退到 YouTube 显示字幕。</li>
+          </ol>
+        </div>
+        <p class="scope-note">仅处理网页可访问的文本字幕；烧录字幕 OCR、标签页音频捕获与实时 ASR 属于后续版本。</p>
+      </section>
+    </main>
+    <script type="module" src="demo/index.js"></script>
+  </body>
+</html>

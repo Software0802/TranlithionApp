@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Tranlithion 设置</title>
+    <link rel="stylesheet" href="options/options.css" />
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="wordmark" href="popup.html" aria-label="Tranlithion 首页">
+        <span class="brand-mark" aria-hidden="true"><i></i><i></i></span>
+        <span>Tranlithion</span>
+      </a>
+      <a class="header-link" href="demo.html">字幕演示</a>
+    </header>
+
+    <main class="page-shell">
+      <div class="page-intro">
+        <p class="path">字幕翻译 / 设置</p>
+        <h1>让译文保持在观看节奏里。</h1>
+        <p>先连接一个你信任的翻译服务；密钥不会交给视频网站，也不会出现在字幕页面中。</p>
+      </div>
+
+      <form id="settings-form" novalidate>
+        <section class="settings-section" aria-labelledby="engine-heading">
+          <div class="section-heading">
+            <h2 id="engine-heading">翻译服务</h2>
+            <p>支持 OpenAI 兼容接口、项目自建 WebSocket，或无需联网的演示模式。</p>
+          </div>
+
+          <div class="field-grid">
+            <label class="field">
+              <span>服务类型</span>
+              <select id="provider" name="provider">
+                <option value="openai-compatible">OpenAI 兼容 API</option>
+                <option value="websocket">自定义 WebSocket</option>
+                <option value="mock">演示翻译（不联网）</option>
+              </select>
+            </label>
+            <label class="field">
+              <span>翻译模型</span>
+              <input id="model" name="model" type="text" autocomplete="off" spellcheck="false" />
+            </label>
+          </div>
+
+          <div id="api-fields" class="provider-fields">
+            <label class="field">
+              <span>API 地址</span>
+              <input id="api-base-url" name="api-base-url" type="url" autocomplete="url" spellcheck="false" />
+              <small>支持形如 <code>https://api.openai.com/v1</code> 的 Chat Completions 服务。</small>
+            </label>
+            <label class="field">
+              <span>API Key</span>
+              <span class="key-input">
+                <input id="api-key" name="api-key" type="password" autocomplete="off" spellcheck="false" />
+                <button id="toggle-key" type="button" class="icon-button" aria-label="显示 API Key">显示</button>
+              </span>
+              <small>仅保存在当前 Chrome 配置文件；请使用可单独撤销、权限最小化的 Key。</small>
+            </label>
+          </div>
+
+          <div id="websocket-fields" class="provider-fields" hidden>
+            <label class="field">
+              <span>WebSocket 地址</span>
+              <input id="websocket-url" name="websocket-url" type="url" autocomplete="url" spellcheck="false" />
+              <small>服务应接受 <code>translate</code> 消息并返回相同 <code>requestId</code> 的译文。</small>
+            </label>
+          </div>
+
+          <div class="notice" role="note">
+            <strong>连接授权</strong>
+            <p>保存时，Chrome 会要求授权连接你填写的服务域名。Tranlithion 只会将字幕和必要的近期上下文发送给该域名。</p>
+          </div>
+          <div class="inline-actions">
+            <button id="test-connection" class="secondary-button" type="button">保存并测试「こんにちは」</button>
+            <p id="connection-result" class="inline-status" aria-live="polite"></p>
+          </div>
+        </section>
+
+        <section class="settings-section" aria-labelledby="caption-heading">
+          <div class="section-heading">
+            <h2 id="caption-heading">字幕显示</h2>
+            <p>V1 读取 YouTube 与 Netflix 页面上已显示、可访问的日文文本字幕；不处理烧录字幕、加密媒体流或受保护内容。</p>
+          </div>
+
+          <div class="field-grid">
+            <label class="field readonly-field">
+              <span>源语言</span>
+              <input value="日语（V1）" type="text" readonly aria-readonly="true" />
+            </label>
+            <label class="field readonly-field">
+              <span>目标语言</span>
+              <input value="简体中文" type="text" readonly aria-readonly="true" />
+            </label>
+            <label class="field">
+              <span>字幕位置</span>
+              <select id="position" name="position">
+                <option value="bottom">播放器下方</option>
+                <option value="middle">画面中央</option>
+                <option value="top">播放器上方</option>
+              </select>
+            </label>
+            <label class="checkbox-field">
+              <input id="show-original-setting" type="checkbox" />
+              <span>
+                <strong>同时显示日文原文</strong>
+                <small>中文译文仍保持在第一行。</small>
+              </span>
+            </label>
+            <label class="checkbox-field">
+              <input id="draft-captions-setting" type="checkbox" />
+              <span>
+                <strong>先显示草稿翻译</strong>
+                <small>
+                  用更快的翻译通道立刻上屏。在 Netflix 上若草稿通道选 DeepL 且已填写 Key，
+                  将<strong>只使用 DeepL</strong>（不再等待 DeepSeek 等主模型），以降低延迟。
+                  其他站点仍为「草稿先上屏、主服务返回后替换」。通道不可用时会自动跳过。
+                </small>
+              </span>
+            </label>
+          </div>
+
+          <div class="field">
+            <label for="draft-provider">草稿翻译通道</label>
+            <select id="draft-provider" name="draft-provider">
+              <option value="browser">Chrome 内置本地翻译（免费、无网络延迟）</option>
+              <option value="deepl">DeepL API（机器翻译，通常快于大模型）</option>
+              <option value="custom">自定义 HTTP 翻译服务</option>
+            </select>
+            <p class="hint">
+              Chrome 内置通道完全在本地运行，但是否支持日语→中文取决于你的 Chrome 版本与设备。
+            </p>
+          </div>
+
+          <div id="draft-remote-fields" hidden>
+            <div class="field">
+              <label for="draft-endpoint">草稿翻译地址</label>
+              <input id="draft-endpoint" name="draft-endpoint" type="url" spellcheck="false" />
+              <p class="hint">
+                DeepL 免费版为 <code>https://api-free.deepl.com/v2/translate</code>，
+                付费版为 <code>https://api.deepl.com/v2/translate</code>。
+                自定义服务需接受 <code>{"text","source","target"}</code> 并返回 <code>{"translation"}</code>。
+              </p>
+            </div>
+            <div class="field">
+              <label for="draft-api-key">草稿翻译 API Key</label>
+              <input id="draft-api-key" name="draft-api-key" type="password" autocomplete="off" spellcheck="false" />
+              <p class="hint">
+                与主翻译服务的 Key 分开保存，同样只存在本机受信任的扩展存储中，不会发送给视频网站。
+              </p>
+            </div>
+          </div>
+
+          <div class="range-grid">
+            <label class="range-field" for="font-size">
+              <span>字幕字号 <output id="font-size-output" for="font-size"></output></span>
+              <input id="font-size" type="range" min="16" max="48" step="1" />
+            </label>
+            <label class="range-field" for="background-opacity">
+              <span>背景不透明度 <output id="opacity-output" for="background-opacity"></output></span>
+              <input id="background-opacity" type="range" min="0.35" max="1" step="0.05" />
+            </label>
+          </div>
+        </section>
+
+        <section class="settings-section" aria-labelledby="local-mt-heading">
+          <div class="section-heading">
+            <h2 id="local-mt-heading">本机翻译（全页 / 选区）</h2>
+            <p>
+              网页全文与选中文字走本机 LibreTranslate；视频字幕仍用上方 DeepL / 主服务。
+              启动说明见仓库 <code>docs/local-libretranslate.md</code>。
+            </p>
+          </div>
+          <label class="checkbox-field">
+            <input id="local-mt-enabled" type="checkbox" />
+            <span>
+              <strong>启用本机 LibreTranslate</strong>
+              <small>选中文字时 3D 精灵头顶冒泡；弹窗可一键全页翻译。</small>
+            </span>
+          </label>
+          <label class="field">
+            <span>本机翻译地址</span>
+            <input id="local-mt-url" name="local-mt-url" type="url" spellcheck="false" />
+            <small>默认 <code>http://127.0.0.1:5000/translate</code>。保存时会请求访问该地址的授权。</small>
+          </label>
+        </section>
+
+        <section class="settings-section" aria-labelledby="glossary-heading">
+          <div class="section-heading">
+            <h2 id="glossary-heading">术语与人物名</h2>
+            <p>这些对照会随近期台词一起交给翻译服务，帮助人名、组织名和固定用语保持一致。</p>
+          </div>
+          <label class="field full-field" for="glossary">
+            <span>一行一个对照；人名在原文前加 <code>@</code></span>
+            <textarea id="glossary" rows="6" spellcheck="false" placeholder="@五条悟 = 五条悟&#10;領域展開 = 领域展开"></textarea>
+          </label>
+        </section>
+
+        <div class="form-actions">
+          <p id="save-result" class="save-status" aria-live="polite"></p>
+          <button id="save-settings" class="primary-button" type="submit">保存设置</button>
+        </div>
+      </form>
+    </main>
+    <script type="module" src="options/index.js"></script>
+  </body>
+</html>

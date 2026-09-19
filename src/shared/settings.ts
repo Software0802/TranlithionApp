@@ -1,0 +1,197 @@
+import type {
+  CaptionPosition,
+  DraftProvider,
+  GlossaryEntry,
+  PublicTranslationSettings,
+  SourceLanguage,
+  TranslationSettings,
+  TranslatorProvider
+} from "./types";
+
+export const SETTINGS_STORAGE_KEY = "translation-settings";
+
+export const DEFAULT_SETTINGS: TranslationSettings = {
+  enabled: true,
+  provider: "openai-compatible",
+  apiBaseUrl: "https://api.openai.com/v1",
+  apiKey: "",
+  model: "gpt-4.1-mini",
+  webSocketUrl: "ws://localhost:8787",
+  sourceLanguage: "ja",
+  targetLanguage: "zh-CN",
+  showOriginal: false,
+  fontSizePx: 28,
+  position: "bottom",
+  backgroundOpacity: 0.76,
+  glossary: [],
+  draftCaptions: true,
+  draftProvider: "browser",
+  draftEndpointUrl: "https://api-free.deepl.com/v2/translate",
+  draftApiKey: "",
+  localMtEnabled: true,
+  localMtUrl: "http://127.0.0.1:5000/translate"
+};
+
+const PROVIDERS = new Set<TranslatorProvider>([
+  "openai-compatible",
+  "websocket",
+  "mock"
+]);
+const POSITIONS = new Set<CaptionPosition>(["top", "middle", "bottom"]);
+const SOURCE_LANGUAGES = new Set<SourceLanguage>(["ja", "en"]);
+const DRAFT_PROVIDERS = new Set<DraftProvider>(["browser", "deepl", "custom"]);
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function stringValue(value: unknown, fallback: string, maxLength = 1_000): string {
+  return typeof value === "string" ? value.trim().slice(0, maxLength) : fallback;
+}
+
+function clamp(value: unknown, fallback: number, min: number, max: number): number {
+  return typeof value === "number" && Number.isFinite(value)
+    ? Math.min(max, Math.max(min, value))
+    : fallback;
+}
+
+function normalizeUrl(value: unknown, fallback: string, protocols: string[]): string {
+  const candidate = stringValue(value, fallback, 2_000);
+  try {
+    const url = new URL(candidate);
+    if (!protocols.includes(url.protocol)) {
+      return fallback;
+    }
+    return url.toString().replace(/\/$/, "");
+  } catch {
+    return fallback;
+  }
+}
+
+export function normalizeGlossary(value: unknown): GlossaryEntry[] {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+
+  const seen = new Set<string>();
+  const entries: GlossaryEntry[] = [];
+  for (const entry of value) {
+    if (!isRecord(entry)) {
+      continue;
+    }
+    const source = stringValue(entry.source, "", 120);
+    const target = stringValue(entry.target, "", 120);
+    const kind = entry.kind === "name" ? "name" : "term";
+    const key = source.toLocaleLowerCase();
+    if (!source || !target || seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    entries.push({ source, target, kind });
+    if (entries.length >= 100) {
+      break;
+    }
+  }
+  return entries;
+}
+
+export function parseGlossary(input: string): GlossaryEntry[] {
+  const entries = input.split(/\r?\n/).flatMap((line) => {
+    const match = line.match(/^\s*(.+?)\s*(?:=>|→|=|：|:)\s*(.+?)\s*$/);
+    if (!match) {
+      return [];
+    }
+    const source = match[1].trim();
+    const target = match[2].trim();
+    const kind = source.startsWith("@");
+    return [{
+      source: kind ? source.slice(1).trim() : source,
+      target,
+      kind: kind ? "name" : "term"
+    } satisfies GlossaryEntry];
+  });
+  return normalizeGlossary(entries);
+}
+
+export function formatGlossary(glossary: GlossaryEntry[]): string {
+  return glossary
+    .map((entry) => `${entry.kind === "name" ? "@" : ""}${entry.source} = ${entry.target}`)
+    .join("\n");
+}
+
+export function normalizeSettings(value: unknown): TranslationSettings {
+  const record = isRecord(value) ? value : {};
+  const provider = PROVIDERS.has(record.provider as TranslatorProvider)
+    ? (record.provider as TranslatorProvider)
+    : DEFAULT_SETTINGS.provider;
+  const position = POSITIONS.has(record.position as CaptionPosition)
+    ? (record.position as CaptionPosition)
+    : DEFAULT_SETTINGS.position;
+  const sourceLanguage = SOURCE_LANGUAGES.has(record.sourceLanguage as SourceLanguage)
+    ? (record.sourceLanguage as SourceLanguage)
+    : DEFAULT_SETTINGS.sourceLanguage;
+
+  return {
+    enabled: typeof record.enabled === "boolean" ? record.enabled : DEFAULT_SETTINGS.enabled,
+    provider,
+    apiBaseUrl: normalizeUrl(record.apiBaseUrl, DEFAULT_SETTINGS.apiBaseUrl, ["https:", "http:"]),
+    apiKey: stringValue(record.apiKey, "", 2_000),
+    model: stringValue(record.model, DEFAULT_SETTINGS.model, 160),
+    webSocketUrl: normalizeUrl(record.webSocketUrl, DEFAULT_SETTINGS.webSocketUrl, ["wss:", "ws:"]),
+    sourceLanguage,
+    targetLanguage: "zh-CN",
+    showOriginal:
+      typeof record.showOriginal === "boolean"
+        ? record.showOriginal
+        : DEFAULT_SETTINGS.showOriginal,
+    fontSizePx: clamp(record.fontSizePx, DEFAULT_SETTINGS.fontSizePx, 16, 48),
+    position,
+    backgroundOpacity: clamp(
+      record.backgroundOpacity,
+      DEFAULT_SETTINGS.backgroundOpacity,
+      0.35,
+      1
+    ),
+    glossary: normalizeGlossary(record.glossary),
+    draftCaptions:
+      typeof record.draftCaptions === "boolean"
+        ? record.draftCaptions
+        : DEFAULT_SETTINGS.draftCaptions,
+    draftProvider: DRAFT_PROVIDERS.has(record.draftProvider as DraftProvider)
+      ? (record.draftProvider as DraftProvider)
+      : DEFAULT_SETTINGS.draftProvider,
+    draftEndpointUrl: normalizeUrl(
+      record.draftEndpointUrl,
+      DEFAULT_SETTINGS.draftEndpointUrl,
+      ["https:", "http:"]
+    ),
+    draftApiKey: stringValue(record.draftApiKey, "", 2_000),
+    localMtEnabled:
+      typeof record.localMtEnabled === "boolean"
+        ? record.localMtEnabled
+        : DEFAULT_SETTINGS.localMtEnabled,
+    localMtUrl: normalizeUrl(
+      record.localMtUrl,
+      DEFAULT_SETTINGS.localMtUrl,
+      ["https:", "http:"]
+    )
+  };
+}
+
+export function publicSettings(settings: TranslationSettings): PublicTranslationSettings {
+  // Both keys are stripped here: content scripts share a page with the video
+  // site, so they only ever learn whether a key exists, never its value.
+  const { apiKey, draftApiKey, ...safeSettings } = settings;
+  return {
+    ...safeSettings,
+    apiKeyConfigured: apiKey.length > 0,
+    draftApiKeyConfigured: draftApiKey.length > 0
+  };
+}
+
+export function mergeSettings(
+  current: TranslationSettings,
+  patch: Partial<TranslationSettings>
+): TranslationSettings {
+  return normalizeSettings({ ...current, ...patch });
+}

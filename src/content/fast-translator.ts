@@ -1,0 +1,251 @@
+import type { DraftTranslationResponse, ExtensionMessage } from "../shared/messages";
+import { safeRuntimeSendMessage } from "../shared/extension-context";
+import type {
+  PublicTranslationSettings,
+  SourceLanguage,
+  TargetLanguage
+} from "../shared/types";
+
+/**
+ * Draft channel backed by Chrome's on-device Translator API.
+ *
+ * The LLM channel needs roughly 1–2 seconds just to emit its first token,
+ * which is longer than a Netflix caption stays on screen. This channel runs
+ * locally and normally answers in tens of milliseconds, so a readable draft
+ * can replace the blank overlay while the higher quality translation is still
+ * streaming in behind it.
+ *
+ * Every entry point degrades to "unavailable" instead of throwing. The API is
+ * absent in older Chrome builds, content scripts run in an isolated world that
+ * may not expose it, and ja→zh is not a guaranteed language pair. In all of
+ * those cases the caller keeps its existing LLM-only behaviour.
+ */
+
+/**
+ * Probing can hang indefinitely when the browser exposes the API but cannot
+ * reach its on-device model backend, so every await here is bounded. Losing the
+ * draft costs nothing; a promise that never settles would leak one pending
+ * translation per caption.
+ */
+const PREPARE_TIMEOUT_MS = 10_000;
+/** A draft slower than this is pointless: the service answer is already close. */
+const DRAFT_TIMEOUT_MS = 800;
+
+/**
+ * A source of immediate, lower-quality captions. Implementations must resolve
+ * to null rather than throwing: the draft is an enhancement, and its failure
+ * must never disturb the main translation path.
+ */
+export interface DraftChannel {
+  /** Warms the channel. Returns false when it cannot serve this browser or config. */
+  prepare(): Promise<boolean>;
+  translate(text: string, signal?: AbortSignal): Promise<string | null>;
+  destroy(): void;
+}
+
+type TranslatorAvailability = "unavailable" | "downloadable" | "downloading" | "available";
+
+interface TranslatorLanguagePair {
+  sourceLanguage: string;
+  targetLanguage: string;
+}
+
+interface TranslatorInstance {
+  translate: (input: string) => Promise<string>;
+  destroy?: () => void;
+}
+
+interface TranslatorFactory {
+  availability: (options: TranslatorLanguagePair) => Promise<TranslatorAvailability>;
+  create: (options: TranslatorLanguagePair) => Promise<TranslatorInstance>;
+}
+
+/** Resolves to null instead of hanging or rejecting, whichever comes first. */
+function withTimeout<T>(work: Promise<T>, timeoutMs: number): Promise<T | null> {
+  return new Promise((resolve) => {
+    const timer = globalThis.setTimeout(() => resolve(null), timeoutMs);
+    const settle = (value: T | null) => {
+      globalThis.clearTimeout(timer);
+      resolve(value);
+    };
+    work.then(settle, () => settle(null));
+  });
+}
+
+/** The Translator API expects a base BCP-47 tag; `zh-CN` is rejected by some builds. */
+function toTranslatorLanguage(language: SourceLanguage | TargetLanguage): string {
+  return language === "zh-CN" ? "zh" : language;
+}
+
+function readTranslatorFactory(): TranslatorFactory | null {
+  const candidate = (globalThis as { Translator?: unknown }).Translator;
+  // Chrome exposes Translator as a class, so `typeof` is "function" rather than
+  // "object". Accept either shape and let the method probe below decide.
+  if (!candidate || (typeof candidate !== "object" && typeof candidate !== "function")) {
+    return null;
+  }
+  const factory = candidate as Partial<TranslatorFactory>;
+  if (typeof factory.availability !== "function" || typeof factory.create !== "function") {
+    return null;
+  }
+  return factory as TranslatorFactory;
+}
+
+export class DraftTranslator implements DraftChannel {
+  private readonly pair: TranslatorLanguagePair;
+  private instance: TranslatorInstance | null = null;
+  private preparation: Promise<TranslatorInstance | null> | null = null;
+  private unsupported = false;
+
+  constructor(sourceLanguage: SourceLanguage, targetLanguage: TargetLanguage) {
+    this.pair = {
+      sourceLanguage: toTranslatorLanguage(sourceLanguage),
+      targetLanguage: toTranslatorLanguage(targetLanguage)
+    };
+  }
+
+  /**
+   * Warms the local model so the first caption does not pay the download cost.
+   * Resolves to false when this browser cannot serve the configured pair.
+   */
+  async prepare(): Promise<boolean> {
+    return (await this.resolveInstance()) !== null;
+  }
+
+  /**
+   * Returns a draft translation, or null when the draft channel is unavailable,
+   * the caller cancelled, or the model produced nothing usable.
+   */
+  async translate(text: string, signal?: AbortSignal): Promise<string | null> {
+    const source = text.trim();
+    if (!source || signal?.aborted) {
+      return null;
+    }
+    const instance = await this.resolveInstance();
+    if (!instance || signal?.aborted) {
+      return null;
+    }
+    try {
+      const translated = await withTimeout(instance.translate(source), DRAFT_TIMEOUT_MS);
+      if (signal?.aborted || typeof translated !== "string") {
+        return null;
+      }
+      const trimmed = translated.trim();
+      // An echo of the source is worse than showing nothing: it would look like
+      // a finished translation that simply failed to translate.
+      return trimmed && trimmed !== source ? trimmed : null;
+    } catch {
+      return null;
+    }
+  }
+
+  destroy(): void {
+    this.instance?.destroy?.();
+    this.instance = null;
+    this.preparation = null;
+  }
+
+  private resolveInstance(): Promise<TranslatorInstance | null> {
+    if (this.unsupported) {
+      return Promise.resolve(null);
+    }
+    if (this.instance) {
+      return Promise.resolve(this.instance);
+    }
+    this.preparation ??= this.createInstance().then(
+      (instance) => {
+        this.instance = instance;
+        if (!instance) {
+          this.unsupported = true;
+        }
+        return instance;
+      },
+      () => {
+        this.unsupported = true;
+        return null;
+      }
+    );
+    return this.preparation;
+  }
+
+  private async createInstance(): Promise<TranslatorInstance | null> {
+    const factory = readTranslatorFactory();
+    if (!factory) {
+      return null;
+    }
+    const availability: TranslatorAvailability | null = await withTimeout(
+      factory.availability(this.pair),
+      PREPARE_TIMEOUT_MS
+    );
+    // A null here means the probe timed out or threw; treat it the same as an
+    // explicit "unavailable" so the channel disables itself instead of retrying
+    // a hanging call on every caption.
+    if (availability === null || availability === "unavailable") {
+      return null;
+    }
+    return withTimeout(factory.create(this.pair), PREPARE_TIMEOUT_MS);
+  }
+}
+
+/**
+ * Draft channel that delegates to the background worker, which holds the API
+ * key for the configured machine-translation endpoint. The content script only
+ * ever sends caption text and receives translated text.
+ */
+export class RemoteDraftTranslator implements DraftChannel {
+  constructor(
+    private readonly sessionId: string,
+    private readonly cueIdOf: () => string
+  ) {}
+
+  /**
+   * Remote endpoints need no warm-up, and probing one would spend a request
+   * before there is a caption to translate.
+   */
+  async prepare(): Promise<boolean> {
+    return true;
+  }
+
+  async translate(text: string, signal?: AbortSignal): Promise<string | null> {
+    if (!text.trim() || signal?.aborted) {
+      return null;
+    }
+    try {
+      const response = await safeRuntimeSendMessage<DraftTranslationResponse>({
+        type: "DRAFT_TRANSLATE",
+        sessionId: this.sessionId,
+        cueId: this.cueIdOf(),
+        text
+      } satisfies ExtensionMessage);
+      if (!response?.ok || typeof response.text !== "string" || signal?.aborted) {
+        return null;
+      }
+      return response.text.trim() || null;
+    } catch {
+      return null;
+    }
+  }
+
+  destroy(): void {
+    // The background worker owns the in-flight request and aborts it when the
+    // next caption arrives or the session is cleared.
+  }
+}
+
+export function createDraftChannel(
+  settings: PublicTranslationSettings,
+  sessionId: string,
+  cueIdOf: () => string
+): DraftChannel | null {
+  if (!settings.draftCaptions) {
+    return null;
+  }
+  if (settings.draftProvider === "browser") {
+    return new DraftTranslator(settings.sourceLanguage, settings.targetLanguage);
+  }
+  // A remote provider without a key would spend a request per caption to fail.
+  if (settings.draftProvider === "deepl" && !settings.draftApiKeyConfigured) {
+    return null;
+  }
+  return new RemoteDraftTranslator(sessionId, cueIdOf);
+}
