@@ -1,6 +1,7 @@
 import {
   isExtensionMessage,
   type ExtensionMessage,
+  type PageCommand,
   type SettingsResponse
 } from "../shared/messages";
 import {
@@ -14,9 +15,10 @@ import type {
   SubtitleCue,
   TranslationResponse
 } from "../shared/types";
+import { isMeetingModeActive } from "../shared/meeting";
 import { SelectionMascot } from "./mascot";
 import { PageTranslator } from "./page-translator";
-import { SubtitleController } from "./subtitle-controller";
+import { SubtitleController, type CaptionTarget } from "./subtitle-controller";
 
 class TranslationContentApp {
   private settings: PublicTranslationSettings | null = null;
@@ -49,8 +51,17 @@ class TranslationContentApp {
             return false;
           }
           if (message.type === "SETTINGS_UPDATED") {
+            const wasMeeting = this.meetingModeActive();
             this.settings = message.settings;
-            this.controller?.updateSettings(message.settings);
+            if (this.meetingModeActive() !== wasMeeting) {
+              // Meeting mode changes which adapter, clock, and overlay anchor
+              // the page needs, so the controller is rebuilt rather than patched.
+              this.controller?.destroy();
+              this.controller = null;
+              this.scan();
+            } else {
+              this.controller?.updateSettings(message.settings);
+            }
             this.syncMascot();
             return false;
           }
@@ -112,8 +123,18 @@ class TranslationContentApp {
     this.stop();
   };
 
+  private meetingModeActive(): boolean {
+    return Boolean(this.settings && isMeetingModeActive(this.settings, location.hostname));
+  }
+
   private syncMascot(): void {
-    const enabled = Boolean(this.settings?.enabled && this.settings.localMtEnabled);
+    // The mascot stays out of meetings unless the user asks for it: the page is
+    // routinely inside a shared screen, where a floating sprite is everyone's
+    // problem rather than the user's choice.
+    const allowedHere = !this.meetingModeActive() || Boolean(this.settings?.meetingMascot);
+    const enabled = Boolean(
+      this.settings?.enabled && this.settings.localMtEnabled && allowedHere
+    );
     if (enabled && !this.mascot) {
       this.mascot = new SelectionMascot();
       return;
@@ -125,9 +146,10 @@ class TranslationContentApp {
   }
 
   private async handlePageCommand(
-    command: "translate-page" | "restore-page" | "ensure-hosts"
+    command: PageCommand
   ): Promise<{ ok: boolean; message?: string; error?: string }> {
-    if (command === "ensure-hosts") {
+    if (command === "ensure-hosts" || command === "enable-meeting-hosts") {
+      // Permission grants and script registration happen in the background.
       return { ok: true };
     }
     if (command === "restore-page") {
@@ -195,6 +217,17 @@ class TranslationContentApp {
       this.controller?.destroy();
       this.controller = null;
     }
+    if (this.meetingModeActive()) {
+      // A meeting page has many participant tiles and no video that tracks the
+      // conversation, so the controller is anchored to the page, not to one of
+      // them. Rebuilding it on every tile change would restart the session.
+      if (this.controller?.target.kind !== "page") {
+        this.controller?.destroy();
+        this.controller = this.createController({ kind: "page" });
+      }
+      return;
+    }
+
     const video = findPrimaryVideo();
     if (!video) {
       // Non-video pages still support selection mascot + full-page commands.
@@ -207,17 +240,25 @@ class TranslationContentApp {
       }
       return;
     }
-    if (this.controller?.video === video) {
+    if (this.controller?.target.kind === "video" && this.controller.target.video === video) {
       return;
     }
     this.controller?.destroy();
-    this.controller = new SubtitleController(
-      video,
+    this.controller = this.createController({ kind: "video", video });
+  }
+
+  private createController(target: CaptionTarget): SubtitleController | null {
+    if (!this.settings) {
+      return null;
+    }
+    const controller = new SubtitleController(
+      target,
       this.settings,
       (cue) => this.translateCue(cue),
       (status) => this.reportStatus(status)
     );
-    this.controller.start();
+    controller.start();
+    return controller;
   }
 
   private async loadPublicSettings(): Promise<PublicTranslationSettings | null> {

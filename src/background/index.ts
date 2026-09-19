@@ -9,12 +9,27 @@ import {
   isExtensionMessage,
   type DraftTranslationResponse,
   type ExtensionMessage,
+  type MeetingTranscriptResponse,
+  type PageCommand,
   type PlainBatchTranslationResponse,
   type PlainTranslationResponse,
   type SettingsResponse,
   type TabStatusResponse,
   type TestTranslationResponse
 } from "../shared/messages";
+import { sampleSourceText } from "../shared/language";
+import {
+  isMeetingHost,
+  MEETING_CONTENT_SCRIPT_ID,
+  MEETING_HOST_PERMISSIONS
+} from "../shared/meeting";
+import {
+  appendTranscriptLine,
+  listTranscriptSessions,
+  MEETING_TRANSCRIPT_STORAGE_KEY,
+  pruneTranscripts,
+  readTranscriptStore
+} from "../shared/meeting-transcript";
 import {
   SessionJobQueue,
   SupersededJobError,
@@ -22,6 +37,7 @@ import {
   type PersistedTranslationSession
 } from "../shared/translation-session";
 import type {
+  EntityHint,
   RuntimeStatus,
   TabRuntimeStatus,
   SubtitleCue,
@@ -38,6 +54,8 @@ import { translateWithAgent, TranslatorError } from "./translator";
 
 const SESSION_CONTEXT_STORAGE_KEY = "translation-session-context";
 const TAB_STATUS_STORAGE_KEY = "tab-runtime-status";
+/** Dynamic registration created by the popup's "启用全站" button. */
+const ALL_PAGES_CONTENT_SCRIPT_ID = "tranlithion-all-pages";
 const sessionStore = new TranslationSessionStore();
 const jobQueue = new SessionJobQueue();
 const tabStatuses = new Map<number, TabRuntimeStatus>();
@@ -50,6 +68,7 @@ const draftControllers = new Map<string, AbortController>();
 const hydratedSessionIds = new Set<string>();
 let contextStorageQueue: Promise<void> = Promise.resolve();
 let tabStatusStorageQueue: Promise<void> = Promise.resolve();
+let transcriptStorageQueue: Promise<void> = Promise.resolve();
 /** Hot-path cache: chrome.storage.local.get on every cue was adding tens of ms. */
 let settingsCache: TranslationSettings | null = null;
 let permissionCache:
@@ -57,14 +76,14 @@ let permissionCache:
   | null = null;
 
 chrome.runtime.onInstalled.addListener(() => {
-  void initializeSettings();
+  void initializeSettings().then(pruneStoredTranscripts);
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  void initializeSettings();
+  void initializeSettings().then(pruneStoredTranscripts);
 });
 
-void initializeSettings();
+void initializeSettings().then(pruneStoredTranscripts);
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName === "local" && changes[SETTINGS_STORAGE_KEY]) {
@@ -125,7 +144,17 @@ async function handleMessage(
       return translateCue(message.request, sender.tab?.id);
     }
     case "DRAFT_TRANSLATE": {
-      return draftTranslate(message.sessionId, message.text);
+      return draftTranslate(message.sessionId, message.text, message.asFinal === true);
+    }
+    case "RECORD_MEETING_LINE": {
+      return recordMeetingLine(message);
+    }
+    case "GET_MEETING_TRANSCRIPTS": {
+      return meetingTranscriptSummary();
+    }
+    case "CLEAR_MEETING_TRANSCRIPTS": {
+      await chrome.storage.local.remove(MEETING_TRANSCRIPT_STORAGE_KEY);
+      return { ok: true };
     }
     case "TRANSLATE_PLAIN": {
       return translatePlain(message.text);
@@ -199,7 +228,9 @@ async function translateCue(
 
   await hydrate;
 
-  const latestOnly = request.cue.source === "netflix-dom";
+  // Live captions that rewrite themselves: only the newest line is worth
+  // finishing, and repeats hit the text cache instead of the network.
+  const latestOnly = request.cue.source === "netflix-dom" || request.cue.source === "meet-dom";
   const cached =
     sessionStore.getCached(request.sessionId, request.cue.id) ??
     (latestOnly
@@ -275,10 +306,16 @@ async function translateCue(
 
 async function draftTranslate(
   sessionId: string,
-  text: string
+  text: string,
+  asFinal: boolean
 ): Promise<DraftTranslationResponse> {
   const settings = await getSettings();
-  if (!settings.enabled || !settings.draftCaptions || settings.draftProvider === "browser") {
+  if (!settings.enabled || settings.draftProvider === "browser") {
+    return { ok: false };
+  }
+  // In meeting mode this channel *is* the caption, so the draft-captions
+  // preference must not silently switch it off.
+  if (!settings.draftCaptions && !asFinal) {
     return { ok: false };
   }
   if (await requiredDraftPermissionMissing(settings)) {
@@ -289,13 +326,98 @@ async function draftTranslate(
   const controller = new AbortController();
   draftControllers.set(sessionId, controller);
   try {
-    const translated = await translateDraft({ text, settings, signal: controller.signal });
+    const translated = await translateDraft({
+      text,
+      settings,
+      signal: controller.signal,
+      asFinal
+    });
     return translated && !controller.signal.aborted ? { ok: true, text: translated } : { ok: false };
   } finally {
     if (draftControllers.get(sessionId) === controller) {
       draftControllers.delete(sessionId);
     }
   }
+}
+
+/**
+ * Records one settled meeting line: into session memory, so repeated terms and
+ * speaker names stay consistent and repeats hit the cache, and into the
+ * retention-limited local transcript when the user has it on (D7).
+ *
+ * The content script can reach this only for a meeting host, and nothing here
+ * hands it anything back beyond an acknowledgement.
+ */
+async function recordMeetingLine(message: {
+  sessionId: string;
+  host: string;
+  title: string;
+  cue: SubtitleCue;
+  translation: string;
+}): Promise<{ ok: boolean }> {
+  const translation = message.translation.trim();
+  if (!isMeetingHost(message.host) || message.cue.source !== "meet-dom" || !translation) {
+    return { ok: false };
+  }
+  const settings = await getSettings();
+  await restorePersistedSession(message.sessionId);
+
+  // Speaker names are exactly the proper nouns a meeting keeps repeating, so
+  // they join the session's term memory and reach the model's stable prefix.
+  const entityHints: EntityHint[] = message.cue.speaker
+    ? [{ source: message.cue.speaker, target: message.cue.speaker, kind: "name" }]
+    : [];
+  sessionStore.record(message.sessionId, message.cue, {
+    text: translation,
+    provider: settings.provider,
+    latencyMs: 0,
+    entityHints
+  });
+  await persistSession(message.sessionId);
+
+  if (!settings.meetingTranscript) {
+    return { ok: true };
+  }
+  await queueTranscriptStorageUpdate(async () => {
+    const stored = await chrome.storage.local.get(MEETING_TRANSCRIPT_STORAGE_KEY);
+    const pruned = pruneTranscripts(
+      readTranscriptStore(stored[MEETING_TRANSCRIPT_STORAGE_KEY]),
+      Date.now(),
+      settings.meetingTranscriptRetentionDays
+    );
+    const next = appendTranscriptLine(pruned, {
+      sessionId: message.sessionId,
+      host: message.host,
+      title: message.title,
+      atMs: Date.now(),
+      speaker: message.cue.speaker ?? null,
+      source: message.cue.text,
+      translation
+    });
+    await chrome.storage.local.set({ [MEETING_TRANSCRIPT_STORAGE_KEY]: next });
+  });
+  return { ok: true };
+}
+
+async function meetingTranscriptSummary(): Promise<MeetingTranscriptResponse> {
+  const settings = await getSettings();
+  const stored = await chrome.storage.local.get(MEETING_TRANSCRIPT_STORAGE_KEY);
+  const sessions = listTranscriptSessions(
+    pruneTranscripts(
+      readTranscriptStore(stored[MEETING_TRANSCRIPT_STORAGE_KEY]),
+      Date.now(),
+      settings.meetingTranscriptRetentionDays
+    )
+  );
+  return {
+    ok: true,
+    summary: {
+      sessions: sessions.length,
+      lines: sessions.reduce((total, session) => total + session.lines.length, 0),
+      updatedAtMs: sessions[0]?.updatedAtMs ?? null,
+      retentionDays: settings.meetingTranscriptRetentionDays
+    }
+  };
 }
 
 async function translatePlain(text: string): Promise<PlainTranslationResponse> {
@@ -342,9 +464,39 @@ async function localMtPermissionMissing(settings: TranslationSettings): Promise<
 }
 
 async function handlePageCommand(
-  command: "translate-page" | "restore-page" | "ensure-hosts",
+  command: PageCommand,
   tabId?: number
 ): Promise<{ ok: boolean; error?: string; message?: string }> {
+  if (command === "enable-meeting-hosts") {
+    // Only the meeting origins, never the all-sites grant: the user is
+    // authorizing one meeting platform and should see exactly that domain.
+    // The grant itself is requested by the options page, which has the user
+    // gesture; this only registers the script once the origin is really ours.
+    const origins = [...MEETING_HOST_PERMISSIONS];
+    if (!(await chrome.permissions.contains({ origins }))) {
+      return { ok: false, error: "未获得访问 meet.google.com 的授权。" };
+    }
+    const registered = await registeredContentScriptIds();
+    // The all-pages registration already covers Meet. Registering both would
+    // inject the content script twice and put two overlays on the call.
+    if (!registered.has(ALL_PAGES_CONTENT_SCRIPT_ID) && !registered.has(MEETING_CONTENT_SCRIPT_ID)) {
+      try {
+        await chrome.scripting.registerContentScripts([
+          {
+            id: MEETING_CONTENT_SCRIPT_ID,
+            matches: origins,
+            js: ["content/index.js"],
+            runAt: "document_idle",
+            persistAcrossSessions: true
+          }
+        ]);
+      } catch {
+        // Already registered from a previous grant.
+      }
+    }
+    return { ok: true, message: "Google Meet 会议字幕已启用，请刷新会议页面。" };
+  }
+
   if (command === "ensure-hosts") {
     const granted = await chrome.permissions.request({
       origins: ["https://*/*", "http://*/*", "http://127.0.0.1/*", "http://localhost/*"]
@@ -352,18 +504,30 @@ async function handlePageCommand(
     if (!granted) {
       return { ok: false, error: "未获得网站访问授权。" };
     }
-    try {
-      await chrome.scripting.registerContentScripts([
-        {
-          id: "tranlithion-all-pages",
-          matches: ["https://*/*", "http://*/*"],
-          js: ["content/index.js"],
-          runAt: "document_idle",
-          persistAcrossSessions: true
-        }
-      ]);
-    } catch {
-      // Already registered from a previous grant.
+    const registered = await registeredContentScriptIds();
+    if (registered.has(MEETING_CONTENT_SCRIPT_ID)) {
+      // Subsumed by the all-pages registration below; leaving it would inject
+      // the content script twice on Meet.
+      try {
+        await chrome.scripting.unregisterContentScripts({ ids: [MEETING_CONTENT_SCRIPT_ID] });
+      } catch {
+        // Nothing registered under that id after all.
+      }
+    }
+    if (!registered.has(ALL_PAGES_CONTENT_SCRIPT_ID)) {
+      try {
+        await chrome.scripting.registerContentScripts([
+          {
+            id: ALL_PAGES_CONTENT_SCRIPT_ID,
+            matches: ["https://*/*", "http://*/*"],
+            js: ["content/index.js"],
+            runAt: "document_idle",
+            persistAcrossSessions: true
+          }
+        ]);
+      } catch {
+        // Already registered from a previous grant.
+      }
     }
     return { ok: true, message: "全站权限已就绪，请刷新目标网页后再用。" };
   }
@@ -382,6 +546,15 @@ async function handlePageCommand(
     return { ok: true, message: result?.message };
   } catch {
     return { ok: false, error: "无法与当前页面通信。请刷新页面后重试，或先点击「启用全站」。" };
+  }
+}
+
+async function registeredContentScriptIds(): Promise<Set<string>> {
+  try {
+    const scripts = await chrome.scripting.getRegisteredContentScripts();
+    return new Set(scripts.map((script) => script.id));
+  } catch {
+    return new Set();
   }
 }
 
@@ -406,7 +579,7 @@ async function testTranslation(settingsCandidate: TranslationSettings): Promise<
         id: "connection-test",
         startMs: 0,
         endMs: 1_000,
-        text: "こんにちは",
+        text: sampleSourceText(settings.sourceLanguage),
         isFinal: true,
         source: "text-track"
       },
@@ -609,6 +782,32 @@ function queueContextStorageUpdate(update: () => Promise<void>): Promise<void> {
   const operation = contextStorageQueue.then(update, update);
   contextStorageQueue = operation.catch(() => undefined);
   return operation;
+}
+
+/** Meeting lines arrive faster than a storage round-trip; serialize the folds. */
+function queueTranscriptStorageUpdate(update: () => Promise<void>): Promise<void> {
+  const operation = transcriptStorageQueue.then(update, update);
+  transcriptStorageQueue = operation.catch(() => undefined);
+  return operation;
+}
+
+/**
+ * D7: transcripts expire even if the user never opens another meeting, so the
+ * retention window is also enforced when the worker wakes up.
+ */
+async function pruneStoredTranscripts(): Promise<void> {
+  const settings = await getSettings();
+  await queueTranscriptStorageUpdate(async () => {
+    const stored = await chrome.storage.local.get(MEETING_TRANSCRIPT_STORAGE_KEY);
+    const current = readTranscriptStore(stored[MEETING_TRANSCRIPT_STORAGE_KEY]);
+    if (Object.keys(current).length === 0) {
+      return;
+    }
+    const pruned = pruneTranscripts(current, Date.now(), settings.meetingTranscriptRetentionDays);
+    if (Object.keys(pruned).length !== Object.keys(current).length) {
+      await chrome.storage.local.set({ [MEETING_TRANSCRIPT_STORAGE_KEY]: pruned });
+    }
+  });
 }
 
 function readPersistedSessions(value: unknown): Record<string, PersistedTranslationSession> {

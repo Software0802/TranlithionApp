@@ -1,3 +1,4 @@
+import { trackLanguageMatchers } from "./language";
 import type { SourceLanguage, SubtitleCue, SubtitleSource } from "./types";
 
 const ENTITY_REPLACEMENTS: Record<string, string> = {
@@ -36,9 +37,13 @@ export function createCueId(
   source: SubtitleSource,
   startMs: number,
   endMs: number | null,
-  text: string
+  text: string,
+  speaker?: string
 ): string {
-  return `${source}:${Math.round(startMs)}:${endMs === null ? "open" : Math.round(endMs)}:${hashSubtitleText(text)}`;
+  const base = `${source}:${Math.round(startMs)}:${endMs === null ? "open" : Math.round(endMs)}:${hashSubtitleText(text)}`;
+  // Two people can say the same words in the same second; without the speaker
+  // in the id the second line would look like a repeat of the first.
+  return speaker ? `${base}:${hashSubtitleText(speaker)}` : base;
 }
 
 export function createSubtitleCue(input: {
@@ -47,18 +52,21 @@ export function createSubtitleCue(input: {
   endMs: number | null;
   text: string;
   isFinal?: boolean;
+  speaker?: string;
 }): SubtitleCue | null {
   const text = normalizeSubtitleText(input.text);
   if (!text) {
     return null;
   }
+  const speaker = input.speaker ? normalizeSubtitleText(input.speaker) : "";
   return {
-    id: createCueId(input.source, input.startMs, input.endMs, text),
+    id: createCueId(input.source, input.startMs, input.endMs, text, speaker || undefined),
     startMs: Math.max(0, Math.round(input.startMs)),
     endMs: input.endMs === null ? null : Math.max(0, Math.round(input.endMs)),
     text,
     isFinal: input.isFinal ?? true,
-    source: input.source
+    source: input.source,
+    ...(speaker ? { speaker } : {})
   };
 }
 
@@ -74,10 +82,7 @@ export function chooseSubtitleTrack(
     }
   }
 
-  const languageMatchers =
-    sourceLanguage === "ja"
-      ? ["ja", "jpn", "japanese", "日本"]
-      : ["en", "eng", "english"];
+  const languageMatchers = trackLanguageMatchers(sourceLanguage);
   return candidates.find((track) => {
     const hint = `${track.language} ${track.label}`.toLocaleLowerCase();
     return languageMatchers.some((matcher) => hint.includes(matcher));

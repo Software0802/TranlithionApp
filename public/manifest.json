@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Tranlithion 字幕翻译",
   "version": "0.3.0",
-  "description": "视频字幕 DeepL；网页选中/全页走本机 LibreTranslate；浏览器内 3D 精灵冒泡。",
+  "description": "在 YouTube / Netflix 视频字幕与 Google Meet 会议字幕上叠加译文；网页选中与全页翻译走本机 LibreTranslate。",
   "permissions": ["storage", "activeTab", "scripting"],
   "host_permissions": [
     "https://www.youtube.com/*",
@@ -15,6 +15,7 @@
     "http://localhost/*"
   ],
   "optional_host_permissions": [
+    "https://meet.google.com/*",
     "https://*/*",
     "http://*/*"
   ],

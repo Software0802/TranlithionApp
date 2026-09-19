@@ -1,14 +1,20 @@
+import { normalizeLanguagePair, normalizeLanguageTag } from "./language";
 import type {
   CaptionPosition,
   DraftProvider,
   GlossaryEntry,
+  MeetingFinalChannel,
   PublicTranslationSettings,
-  SourceLanguage,
   TranslationSettings,
   TranslatorProvider
 } from "./types";
 
 export const SETTINGS_STORAGE_KEY = "translation-settings";
+
+/** D7: a meeting transcript is deleted automatically after this many days. */
+export const DEFAULT_TRANSCRIPT_RETENTION_DAYS = 7;
+export const MIN_TRANSCRIPT_RETENTION_DAYS = 1;
+export const MAX_TRANSCRIPT_RETENTION_DAYS = 90;
 
 export const DEFAULT_SETTINGS: TranslationSettings = {
   enabled: true,
@@ -29,7 +35,13 @@ export const DEFAULT_SETTINGS: TranslationSettings = {
   draftEndpointUrl: "https://api-free.deepl.com/v2/translate",
   draftApiKey: "",
   localMtEnabled: true,
-  localMtUrl: "http://127.0.0.1:5000/translate"
+  localMtUrl: "http://127.0.0.1:5000/translate",
+  meetingMode: true,
+  meetingFinalChannel: "fast-mt",
+  meetingMascot: false,
+  meetingOverlayHidden: false,
+  meetingTranscript: true,
+  meetingTranscriptRetentionDays: DEFAULT_TRANSCRIPT_RETENTION_DAYS
 };
 
 const PROVIDERS = new Set<TranslatorProvider>([
@@ -38,8 +50,12 @@ const PROVIDERS = new Set<TranslatorProvider>([
   "mock"
 ]);
 const POSITIONS = new Set<CaptionPosition>(["top", "middle", "bottom"]);
-const SOURCE_LANGUAGES = new Set<SourceLanguage>(["ja", "en"]);
 const DRAFT_PROVIDERS = new Set<DraftProvider>(["browser", "deepl", "custom"]);
+const MEETING_FINAL_CHANNELS = new Set<MeetingFinalChannel>([
+  "fast-mt",
+  "local-mt",
+  "llm"
+]);
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -127,9 +143,12 @@ export function normalizeSettings(value: unknown): TranslationSettings {
   const position = POSITIONS.has(record.position as CaptionPosition)
     ? (record.position as CaptionPosition)
     : DEFAULT_SETTINGS.position;
-  const sourceLanguage = SOURCE_LANGUAGES.has(record.sourceLanguage as SourceLanguage)
-    ? (record.sourceLanguage as SourceLanguage)
-    : DEFAULT_SETTINGS.sourceLanguage;
+  // Source and target come from two independent selects, so the pair is
+  // normalized together: a target equal to the source is not translatable.
+  const { source: sourceLanguage, target: targetLanguage } = normalizeLanguagePair(
+    normalizeLanguageTag(record.sourceLanguage, DEFAULT_SETTINGS.sourceLanguage),
+    normalizeLanguageTag(record.targetLanguage, DEFAULT_SETTINGS.targetLanguage)
+  );
 
   return {
     enabled: typeof record.enabled === "boolean" ? record.enabled : DEFAULT_SETTINGS.enabled,
@@ -139,7 +158,7 @@ export function normalizeSettings(value: unknown): TranslationSettings {
     model: stringValue(record.model, DEFAULT_SETTINGS.model, 160),
     webSocketUrl: normalizeUrl(record.webSocketUrl, DEFAULT_SETTINGS.webSocketUrl, ["wss:", "ws:"]),
     sourceLanguage,
-    targetLanguage: "zh-CN",
+    targetLanguage,
     showOriginal:
       typeof record.showOriginal === "boolean"
         ? record.showOriginal
@@ -174,6 +193,35 @@ export function normalizeSettings(value: unknown): TranslationSettings {
       record.localMtUrl,
       DEFAULT_SETTINGS.localMtUrl,
       ["https:", "http:"]
+    ),
+    meetingMode:
+      typeof record.meetingMode === "boolean"
+        ? record.meetingMode
+        : DEFAULT_SETTINGS.meetingMode,
+    meetingFinalChannel: MEETING_FINAL_CHANNELS.has(
+      record.meetingFinalChannel as MeetingFinalChannel
+    )
+      ? (record.meetingFinalChannel as MeetingFinalChannel)
+      : DEFAULT_SETTINGS.meetingFinalChannel,
+    meetingMascot:
+      typeof record.meetingMascot === "boolean"
+        ? record.meetingMascot
+        : DEFAULT_SETTINGS.meetingMascot,
+    meetingOverlayHidden:
+      typeof record.meetingOverlayHidden === "boolean"
+        ? record.meetingOverlayHidden
+        : DEFAULT_SETTINGS.meetingOverlayHidden,
+    meetingTranscript:
+      typeof record.meetingTranscript === "boolean"
+        ? record.meetingTranscript
+        : DEFAULT_SETTINGS.meetingTranscript,
+    meetingTranscriptRetentionDays: Math.round(
+      clamp(
+        record.meetingTranscriptRetentionDays,
+        DEFAULT_SETTINGS.meetingTranscriptRetentionDays,
+        MIN_TRANSCRIPT_RETENTION_DAYS,
+        MAX_TRANSCRIPT_RETENTION_DAYS
+      )
     )
   };
 }

@@ -1,13 +1,11 @@
-import type { SourceLanguage, TranslationSettings } from "../shared/types";
+import { toShortLanguageCode, type LanguageTag } from "../shared/language";
+import type { TranslationSettings } from "../shared/types";
 
 const LOCAL_MT_TIMEOUT_MS = 20_000;
 
 /** LibreTranslate uses short codes; Simplified Chinese is `zh`. */
-export function toLibreTranslateLang(language: SourceLanguage | "zh-CN"): string {
-  if (language === "zh-CN") {
-    return "zh";
-  }
-  return language;
+export function toLibreTranslateLang(language: LanguageTag): string {
+  return toShortLanguageCode(language);
 }
 
 /**

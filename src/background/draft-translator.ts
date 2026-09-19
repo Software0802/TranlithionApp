@@ -1,4 +1,5 @@
-import type { SourceLanguage, TranslationSettings } from "../shared/types";
+import { toDeepLSource, toDeepLTarget } from "../shared/language";
+import type { TranslationSettings } from "../shared/types";
 
 /**
  * Remote draft channel: a dedicated machine-translation endpoint that answers
@@ -18,22 +19,28 @@ import type { SourceLanguage, TranslationSettings } from "../shared/types";
  * lands, so it is dropped instead.
  */
 const REMOTE_DRAFT_TIMEOUT_MS = 1_200;
+/**
+ * When this channel *is* the caption (meeting mode), there is nothing slower
+ * waiting behind it, so it is worth waiting a little longer rather than
+ * showing the user nothing.
+ */
+const FINAL_CHANNEL_TIMEOUT_MS = 4_000;
 
 export interface RemoteDraftInput {
   text: string;
   settings: TranslationSettings;
   signal?: AbortSignal;
-}
-
-/** DeepL spells Simplified Chinese `ZH-HANS` and expects upper-case codes. */
-function deepLSourceLanguage(language: SourceLanguage): string {
-  return language === "ja" ? "JA" : "EN";
+  /** The caller is using this channel as the final caption, not as a preview. */
+  asFinal?: boolean;
 }
 
 export async function translateDraft(input: RemoteDraftInput): Promise<string | null> {
   const { settings } = input;
   const text = input.text.trim();
-  if (!text || !settings.draftCaptions || settings.draftProvider === "browser") {
+  if (!text || settings.draftProvider === "browser") {
+    return null;
+  }
+  if (!settings.draftCaptions && !input.asFinal) {
     return null;
   }
   if (settings.draftProvider === "deepl" && !settings.draftApiKey) {
@@ -46,7 +53,10 @@ export async function translateDraft(input: RemoteDraftInput): Promise<string | 
     return null;
   }
   input.signal?.addEventListener("abort", abortForNewerCue, { once: true });
-  const timer = globalThis.setTimeout(() => controller.abort(), REMOTE_DRAFT_TIMEOUT_MS);
+  const timer = globalThis.setTimeout(
+    () => controller.abort(),
+    input.asFinal ? FINAL_CHANNEL_TIMEOUT_MS : REMOTE_DRAFT_TIMEOUT_MS
+  );
 
   try {
     const response = await fetch(settings.draftEndpointUrl, {
@@ -90,8 +100,8 @@ function draftRequestBody(settings: TranslationSettings, text: string): unknown 
   if (settings.draftProvider === "deepl") {
     return {
       text: [text],
-      source_lang: deepLSourceLanguage(settings.sourceLanguage),
-      target_lang: "ZH-HANS"
+      source_lang: toDeepLSource(settings.sourceLanguage),
+      target_lang: toDeepLTarget(settings.targetLanguage)
     };
   }
   return {

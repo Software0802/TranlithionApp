@@ -1,3 +1,4 @@
+import { languageEnglishName, type LanguageTag } from "../shared/language";
 import { normalizeGlossary } from "../shared/settings";
 import type {
   ContextLine,
@@ -117,33 +118,37 @@ async function translateWithOpenAiCompatibleApi(
           {
             role: "system",
             content: input.onPartial
-              ? streamingTranslationSystemPrompt(settings.sourceLanguage, terminology)
-              : translationSystemPrompt(settings.sourceLanguage, terminology)
+              ? streamingTranslationSystemPrompt(
+                  settings.sourceLanguage,
+                  settings.targetLanguage,
+                  terminology
+                )
+              : translationSystemPrompt(
+                  settings.sourceLanguage,
+                  settings.targetLanguage,
+                  terminology
+                )
           },
           {
             role: "user",
             content: JSON.stringify(
               input.onPartial
                 ? {
-                    context: input.recentContext.map(({ source, translation }) => ({
-                      source,
-                      translation
-                    })),
-                    cue: input.cue.text
+                    context: input.recentContext.map(contextEntry),
+                    cue: input.cue.text,
+                    ...(input.cue.speaker ? { speaker: input.cue.speaker } : {})
                   }
                 : {
                     task: "Translate the current subtitle cue only.",
-                    context: input.recentContext.map(({ source, translation }) => ({
-                      source,
-                      translation
-                    })),
+                    context: input.recentContext.map(contextEntry),
                     cue: input.cue.text,
+                    ...(input.cue.speaker ? { speaker: input.cue.speaker } : {}),
                     output_contract: {
-                      translation: "Simplified Chinese subtitle only",
+                      translation: `${languageEnglishName(settings.targetLanguage)} subtitle only`,
                       entities: [
                         {
                           source: "new proper name or term in source language",
-                          target: "Chinese rendering",
+                          target: `${languageEnglishName(settings.targetLanguage)} rendering`,
                           kind: "name or term"
                         }
                       ]
@@ -298,17 +303,36 @@ function shouldDisableDeepSeekThinking(settings: TranslationSettings): boolean {
   }
 }
 
+/**
+ * Context lines carry the speaker when the source had one, so the model can
+ * tell a two-person exchange apart across cues.
+ */
+function contextEntry(line: ContextLine): {
+  source: string;
+  translation: string;
+  speaker?: string;
+} {
+  return {
+    source: line.source,
+    translation: line.translation,
+    ...(line.speaker ? { speaker: line.speaker } : {})
+  };
+}
+
 function streamingTranslationSystemPrompt(
-  sourceLanguage: "ja" | "en",
+  sourceLanguage: LanguageTag,
+  targetLanguage: LanguageTag,
   terminology: GlossaryEntry[]
 ): string {
-  const language = sourceLanguage === "ja" ? "Japanese" : "English";
+  const source = languageEnglishName(sourceLanguage);
+  const target = languageEnglishName(targetLanguage);
   return withTerminology(
     [
-      `You are a real-time ${language}-to-Simplified-Chinese subtitle translator for TV/film captions.`,
-      "Render natural spoken Chinese a viewer can read at a glance—not word-for-word calque.",
+      `You are a real-time ${source}-to-${target} subtitle translator for captions.`,
+      `Render natural spoken ${target} a viewer can read at a glance—not word-for-word calque.`,
       "Prefer meaning, tone, and speaker intent over literal diction; keep names and fixed terms consistent with context.",
-      "Keep it concise for on-screen subtitles. Return only the Chinese subtitle text; no JSON, labels, notes, or explanation."
+      "A `speaker` field names who is talking: use it for pronouns and register, and never repeat it in the output.",
+      `Keep it concise for on-screen subtitles. Return only the ${target} subtitle text; no JSON, labels, notes, or explanation.`
     ].join(" "),
     terminology
   );
@@ -413,15 +437,18 @@ function streamDelta(line: string): string {
 }
 
 function translationSystemPrompt(
-  sourceLanguage: "ja" | "en",
+  sourceLanguage: LanguageTag,
+  targetLanguage: LanguageTag,
   terminology: GlossaryEntry[]
 ): string {
-  const language = sourceLanguage === "ja" ? "Japanese" : "English";
+  const source = languageEnglishName(sourceLanguage);
+  const target = languageEnglishName(targetLanguage);
   return withTerminology([
-    `You are a real-time ${language}-to-Simplified-Chinese subtitle translator for TV/film captions.`,
-    "Prioritize natural, concise Chinese that fits on-screen subtitles—not word-for-word calque.",
+    `You are a real-time ${source}-to-${target} subtitle translator for captions.`,
+    `Prioritize natural, concise ${target} that fits on-screen subtitles—not word-for-word calque.`,
     "Preserve meaning, tone, speaker intent, proper names, and terminology across nearby cues.",
-    "Prefer idiomatic Chinese over literal diction when both are faithful.",
+    "A `speaker` field names who is talking: use it for pronouns and register, and never repeat it in the output.",
+    `Prefer idiomatic ${target} over literal diction when both are faithful.`,
     "Do not explain, annotate, censor, or repeat the source text.",
     "Return one JSON object only, with this exact shape:",
     '{"translation":"…","entities":[{"source":"…","target":"…","kind":"name"}]}.',

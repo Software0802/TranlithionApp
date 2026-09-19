@@ -49,7 +49,8 @@ export class TranslationSessionStore {
       cueId: cue.id,
       source: cue.text,
       translation: translation.text,
-      atMs: Date.now()
+      atMs: Date.now(),
+      ...(cue.speaker ? { speaker: cue.speaker } : {})
     });
     session.recent.splice(0, Math.max(0, session.recent.length - MAX_CONTEXT_LINES));
 

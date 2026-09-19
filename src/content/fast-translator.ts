@@ -1,5 +1,10 @@
-import type { DraftTranslationResponse, ExtensionMessage } from "../shared/messages";
+import type {
+  DraftTranslationResponse,
+  ExtensionMessage,
+  PlainTranslationResponse
+} from "../shared/messages";
 import { safeRuntimeSendMessage } from "../shared/extension-context";
+import { toShortLanguageCode } from "../shared/language";
 import type {
   PublicTranslationSettings,
   SourceLanguage,
@@ -74,7 +79,7 @@ function withTimeout<T>(work: Promise<T>, timeoutMs: number): Promise<T | null> 
 
 /** The Translator API expects a base BCP-47 tag; `zh-CN` is rejected by some builds. */
 function toTranslatorLanguage(language: SourceLanguage | TargetLanguage): string {
-  return language === "zh-CN" ? "zh" : language;
+  return toShortLanguageCode(language);
 }
 
 function readTranslatorFactory(): TranslatorFactory | null {
@@ -195,7 +200,9 @@ export class DraftTranslator implements DraftChannel {
 export class RemoteDraftTranslator implements DraftChannel {
   constructor(
     private readonly sessionId: string,
-    private readonly cueIdOf: () => string
+    private readonly cueIdOf: () => string,
+    /** Meeting mode: this channel is the caption, so drafts being off must not disable it. */
+    private readonly asFinal = false
   ) {}
 
   /**
@@ -215,7 +222,8 @@ export class RemoteDraftTranslator implements DraftChannel {
         type: "DRAFT_TRANSLATE",
         sessionId: this.sessionId,
         cueId: this.cueIdOf(),
-        text
+        text,
+        asFinal: this.asFinal
       } satisfies ExtensionMessage);
       if (!response?.ok || typeof response.text !== "string" || signal?.aborted) {
         return null;
@@ -232,6 +240,41 @@ export class RemoteDraftTranslator implements DraftChannel {
   }
 }
 
+/**
+ * Local LibreTranslate as a caption channel.
+ *
+ * The background worker already owns the endpoint and its host permission for
+ * full-page translation; meeting mode reuses that path so a meeting can be
+ * translated entirely on the user's own machine.
+ */
+export class LocalMtTranslator implements DraftChannel {
+  async prepare(): Promise<boolean> {
+    return true;
+  }
+
+  async translate(text: string, signal?: AbortSignal): Promise<string | null> {
+    if (!text.trim() || signal?.aborted) {
+      return null;
+    }
+    try {
+      const response = await safeRuntimeSendMessage<PlainTranslationResponse>({
+        type: "TRANSLATE_PLAIN",
+        text
+      } satisfies ExtensionMessage);
+      if (!response?.ok || typeof response.text !== "string" || signal?.aborted) {
+        return null;
+      }
+      return response.text.trim() || null;
+    } catch {
+      return null;
+    }
+  }
+
+  destroy(): void {
+    // The background worker owns the request and its timeout.
+  }
+}
+
 export function createDraftChannel(
   settings: PublicTranslationSettings,
   sessionId: string,
@@ -240,6 +283,20 @@ export function createDraftChannel(
   if (!settings.draftCaptions) {
     return null;
   }
+  return createFastChannel(settings, sessionId, cueIdOf);
+}
+
+/**
+ * The fast machine-translation channel itself, independent of whether the user
+ * wants it as a draft. Meeting mode uses it as the final caption, so it must be
+ * constructible without `draftCaptions` being on.
+ */
+export function createFastChannel(
+  settings: PublicTranslationSettings,
+  sessionId: string,
+  cueIdOf: () => string,
+  asFinal = false
+): DraftChannel | null {
   if (settings.draftProvider === "browser") {
     return new DraftTranslator(settings.sourceLanguage, settings.targetLanguage);
   }
@@ -247,5 +304,5 @@ export function createDraftChannel(
   if (settings.draftProvider === "deepl" && !settings.draftApiKeyConfigured) {
     return null;
   }
-  return new RemoteDraftTranslator(sessionId, cueIdOf);
+  return new RemoteDraftTranslator(sessionId, cueIdOf, asFinal);
 }

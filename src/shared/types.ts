@@ -1,7 +1,18 @@
-export type SourceLanguage = "ja" | "en";
-export type TargetLanguage = "zh-CN";
-export type SubtitleSource = "text-track" | "youtube-dom" | "netflix-dom";
+import type { LanguageTag } from "./language";
+
+export type SourceLanguage = LanguageTag;
+export type TargetLanguage = LanguageTag;
+export type SubtitleSource = "text-track" | "youtube-dom" | "netflix-dom" | "meet-dom";
 export type TranslatorProvider = "openai-compatible" | "websocket" | "mock";
+
+/**
+ * Which channel produces the caption the viewer finally reads in meeting mode.
+ *
+ * A one-hour meeting is several times as many lines as an episode, so the
+ * default is the cheap, low-latency machine-translation channel rather than the
+ * chat model. `llm` keeps the film behaviour (fast draft, model final).
+ */
+export type MeetingFinalChannel = "fast-mt" | "local-mt" | "llm";
 
 /**
  * Which service produces the immediate draft caption. `browser` runs Chrome's
@@ -47,6 +58,12 @@ export interface SubtitleCue {
   text: string;
   isFinal: boolean;
   source: SubtitleSource;
+  /**
+   * Who said the line, when the page exposes it. Meeting captions carry a
+   * speaker; film and video captions do not. It is rendered beside the
+   * translation and sent as context, never folded into the text to translate.
+   */
+  speaker?: string;
 }
 
 export interface GlossaryEntry {
@@ -107,6 +124,23 @@ export interface TranslationSettings {
    */
   localMtEnabled: boolean;
   localMtUrl: string;
+  /**
+   * Meeting mode. Only ever applies on a supported meeting host (currently
+   * Google Meet web); every other page behaves exactly as before.
+   */
+  meetingMode: boolean;
+  meetingFinalChannel: MeetingFinalChannel;
+  /**
+   * The selection mascot is off in meetings by default: the overlay is often
+   * inside a shared screen, and a floating sprite there is everyone's problem.
+   */
+  meetingMascot: boolean;
+  /** One-click screen-share hide: overlay off, the site's own captions back. */
+  meetingOverlayHidden: boolean;
+  /** Keep a local bilingual transcript of the meeting. */
+  meetingTranscript: boolean;
+  /** Transcripts older than this are deleted automatically. */
+  meetingTranscriptRetentionDays: number;
 }
 
 export interface PublicTranslationSettings
@@ -120,6 +154,8 @@ export interface ContextLine {
   source: string;
   translation: string;
   atMs: number;
+  /** Present for meeting captions; lets the model track who is speaking. */
+  speaker?: string;
 }
 
 export interface RuntimeStatus {

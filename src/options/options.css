@@ -69,7 +69,7 @@ h2 { font-size: 18px; line-height: 1.3; letter-spacing: -0.018em; }
 .field input:focus, .field select:focus, textarea:focus { border-color: var(--primary-hover); }
 .field small, .checkbox-field small { color: var(--muted); font-size: 12px; font-weight: 450; line-height: 1.5; }
 .field code, .notice code { color: oklch(0.8 0.1 110); font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
-.readonly-field input { color: var(--muted); cursor: default; }
+.hint { max-width: 680px; color: var(--muted); font-size: 12px; font-weight: 450; line-height: 1.5; }
 .key-input { position: relative; display: block; }
 .key-input input { padding-right: 56px; }
 .icon-button { position: absolute; top: 50%; right: 9px; border: 0; padding: 4px; color: var(--primary-hover); background: transparent; font-size: 12px; font-weight: 700; transform: translateY(-50%); }

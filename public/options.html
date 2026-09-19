@@ -81,17 +81,30 @@
         <section class="settings-section" aria-labelledby="caption-heading">
           <div class="section-heading">
             <h2 id="caption-heading">字幕显示</h2>
-            <p>V1 读取 YouTube 与 Netflix 页面上已显示、可访问的日文文本字幕；不处理烧录字幕、加密媒体流或受保护内容。</p>
+            <p>
+              读取 YouTube、Netflix 与 Google Meet 页面上已显示、可访问的文本字幕；
+              不处理烧录字幕、加密媒体流或受保护内容。
+            </p>
           </div>
 
           <div class="field-grid">
-            <label class="field readonly-field">
+            <label class="field">
               <span>源语言</span>
-              <input value="日语（V1）" type="text" readonly aria-readonly="true" />
+              <select id="source-language" name="source-language">
+                <option value="ja">日语</option>
+                <option value="en">英语</option>
+                <option value="zh-CN">简体中文</option>
+              </select>
+              <small>字幕原文的语言。选错会让译文明显走样。</small>
             </label>
-            <label class="field readonly-field">
+            <label class="field">
               <span>目标语言</span>
-              <input value="简体中文" type="text" readonly aria-readonly="true" />
+              <select id="target-language" name="target-language">
+                <option value="zh-CN">简体中文</option>
+                <option value="en">英语</option>
+                <option value="ja">日语</option>
+              </select>
+              <small>叠加显示的译文语言；不能与源语言相同。</small>
             </label>
             <label class="field">
               <span>字幕位置</span>
@@ -104,8 +117,8 @@
             <label class="checkbox-field">
               <input id="show-original-setting" type="checkbox" />
               <span>
-                <strong>同时显示日文原文</strong>
-                <small>中文译文仍保持在第一行。</small>
+                <strong>同时显示原文</strong>
+                <small>译文仍保持在第一行。</small>
               </span>
             </label>
             <label class="checkbox-field">
@@ -129,7 +142,8 @@
               <option value="custom">自定义 HTTP 翻译服务</option>
             </select>
             <p class="hint">
-              Chrome 内置通道完全在本地运行，但是否支持日语→中文取决于你的 Chrome 版本与设备。
+              Chrome 内置通道完全在本地运行，但是否支持你选择的语言对取决于 Chrome 版本与设备；
+              不支持时会自动跳过。会议模式的「机器翻译通道」也使用这里的设置。
             </p>
           </div>
 
@@ -164,6 +178,94 @@
           </div>
         </section>
 
+        <section class="settings-section" aria-labelledby="meeting-heading">
+          <div class="section-heading">
+            <h2 id="meeting-heading">会议模式（Google Meet 网页版）</h2>
+            <p>
+              读取 Meet 自己开启的字幕文本，按发言人叠加译文。
+              不录音、不使用麦克风或标签页音频，也不接入任何会议 SDK；
+              Meet 没开字幕时扩展会直说读不到，不会伪造译文。
+            </p>
+          </div>
+
+          <label class="checkbox-field">
+            <input id="meeting-mode" type="checkbox" />
+            <span>
+              <strong>在 Google Meet 上开启会议字幕翻译</strong>
+              <small>仅在 <code>meet.google.com</code> 生效；其他网站行为不变。</small>
+            </span>
+          </label>
+
+          <div class="notice" role="note">
+            <strong>网站访问授权</strong>
+            <p>
+              会议字幕需要单独授权访问 <code>https://meet.google.com/*</code>。
+              点击下方按钮后，Chrome 会显示该域名请你确认；授权前不会读取任何会议页面。
+            </p>
+          </div>
+          <div class="inline-actions">
+            <button id="enable-meeting-hosts" class="secondary-button" type="button">
+              授权并启用 meet.google.com
+            </button>
+            <p id="meeting-permission-result" class="inline-status" aria-live="polite"></p>
+          </div>
+
+          <div class="field">
+            <label for="meeting-final-channel">会议译文通道</label>
+            <select id="meeting-final-channel" name="meeting-final-channel">
+              <option value="fast-mt">机器翻译通道（DeepL / 自定义，推荐）</option>
+              <option value="local-mt">本机 LibreTranslate（不出本机）</option>
+              <option value="llm">大模型主译（更贵更慢，可选增强）</option>
+            </select>
+            <p class="hint">
+              一小时会议的句数是一集剧的数倍。默认走上方「草稿翻译」里配置的机器翻译通道，
+              它直接作为正式译文上屏，不再等待大模型。选「大模型主译」才会按影视模式走
+              「草稿先上屏、主模型覆盖」。
+            </p>
+          </div>
+
+          <label class="checkbox-field">
+            <input id="meeting-mascot" type="checkbox" />
+            <span>
+              <strong>会议中也显示 3D 精灵</strong>
+              <small>默认关闭：会议页面常被共享出去，精灵会出现在所有人的屏幕上。</small>
+            </span>
+          </label>
+
+          <label class="checkbox-field">
+            <input id="meeting-overlay-hidden" type="checkbox" />
+            <span>
+              <strong>临时隐藏会议译文（共享屏幕用）</strong>
+              <small>打开后不显示译文、也不发送任何会议文本；Meet 自带字幕立即恢复。扩展弹窗里可一键切换。</small>
+            </span>
+          </label>
+
+          <div class="notice" role="note">
+            <strong>会议文本的去向</strong>
+            <p id="meeting-destination">正在读取当前配置…</p>
+          </div>
+
+          <label class="checkbox-field">
+            <input id="meeting-transcript" type="checkbox" />
+            <span>
+              <strong>在本机保存会议双语记录</strong>
+              <small>只存在这台电脑的扩展存储中，不上传、不同步；到期自动删除。</small>
+            </span>
+          </label>
+          <div class="field">
+            <label for="meeting-retention">会议记录保留时长</label>
+            <select id="meeting-retention" name="meeting-retention">
+              <option value="1">1 天</option>
+              <option value="7">7 天（默认）</option>
+              <option value="30">30 天</option>
+            </select>
+          </div>
+          <div class="inline-actions">
+            <button id="clear-transcripts" class="secondary-button" type="button">立即清除全部会议记录</button>
+            <p id="transcript-summary" class="inline-status" aria-live="polite"></p>
+          </div>
+        </section>
+
         <section class="settings-section" aria-labelledby="local-mt-heading">
           <div class="section-heading">
             <h2 id="local-mt-heading">本机翻译（全页 / 选区）</h2>
@@ -189,12 +291,20 @@
         <section class="settings-section" aria-labelledby="glossary-heading">
           <div class="section-heading">
             <h2 id="glossary-heading">术语与人物名</h2>
-            <p>这些对照会随近期台词一起交给翻译服务，帮助人名、组织名和固定用语保持一致。</p>
+            <p>
+              这些对照会随近期台词一起交给翻译服务，帮助人名、组织名和固定用语保持一致。
+              会议模式同样使用它：会前把与会人姓名和项目术语贴进来，
+              同一场会议里重复出现的说法会命中缓存，后面的句子更快也更一致。
+            </p>
           </div>
           <label class="field full-field" for="glossary">
             <span>一行一个对照；人名在原文前加 <code>@</code></span>
-            <textarea id="glossary" rows="6" spellcheck="false" placeholder="@五条悟 = 五条悟&#10;領域展開 = 领域展开"></textarea>
+            <textarea id="glossary" rows="6" spellcheck="false" placeholder="@五条悟 = 五条悟&#10;領域展開 = 领域展开&#10;@Alice Chen = 陈爱丽&#10;retro = 复盘会"></textarea>
           </label>
+          <p class="hint">
+            会议进行中，扩展还会把 Meet 给出的发言人姓名自动登记为人名，
+            使同一场会议内的称呼保持一致；会话结束即清除。
+          </p>
         </section>
 
         <div class="form-actions">
