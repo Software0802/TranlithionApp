@@ -85,30 +85,16 @@ export function hasMeetCaptionExpired(lastTextAtMs: number, nowMs: number): bool
 }
 
 /**
- * Titles and short forms that end in a period without ending a sentence.
- * Erring towards this list only makes a segment longer, while missing an entry
- * would hand the translator a three-character fragment such as "Mr.".
- */
-const LATIN_ABBREVIATIONS = new Set([
-  "mr", "mrs", "ms", "dr", "prof", "sr", "jr", "st", "vs", "etc",
-  "fig", "no", "approx", "inc", "ltd", "co", "dept", "al", "eg", "ie"
-]);
-
-/**
  * Where the settled part of a growing recognizer line ends, as an index into
  * `text`, or 0 when nothing has settled yet.
  *
  * A Latin full stop only counts when whitespace or the end of the line follows
- * it, so a figure like "3.5" never splits a line; a period after a known
- * abbreviation is skipped for the same reason.
+ * it, so a figure like "3.5" never splits a line.
  */
 export function settledSegmentEnd(text: string): number {
-  const terminators = /([。！？]+)|([.!?]+)(?=\s|$)/g;
+  const terminators = /[。！？]+|[.!?]+(?=\s|$)/g;
   let cut = 0;
   for (let match = terminators.exec(text); match; match = terminators.exec(text)) {
-    if (match[2] === "." && endsWithAbbreviation(text.slice(0, match.index))) {
-      continue;
-    }
     cut = match.index + match[0].length;
   }
   if (cut > 0) {
@@ -124,32 +110,19 @@ export function settledSegmentEnd(text: string): number {
   return boundary > MEET_MAX_SEGMENT_CHARS / 2 ? boundary + 1 : MEET_MAX_SEGMENT_CHARS;
 }
 
-function endsWithAbbreviation(head: string): boolean {
-  const word = /([A-Za-z]+)$/.exec(head)?.[1];
-  return Boolean(word && LATIN_ABBREVIATIONS.has(word.toLocaleLowerCase()));
-}
-
-/** Splits one rendered speaker turn into its name and its spoken text. */
+/**
+ * Splits one rendered speaker turn into its name and its spoken text.
+ *
+ * Only the declared selectors are trusted. Guessing which row of an unknown
+ * layout holds the display name would eventually label a fragment of speech as
+ * a speaker and drop it from the translation; when the selectors stop matching
+ * the turn reads as empty and the extension says it cannot see the captions.
+ */
 export function parseMeetCaptionBlock(block: Element): MeetCaptionBlock {
-  const speaker = pickText(block, MEET_CAPTION_SPEAKER_SELECTORS);
-  const text = pickText(block, MEET_CAPTION_TEXT_SELECTORS);
-  if (text) {
-    return { speaker: usableSpeaker(speaker), text };
-  }
-
-  // Class names changed under us. Meet still renders one turn as
-  // avatar / name / text, so an avatar image is the signal that the first
-  // text-bearing row is a display name rather than the start of a sentence.
-  const rows = textRows(block);
-  if (rows.length >= 2 && hasAvatar(block) && rows[0].length <= MEET_MAX_SPEAKER_CHARS) {
-    return { speaker: rows[0], text: normalizeSubtitleText(rows.slice(1).join(" ")) };
-  }
-
-  const full = normalizeSubtitleText(elementText(block));
-  if (speaker && full.startsWith(speaker)) {
-    return { speaker: usableSpeaker(speaker), text: full.slice(speaker.length).trim() };
-  }
-  return { speaker: usableSpeaker(speaker), text: full };
+  return {
+    speaker: usableSpeaker(pickText(block, MEET_CAPTION_SPEAKER_SELECTORS)),
+    text: pickText(block, MEET_CAPTION_TEXT_SELECTORS)
+  };
 }
 
 /** Every speaker turn currently rendered in the caption region, oldest first. */
@@ -177,6 +150,8 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
   private nativeCaptionsVisible = true;
   /** Speaker of the turn currently being read. */
   private speaker: string | null = null;
+  /** Full text of the caption block this turn is being read from. */
+  private blockText = "";
   /** Prefix of this turn already published as a finished segment. */
   private emitted = "";
   /** The published segment ended a sentence, so new words open a new cue. */
@@ -222,6 +197,7 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
     this.region = null;
     this.currentCue = null;
     this.speaker = null;
+    this.blockText = "";
     this.emitted = "";
     this.segmentClosed = false;
     this.callback = null;
@@ -272,29 +248,52 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
     }
   };
 
+  private readBlocks(): MeetCaptionBlock[] {
+    return this.region ? readMeetCaptionBlocks(this.region) : [];
+  }
+
   private readLatestBlock(): MeetCaptionBlock | null {
-    if (!this.region) {
-      return null;
-    }
-    const blocks = readMeetCaptionBlocks(this.region);
+    const blocks = this.readBlocks();
     return blocks[blocks.length - 1] ?? null;
   }
 
+  /**
+   * Whether the newest block is a block we have not been reading, rather than
+   * the one already open still growing.
+   *
+   * Meet merges a person's consecutive speech into one growing block and
+   * starts a fresh block at a paragraph, so a new block ends the open line
+   * even when the same person keeps talking. The recognizer also rewrites
+   * words inside the block it is still growing, and that is a revision of the
+   * open line — the block we were reading being pushed up the strip is what
+   * tells the two apart.
+   */
+  private startsNewBlock(blocks: MeetCaptionBlock[]): boolean {
+    const latest = blocks[blocks.length - 1];
+    if (!this.blockText || !latest || latest.text.startsWith(this.blockText)) {
+      return false;
+    }
+    return blocks.slice(0, -1).some((block) => block.text === this.blockText);
+  }
+
   private readCaption(): void {
-    const latest = this.readLatestBlock();
+    const blocks = this.readBlocks();
+    const latest = blocks[blocks.length - 1];
     if (!latest) {
       // A blank region is not evidence the turn is over; `tick` decides that.
       return;
     }
     this.lastTextAtMs = this.clock.nowMs();
 
-    if (latest.speaker !== this.speaker) {
-      // A different person is talking: the previous turn is genuinely over.
+    if (latest.speaker !== this.speaker || this.startsNewBlock(blocks)) {
+      // Either a different person is talking or Meet started a new paragraph
+      // for the same one: the previous turn is genuinely over either way.
       this.finishCurrentTurn();
       this.speaker = latest.speaker;
     }
 
     const full = latest.text;
+    this.blockText = full;
     if (!full.startsWith(this.emitted)) {
       // The recognizer rewrote words it had already shown, so the prefix we
       // were counting from no longer exists. Start this turn's accounting over.
@@ -382,6 +381,7 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
   /** Ends the open cue and forgets the turn's published prefix. */
   private finishCurrentTurn(): void {
     this.finishCurrentCue();
+    this.blockText = "";
     this.emitted = "";
     this.segmentClosed = false;
   }
@@ -441,7 +441,12 @@ function removeNativeCaptionHideStyle(): void {
   document.getElementById(MEET_NATIVE_HIDE_STYLE_ID)?.remove();
 }
 
-function findMeetCaptionRegion(preferredRegion: Element | null): Element | null {
+/**
+ * The caption region currently in the page, preferring the one already being
+ * read. Selectors are tried in order, so a renamed class cannot win over the
+ * semantic attributes.
+ */
+export function findMeetCaptionRegion(preferredRegion: Element | null): Element | null {
   if (preferredRegion?.isConnected) {
     return preferredRegion;
   }
@@ -472,18 +477,6 @@ function pickText(block: Element, selectors: readonly string[]): string {
 
 function usableSpeaker(speaker: string): string | null {
   return speaker && speaker.length <= MEET_MAX_SPEAKER_CHARS ? speaker : null;
-}
-
-/** Normalized text of each element child that carries text and no avatar. */
-function textRows(block: Element): string[] {
-  return Array.from(block.children)
-    .filter((child) => !child.querySelector("img") && child.tagName !== "IMG")
-    .map((child) => normalizeSubtitleText(elementText(child)))
-    .filter((text) => text.length > 0);
-}
-
-function hasAvatar(block: Element): boolean {
-  return Boolean(block.querySelector("img"));
 }
 
 function elementText(element: Element): string {

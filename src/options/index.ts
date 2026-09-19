@@ -63,6 +63,11 @@ draftProvider.addEventListener("change", renderProviderFields);
 meetingFinalChannel.addEventListener("change", renderProviderFields);
 sourceLanguage.addEventListener("change", renderLanguagePair);
 targetLanguage.addEventListener("change", renderLanguagePair);
+// D7: the disclosure names a host read from these fields, so it has to follow
+// them as they are typed — otherwise it keeps naming the previous service.
+for (const field of [draftEndpoint, localMtUrl, apiBaseUrl, websocketUrl, model]) {
+  field.addEventListener("input", renderMeetingDestination);
+}
 toggleKey.addEventListener("click", toggleApiKeyVisibility);
 fontSize.addEventListener("input", renderRangeOutputs);
 opacity.addEventListener("input", renderRangeOutputs);

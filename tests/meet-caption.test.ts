@@ -1,5 +1,6 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  findMeetCaptionRegion,
   hasMeetCaptionExpired,
   MEET_CAPTION_REGION_SELECTORS,
   MEET_MAX_SEGMENT_CHARS,
@@ -8,7 +9,7 @@ import {
   readMeetCaptionBlocks,
   settledSegmentEnd
 } from "../src/content/adapters/meet-caption-adapter";
-import { asElement, element } from "./helpers/fake-dom";
+import { asElement, element, type FakeElement } from "./helpers/fake-dom";
 
 /** The shape Google Meet renders for one speaker turn. */
 function meetTurn(speaker: string, text: string) {
@@ -22,13 +23,61 @@ function meetTurn(speaker: string, text: string) {
   };
 }
 
+/** A page exposing exactly these elements to a selector query, in order. */
+function stubDocument(nodes: FakeElement[]): void {
+  vi.stubGlobal("document", {
+    querySelector: (selector: string) => nodes.find((node) => node.matches(selector)) ?? null
+  });
+}
+
 describe("Meet caption region", () => {
-  it("prefers semantic attributes over Meet's obfuscated class names", () => {
-    // Class names change between Meet releases; the captions region keeps its
-    // role and label, so those selectors have to be tried first.
-    expect(MEET_CAPTION_REGION_SELECTORS[0]).toContain('role="region"');
-    expect(MEET_CAPTION_REGION_SELECTORS).toContain(".a4cQT");
-    expect(MEET_CAPTION_REGION_SELECTORS.indexOf(".a4cQT")).toBeGreaterThan(0);
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("prefers the semantically labelled region over Meet's obfuscated class names", () => {
+    // Class names change between Meet releases, and a stale one can still be
+    // in the page. The captions region keeps its role and label, so discovery
+    // has to pick that one even when the class match comes first in the page.
+    const classOnly = element({
+      className: "a4cQT",
+      children: [meetTurn("Bob Tan", "from the class node")]
+    });
+    const labelled = element({
+      className: "Kq7Fxb",
+      attributes: { role: "region", "aria-label": "Captions" },
+      children: [meetTurn("Alice Chen", "from the labelled region")]
+    });
+    stubDocument([classOnly, labelled]);
+
+    const region = findMeetCaptionRegion(null);
+
+    expect(region).not.toBeNull();
+    expect(readMeetCaptionBlocks(region as Element)).toEqual([
+      { speaker: "Alice Chen", text: "from the labelled region" }
+    ]);
+  });
+
+  it("still finds the region when only the class name is there", () => {
+    const classOnly = element({
+      className: "a4cQT",
+      children: [meetTurn("Bob Tan", "from the class node")]
+    });
+    stubDocument([classOnly]);
+
+    expect(readMeetCaptionBlocks(findMeetCaptionRegion(null) as Element)).toEqual([
+      { speaker: "Bob Tan", text: "from the class node" }
+    ]);
+  });
+
+  it("keeps reading the region it already found", () => {
+    const labelled = element({
+      attributes: { role: "region", "aria-label": "Captions" },
+      children: [meetTurn("Alice Chen", "still here")]
+    });
+    stubDocument([]);
+
+    expect(findMeetCaptionRegion(asElement(labelled))).toBe(asElement(labelled));
   });
 
   it("hides Meet's own captions with a selector stylesheet", () => {
@@ -48,28 +97,10 @@ describe("Meet caption block parsing", () => {
     expect(block).toEqual({ speaker: "Alice Chen", text: "Good morning." });
   });
 
-  it("still finds the speaker when Meet renames its caption classes", () => {
-    // Only the avatar / name / text row layout survives; the avatar image is
-    // what marks the first text row as a display name rather than a sentence.
-    const renamed = element({
-      className: "xQ1a",
-      children: [
-        { className: "aa", children: [{ tag: "img" }] },
-        { className: "bb", text: "Bob Tan" },
-        { className: "cc", text: "Let's start with the roadmap." }
-      ]
-    });
-
-    expect(parseMeetCaptionBlock(asElement(renamed))).toEqual({
-      speaker: "Bob Tan",
-      text: "Let's start with the roadmap."
-    });
-  });
-
   it("reports no speaker rather than guessing one out of a sentence", () => {
     const anonymous = element({
-      className: "xQ1a",
-      children: [{ className: "cc", text: "Sorry, could you repeat that?" }]
+      className: "nMcdL",
+      children: [{ className: "bh44bd", text: "Sorry, could you repeat that?" }]
     });
 
     expect(parseMeetCaptionBlock(asElement(anonymous))).toEqual({
@@ -78,21 +109,40 @@ describe("Meet caption block parsing", () => {
     });
   });
 
-  it("does not mistake a long first line for a display name", () => {
-    const sentence = "We should postpone the launch until the security review is done.";
-    const block = element({
+  it("reads nothing at all when Meet renames every caption class", () => {
+    // Guessing which row of an unknown layout is the display name would
+    // eventually label a fragment of speech as a speaker and drop it from the
+    // translation. Reading nothing is the honest answer; the extension then
+    // tells the user it cannot see the captions.
+    const renamed = {
       className: "xQ1a",
       children: [
         { className: "aa", children: [{ tag: "img" }] },
-        { className: "bb", text: sentence },
-        { className: "cc", text: "Agreed." }
+        { className: "bb", text: "Bob Tan" },
+        { className: "cc", text: "Let's start with the roadmap." }
+      ]
+    };
+
+    expect(parseMeetCaptionBlock(asElement(element(renamed)))).toEqual({
+      speaker: null,
+      text: ""
+    });
+    expect(
+      readMeetCaptionBlocks(asElement(element({ className: "a4cQT", children: [renamed] })))
+    ).toEqual([]);
+  });
+
+  it("does not accept a whole sentence as a display name", () => {
+    const sentence = "We should postpone the launch until the security review is done.";
+    const block = element({
+      className: "nMcdL",
+      children: [
+        { className: "zs7s8d", text: sentence },
+        { className: "bh44bd", text: "Agreed." }
       ]
     });
 
-    // Falling back to "first row is the name" here would delete a real
-    // sentence from the caption, so the whole block stays as text.
-    expect(parseMeetCaptionBlock(asElement(block)).speaker).toBeNull();
-    expect(parseMeetCaptionBlock(asElement(block)).text).toContain(sentence);
+    expect(parseMeetCaptionBlock(asElement(block))).toEqual({ speaker: null, text: "Agreed." });
   });
 
   it("reads every rendered turn in order, oldest first", () => {
@@ -149,12 +199,17 @@ describe("settled segment splitting", () => {
     expect("早上好。我们开始吧".slice(0, settledSegmentEnd("早上好。我们开始吧"))).toBe("早上好。");
   });
 
-  it("does not cut inside a figure or after a title", () => {
-    // Splitting here would hand the translator "Mr." on its own line.
+  it("does not cut inside a figure", () => {
+    // A period with a digit behind it is not the end of anything.
     expect(settledSegmentEnd("Q3.5 revenue was")).toBe(0);
-    expect(settledSegmentEnd("Mr. Lee will")).toBe(0);
-    const text = "Mr. Lee will present. Then";
-    expect(text.slice(0, settledSegmentEnd(text))).toBe("Mr. Lee will present.");
+    expect(settledSegmentEnd("we shipped 2.1 last")).toBe(0);
+  });
+
+  it("settles a finished sentence even when it ends in a short word", () => {
+    // "I said no." really is finished; holding it open waiting for a longer
+    // sentence would leave the line untranslated until the turn ended.
+    const text = "I said no. Then";
+    expect(text.slice(0, settledSegmentEnd(text))).toBe("I said no.");
   });
 
   it("caps an unpunctuated run on a word boundary", () => {

@@ -170,6 +170,34 @@ describe("Meet cue lifecycle", () => {
     expect(fixture.events).toEqual(["revise:Alice Chen|Let's begin."]);
   });
 
+  it("ends the line when the same person starts a new block", async () => {
+    const fixture = createFixture();
+    await fixture.render([{ speaker: "Alice Chen", text: "over to you" }]);
+    fixture.events.length = 0;
+
+    // Meet starts a fresh block at a paragraph even while the same person is
+    // talking. Overwriting the open line would lose it before it was ever
+    // translated, so the paragraph is a cue boundary like a speaker change.
+    await fixture.render([
+      { speaker: "Alice Chen", text: "over to you" },
+      { speaker: "Alice Chen", text: "thanks" }
+    ]);
+
+    expect(fixture.events).toEqual(["end", "start:Alice Chen|thanks"]);
+  });
+
+  it("still revises in place when the recognizer corrects the open block", async () => {
+    const fixture = createFixture();
+    await fixture.render([{ speaker: "Alice Chen", text: "we should probably" }]);
+    fixture.events.length = 0;
+
+    // A correction rewrites the block being read rather than adding one, and
+    // that is one line being refined, not two lines spoken.
+    await fixture.render([{ speaker: "Alice Chen", text: "we shouldn't probably" }]);
+
+    expect(fixture.events).toEqual(["revise:Alice Chen|we shouldn't probably"]);
+  });
+
   it("ends the turn when a different person starts talking", async () => {
     const fixture = createFixture();
     await fixture.render([{ speaker: "Alice Chen", text: "over to you" }]);

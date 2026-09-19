@@ -106,6 +106,12 @@ export class SubtitleController {
   private lastStreamText = "";
   private reviseTimer: number | null = null;
   private pendingReviseCue: SubtitleCue | null = null;
+  /** Meeting translations, one at a time. See `runFinalTranslation`. */
+  private meetingQueue: Promise<void> = Promise.resolve();
+  /** Aborted on destroy only: a finished sentence outlives its on-screen slot. */
+  private readonly settleAbort = new AbortController();
+  /** The meeting's only channel answered with nothing. */
+  private meetingChannelBroken = false;
 
   constructor(
     readonly target: CaptionTarget,
@@ -193,6 +199,7 @@ export class SubtitleController {
     this.cancelReviseDebounce();
     this.draftAbort?.abort();
     this.draftAbort = null;
+    this.settleAbort.abort();
     this.draftTranslator?.destroy();
     this.draftTranslator = null;
     this.meetingChannel?.destroy();
@@ -311,15 +318,7 @@ export class SubtitleController {
         return;
       }
       this.report("translating", "正在翻译当前字幕", cue.source);
-      const single = this.singleChannel();
-      if (single) {
-        // One network hop only: the fast channel is the caption the user reads.
-        void this.translateWithSingleChannel(cue, single, this.draftAbort.signal);
-        return;
-      }
-      // Fast draft + model final when no single channel is configured.
-      void this.showDraftTranslation(cue, this.draftAbort.signal);
-      void this.translateActiveCue(cue);
+      this.startFinalTranslation(cue, this.draftAbort.signal);
       return;
     }
 
@@ -412,13 +411,41 @@ export class SubtitleController {
       return;
     }
     this.report("translating", "正在翻译当前字幕", cue.source);
+    this.startFinalTranslation(cue, this.draftAbort.signal);
+  }
+
+  /**
+   * Starts whatever produces the caption the user reads: one machine
+   * translation hop when a single channel is configured, otherwise a local
+   * draft plus the model's answer.
+   */
+  private startFinalTranslation(cue: SubtitleCue, signal: AbortSignal): void {
     const single = this.singleChannel();
     if (single) {
-      void this.translateWithSingleChannel(cue, single, this.draftAbort.signal);
+      // One network hop only: the fast channel is the caption the user reads.
+      this.runFinalTranslation(() => this.translateWithSingleChannel(cue, single, signal));
       return;
     }
-    void this.showDraftTranslation(cue, this.draftAbort.signal);
-    void this.translateActiveCue(cue);
+    // Fast draft + model final when no single channel is configured.
+    void this.showDraftTranslation(cue, signal);
+    this.runFinalTranslation(() => this.translateActiveCue(cue));
+  }
+
+  /**
+   * Meeting captions translate one at a time.
+   *
+   * Both the background's draft channel and its job queue keep only the newest
+   * request per session, so two overlapping meeting requests cancel the older
+   * one — and in a meeting the older one is usually a sentence that has just
+   * finished and still has to reach the screen and the transcript. Speech
+   * arrives a sentence at a time, so queuing costs far less than losing a line.
+   */
+  private runFinalTranslation(job: () => Promise<void>): void {
+    if (!this.meetingMode()) {
+      void job();
+      return;
+    }
+    this.meetingQueue = this.meetingQueue.then(job, job).catch(() => undefined);
   }
 
   private cancelReviseDebounce(): void {
@@ -435,6 +462,7 @@ export class SubtitleController {
     }
     // A real end beats a pending revise for the same slot.
     this.cancelReviseDebounce();
+    this.settleMeetingLine(this.activeCue);
     // Nothing is on screen yet when no channel has answered, so there is no
     // reading time to protect and the cue can end immediately.
     const shownForMs = this.clock.nowMs() - this.captionShownAtMs;
@@ -527,6 +555,7 @@ export class SubtitleController {
     if (!this.meetingMode() || this.settings.meetingFinalChannel === "llm" || this.meetingChannel) {
       return false;
     }
+    this.setMeetingChannelBroken(true);
     this.report(
       "error",
       "会议翻译通道尚未配置：请在设置中填写 DeepL / 自定义机器翻译的地址与 Key，或改用本机 LibreTranslate。",
@@ -559,14 +588,24 @@ export class SubtitleController {
         return;
       }
       const text = await channel.translate(cue.text, signal);
-      if (signal.aborted || this.destroyed || this.activeCue?.id !== cue.id) {
+      if (this.destroyed) {
+        return;
+      }
+      if (text) {
+        // Cached by source text before the freshness check: a sentence the
+        // next line has already replaced on screen still owes the transcript
+        // its translation.
+        this.rememberLocalTranslation(cue.text, text);
+        this.setMeetingChannelBroken(false);
+      }
+      if (signal.aborted || this.activeCue?.id !== cue.id) {
         return;
       }
       if (!text) {
+        this.setMeetingChannelBroken(true);
         this.report("error", this.singleChannelFailureMessage(), cue.source);
         return;
       }
-      this.rememberLocalTranslation(cue.text, text);
       this.applyCaption(cue, "final", text);
       this.report(
         "ready",
@@ -658,10 +697,55 @@ export class SubtitleController {
       pending: stage === "streaming",
       draft: stage === "draft"
     });
-    if (stage === "final") {
-      this.recordMeetingLine(cue, text);
-    }
     return true;
+  }
+
+  /**
+   * A meeting sentence is settled when its cue ends, and only a settled
+   * sentence belongs in the transcript: painting happens on every debounced
+   * revision, so recording there would keep "Good", "Good morning", "Good
+   * morning everyone" as three lines of one sentence.
+   *
+   * The translation is still wanted even when the next sentence has already
+   * taken the slot, so the request in flight for this line is detached from
+   * the active cue's abort and the recording waits for it on the meeting
+   * queue.
+   */
+  private settleMeetingLine(cue: SubtitleCue | null): void {
+    if (!cue || cue.source !== "meet-dom" || !this.meetingMode()) {
+      return;
+    }
+    if (!this.settings.enabled || this.overlayHidden()) {
+      return;
+    }
+    // Whatever is translating this sentence must survive the next cue-start.
+    this.draftAbort = null;
+    this.runFinalTranslation(async () => {
+      if (!this.localTextCache.has(cue.text)) {
+        await this.translateSettledLine(cue);
+      }
+      const translation = this.localTextCache.get(cue.text);
+      if (translation) {
+        this.recordMeetingLine(cue, translation);
+      }
+    });
+  }
+
+  private async translateSettledLine(cue: SubtitleCue): Promise<void> {
+    if (this.destroyed || !this.settings.enabled) {
+      return;
+    }
+    const single = this.singleChannel();
+    if (single) {
+      await this.translateWithSingleChannel(cue, single, this.settleAbort.signal);
+      return;
+    }
+    if (this.settings.meetingFinalChannel !== "llm") {
+      // The configured channel is missing. Finishing this line on the chat
+      // model is the silent fallback meeting mode promises not to make.
+      return;
+    }
+    await this.translateActiveCue(cue);
   }
 
   /**
@@ -706,7 +790,21 @@ export class SubtitleController {
   private syncNativeCaptionVisibility(): void {
     const nativeVisible = !this.settings.enabled || this.overlayHidden();
     this.netflixAdapter?.setNativeCaptionVisibility(nativeVisible);
-    this.meetAdapter?.setNativeCaptionVisibility(nativeVisible);
+    this.meetAdapter?.setNativeCaptionVisibility(nativeVisible || this.meetingChannelBroken);
+  }
+
+  /**
+   * A meeting whose only channel cannot answer would otherwise leave the user
+   * staring at an empty strip, because Meet's own captions are hidden for the
+   * whole enabled session. Reading the source language beats reading nothing,
+   * so they come back until the channel answers again.
+   */
+  private setMeetingChannelBroken(broken: boolean): void {
+    if (this.meetingChannelBroken === broken) {
+      return;
+    }
+    this.meetingChannelBroken = broken;
+    this.syncNativeCaptionVisibility();
   }
 
   private rememberLocalTranslation(sourceText: string, translation: string): void {
@@ -727,6 +825,9 @@ export class SubtitleController {
   }
 
   private syncTranslationChannels(): void {
+    // The user just changed the channel configuration; give it another chance
+    // before deciding the meeting has no translator.
+    this.setMeetingChannelBroken(false);
     this.draftTranslator?.destroy();
     this.draftTranslator = null;
     this.meetingChannel?.destroy();
@@ -754,7 +855,13 @@ export class SubtitleController {
   private async translateActiveCue(cue: SubtitleCue): Promise<void> {
     try {
       const response = await this.requestTranslation(cue);
-      if (this.destroyed || this.activeCue?.id !== cue.id) {
+      if (this.destroyed) {
+        return;
+      }
+      if (response.ok && response.translation) {
+        this.rememberLocalTranslation(cue.text, response.translation.text);
+      }
+      if (this.activeCue?.id !== cue.id) {
         return;
       }
       if (!isCueWithinPlaybackWindow(cue, this.clock.nowMs())) {
@@ -786,7 +893,6 @@ export class SubtitleController {
         return;
       }
 
-      this.rememberLocalTranslation(cue.text, response.translation.text);
       this.applyCaption(cue, "final", response.translation.text);
       const mode = response.translation.provider === "mock" ? "演示翻译模式" : "正在同步显示译文";
       this.report("ready", mode, cue.source, response.translation.latencyMs);

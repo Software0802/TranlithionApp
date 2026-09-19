@@ -16,9 +16,17 @@ export interface FakeNodeSpec {
   children?: FakeNodeSpec[];
 }
 
+type AttributeOperator = "=" | "*=" | "^=" | "$=";
+
 type SelectorPart =
   | { kind: "class"; value: string }
-  | { kind: "attribute"; name: string; value: string }
+  | {
+      kind: "attribute";
+      name: string;
+      value: string;
+      operator: AttributeOperator;
+      caseInsensitive: boolean;
+    }
   | { kind: "tag"; value: string };
 
 export class FakeElement {
@@ -91,7 +99,7 @@ export class FakeElement {
       if (part.kind === "tag") {
         return this.tagName === part.value.toUpperCase();
       }
-      return this.attributes[part.name] === part.value;
+      return matchesAttribute(this.attributes[part.name], part);
     });
   }
 }
@@ -106,16 +114,45 @@ export function asElement(fake: FakeElement): Element {
 }
 
 function parseCompound(compound: string): SelectorPart[] {
-  const pattern = /\.([\w-]+)|\[([\w-]+)="([^"]*)"\]|([A-Za-z][\w-]*)/g;
+  // Attribute form: [name], [name="v"], [name*="v"], each optionally with the
+  // ` i` case-insensitive flag Meet's localized aria-labels are matched with.
+  const pattern = /\.([\w-]+)|\[([\w-]+)([*^$]?=)"([^"]*)"(\s+i)?\]|([A-Za-z][\w-]*)/g;
   const parts: SelectorPart[] = [];
   for (let match = pattern.exec(compound); match; match = pattern.exec(compound)) {
     if (match[1]) {
       parts.push({ kind: "class", value: match[1] });
     } else if (match[2]) {
-      parts.push({ kind: "attribute", name: match[2], value: match[3] ?? "" });
-    } else if (match[4]) {
-      parts.push({ kind: "tag", value: match[4] });
+      parts.push({
+        kind: "attribute",
+        name: match[2],
+        operator: match[3] as AttributeOperator,
+        value: match[4] ?? "",
+        caseInsensitive: Boolean(match[5])
+      });
+    } else if (match[6]) {
+      parts.push({ kind: "tag", value: match[6] });
     }
   }
   return parts;
+}
+
+function matchesAttribute(
+  actual: string | undefined,
+  part: Extract<SelectorPart, { kind: "attribute" }>
+): boolean {
+  if (actual === undefined) {
+    return false;
+  }
+  const value = part.caseInsensitive ? actual.toLowerCase() : actual;
+  const expected = part.caseInsensitive ? part.value.toLowerCase() : part.value;
+  switch (part.operator) {
+    case "*=":
+      return value.includes(expected);
+    case "^=":
+      return value.startsWith(expected);
+    case "$=":
+      return value.endsWith(expected);
+    default:
+      return value === expected;
+  }
 }
