@@ -60,6 +60,24 @@ describe("Meet caption region", () => {
     ]);
   });
 
+  it("prefers a live region over a plain one when both hold caption rows", () => {
+    // Both match on role, so only the aria-live tier separates them: the
+    // strip Meet announces to a screen reader is the one being spoken into.
+    const plain = element({
+      attributes: { role: "region" },
+      children: [meetTurn("Bob Tan", "from the plain region")]
+    });
+    const live = element({
+      attributes: { role: "region", "aria-live": "polite" },
+      children: [meetTurn("Alice Chen", "from the live region")]
+    });
+    stubDocument([plain, live]);
+
+    expect(readMeetCaptionBlocks(findMeetCaptionRegion(null) as Element)).toEqual([
+      { speaker: "Alice Chen", text: "from the live region" }
+    ]);
+  });
+
   it("finds the caption region whatever language its label is in", () => {
     // The label is localized, so nothing may depend on reading it: the role
     // plus the caption rows inside are what identify the strip.
@@ -164,17 +182,22 @@ describe("Meet caption block parsing", () => {
     ).toEqual([]);
   });
 
-  it("does not accept a whole sentence as a display name", () => {
-    const sentence = "We should postpone the launch until the security review is done.";
+  it("keeps a long display name instead of second-guessing the selector", () => {
+    // Google account names carry titles, team suffixes and parenthetical
+    // roles. Dropping one on length would silently take that person's name
+    // off the overlay, out of the translation context and out of the D7
+    // transcript — the declared selector is the discriminator, not a guess
+    // about how long a name can be.
+    const name = "Alexandra Constantinescu-Petrescu | Platform Engineering (she/her)";
     const block = element({
       className: "nMcdL",
       children: [
-        { className: "zs7s8d", text: sentence },
+        { className: "zs7s8d", text: name },
         { className: "bh44bd", text: "Agreed." }
       ]
     });
 
-    expect(parseMeetCaptionBlock(asElement(block))).toEqual({ speaker: null, text: "Agreed." });
+    expect(parseMeetCaptionBlock(asElement(block))).toEqual({ speaker: name, text: "Agreed." });
   });
 
   it("reads every rendered turn in order, oldest first", () => {

@@ -35,6 +35,12 @@ import type {
 const PREPARE_TIMEOUT_MS = 10_000;
 /** A draft slower than this is pointless: the service answer is already close. */
 const DRAFT_TIMEOUT_MS = 800;
+/**
+ * When this channel *is* the caption (meeting mode), nothing slower is waiting
+ * behind it. A cold on-device model or a long sentence is worth waiting for;
+ * giving up at the draft budget would drop the line entirely.
+ */
+const FINAL_CHANNEL_TIMEOUT_MS = 4_000;
 
 /**
  * A source of immediate, lower-quality captions. Implementations must resolve
@@ -102,7 +108,12 @@ export class DraftTranslator implements DraftChannel {
   private preparation: Promise<TranslatorInstance | null> | null = null;
   private unsupported = false;
 
-  constructor(sourceLanguage: SourceLanguage, targetLanguage: TargetLanguage) {
+  constructor(
+    sourceLanguage: SourceLanguage,
+    targetLanguage: TargetLanguage,
+    /** This channel is the caption the user reads, not a preview of one. */
+    private readonly asFinal = false
+  ) {
     this.pair = {
       sourceLanguage: toTranslatorLanguage(sourceLanguage),
       targetLanguage: toTranslatorLanguage(targetLanguage)
@@ -131,7 +142,10 @@ export class DraftTranslator implements DraftChannel {
       return null;
     }
     try {
-      const translated = await withTimeout(instance.translate(source), DRAFT_TIMEOUT_MS);
+      const translated = await withTimeout(
+        instance.translate(source),
+        this.asFinal ? FINAL_CHANNEL_TIMEOUT_MS : DRAFT_TIMEOUT_MS
+      );
       if (signal?.aborted || typeof translated !== "string") {
         return null;
       }
@@ -298,7 +312,7 @@ export function createFastChannel(
   asFinal = false
 ): DraftChannel | null {
   if (settings.draftProvider === "browser") {
-    return new DraftTranslator(settings.sourceLanguage, settings.targetLanguage);
+    return new DraftTranslator(settings.sourceLanguage, settings.targetLanguage, asFinal);
   }
   // A remote provider without a key would spend a request per caption to fail.
   if (settings.draftProvider === "deepl" && !settings.draftApiKeyConfigured) {

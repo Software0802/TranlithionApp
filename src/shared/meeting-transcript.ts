@@ -15,8 +15,6 @@
 
 /** One meeting per key: `meeting-transcript:<sessionId>`. */
 export const MEETING_TRANSCRIPT_KEY_PREFIX = "meeting-transcript:";
-/** The single-blob key earlier builds wrote; dropped on the next prune. */
-export const LEGACY_MEETING_TRANSCRIPT_KEY = "meeting-transcripts";
 
 /** Caps so a long day of meetings cannot fill the profile's storage quota. */
 export const MAX_TRANSCRIPT_SESSIONS = 20;

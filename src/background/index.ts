@@ -27,7 +27,6 @@ import {
   appendTranscriptLine,
   expiredTranscriptKeys,
   isTranscriptSessionKey,
-  LEGACY_MEETING_TRANSCRIPT_KEY,
   readTranscriptSession,
   readTranscriptSessions,
   retainedTranscriptSessions,
@@ -830,19 +829,14 @@ async function dropExpiredTranscripts(retentionDays: number): Promise<void> {
     Date.now(),
     retentionDays
   );
-  // Meetings an earlier build wrote into one shared blob are dropped rather
-  // than migrated: they would otherwise sit in the quota past their window.
-  const legacy = LEGACY_MEETING_TRANSCRIPT_KEY in stored ? [LEGACY_MEETING_TRANSCRIPT_KEY] : [];
-  if (expired.length + legacy.length > 0) {
-    await chrome.storage.local.remove([...expired, ...legacy]);
+  if (expired.length > 0) {
+    await chrome.storage.local.remove(expired);
   }
 }
 
 async function clearStoredTranscripts(): Promise<void> {
   await queueTranscriptStorageUpdate(async () => {
-    const keys = Object.keys(await chrome.storage.local.get(null)).filter(
-      (key) => isTranscriptSessionKey(key) || key === LEGACY_MEETING_TRANSCRIPT_KEY
-    );
+    const keys = Object.keys(await chrome.storage.local.get(null)).filter(isTranscriptSessionKey);
     if (keys.length > 0) {
       await chrome.storage.local.remove(keys);
     }

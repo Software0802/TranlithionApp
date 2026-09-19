@@ -139,6 +139,45 @@ describe("on-device draft translator", () => {
     }
   });
 
+  it("waits longer for the on-device model when it is the caption itself", async () => {
+    vi.useFakeTimers();
+    try {
+      // Meeting mode with stock settings makes this channel the final caption:
+      // nothing slower is waiting behind it, and a cold model that answers at
+      // 1.5 s is a line the user reads rather than a line that disappears.
+      let settle: ((text: string) => void) | undefined;
+      stubTranslatorApi({
+        translate: () => new Promise<string>((resolve) => {
+          settle = resolve;
+        })
+      });
+      const translator = new DraftTranslator("ja", "zh-CN", true);
+
+      const caption = translator.translate("こんにちは");
+      await vi.advanceTimersByTimeAsync(1_500);
+      settle?.("你好");
+
+      expect(await caption).toBe("你好");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still gives up on a final-channel translation that never answers", async () => {
+    vi.useFakeTimers();
+    try {
+      stubTranslatorApi({ translateHangs: true });
+      const translator = new DraftTranslator("ja", "zh-CN", true);
+
+      const caption = translator.translate("こんにちは");
+      await vi.advanceTimersByTimeAsync(4_000);
+
+      expect(await caption).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("drops a draft whose caption was already superseded", async () => {
     stubTranslatorApi({});
     const translator = new DraftTranslator("ja", "zh-CN");

@@ -16,7 +16,8 @@ export interface FakeNodeSpec {
   children?: FakeNodeSpec[];
 }
 
-type AttributeOperator = "=" | "*=" | "^=" | "$=";
+/** `present` is the bare `[name]` form, which only asks that the attribute exists. */
+type AttributeOperator = "present" | "=" | "*=" | "^=" | "$=";
 
 type SelectorPart =
   | { kind: "class"; value: string }
@@ -126,9 +127,12 @@ export function asElement(fake: FakeElement): Element {
 }
 
 function parseCompound(compound: string): SelectorPart[] {
-  // Attribute form: [name], [name="v"], [name*="v"], each optionally with the
-  // ` i` case-insensitive flag Meet's localized aria-labels are matched with.
-  const pattern = /\.([\w-]+)|\[([\w-]+)([*^$]?=)"([^"]*)"(\s+i)?\]|([A-Za-z][\w-]*)/g;
+  // Attribute forms: [name] on its own, or [name="v"] / [name*="v"], each
+  // optionally with the ` i` case-insensitive flag. The bare form has to be
+  // matched before the tag alternative, which would otherwise swallow the
+  // attribute name and turn `[aria-live]` into a tag nothing can be.
+  const pattern =
+    /\.([\w-]+)|\[([\w-]+)([*^$]?=)"([^"]*)"(\s+i)?\]|\[([\w-]+)\]|([A-Za-z][\w-]*)/g;
   const parts: SelectorPart[] = [];
   for (let match = pattern.exec(compound); match; match = pattern.exec(compound)) {
     if (match[1]) {
@@ -142,7 +146,15 @@ function parseCompound(compound: string): SelectorPart[] {
         caseInsensitive: Boolean(match[5])
       });
     } else if (match[6]) {
-      parts.push({ kind: "tag", value: match[6] });
+      parts.push({
+        kind: "attribute",
+        name: match[6],
+        operator: "present",
+        value: "",
+        caseInsensitive: false
+      });
+    } else if (match[7]) {
+      parts.push({ kind: "tag", value: match[7] });
     }
   }
   return parts;
@@ -158,6 +170,8 @@ function matchesAttribute(
   const value = part.caseInsensitive ? actual.toLowerCase() : actual;
   const expected = part.caseInsensitive ? part.value.toLowerCase() : part.value;
   switch (part.operator) {
+    case "present":
+      return true;
     case "*=":
       return value.includes(expected);
     case "^=":

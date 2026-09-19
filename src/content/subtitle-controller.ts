@@ -639,12 +639,20 @@ export class SubtitleController {
     if (this.settings.meetingFinalChannel === "local-mt") {
       return "本机 LibreTranslate";
     }
+    if (this.settings.draftProvider === "browser") {
+      return "Chrome 内置翻译";
+    }
     return this.settings.draftProvider === "deepl" ? "DeepL" : "机器翻译";
   }
 
   private singleChannelFailureMessage(): string {
     if (this.meetingMode() && this.settings.meetingFinalChannel === "local-mt") {
       return "本机 LibreTranslate 未响应；请确认它已启动，或在设置中改用其他会议翻译通道。";
+    }
+    // The on-device translator has neither an address nor a Key, so sending
+    // the user to check them would be pointing at the wrong screen.
+    if (this.meetingMode() && this.settings.draftProvider === "browser") {
+      return "Chrome 内置翻译没有给出结果：这台设备或这个语言对可能不支持它。请在设置中把会议翻译通道改为 DeepL / 自定义机器翻译或本机 LibreTranslate。";
     }
     return `${this.singleChannelLabel()}：翻译失败或超时；请在设置中检查该通道的地址与 Key。`;
   }

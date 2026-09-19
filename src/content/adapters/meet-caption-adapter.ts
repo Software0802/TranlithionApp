@@ -35,17 +35,13 @@ export const MEET_CAPTION_REGION_SELECTORS = [
 ] as const;
 
 /** One speaker turn inside the region. Falls back to the region's children. */
-export const MEET_CAPTION_BLOCK_SELECTORS = [".nMcdL", ".TBMuR"] as const;
+export const MEET_CAPTION_BLOCK_SELECTORS = [".nMcdL"] as const;
 
 /** The spoken text inside a turn. */
-export const MEET_CAPTION_TEXT_SELECTORS = [
-  '[jsname="tgaKEf"]',
-  ".bh44bd",
-  ".iTTPOb"
-] as const;
+export const MEET_CAPTION_TEXT_SELECTORS = ['[jsname="tgaKEf"]', ".bh44bd"] as const;
 
 /** The speaker's display name inside a turn. */
-export const MEET_CAPTION_SPEAKER_SELECTORS = [".zs7s8d", ".KcIKyf"] as const;
+export const MEET_CAPTION_SPEAKER_SELECTORS = [".zs7s8d"] as const;
 
 export const MEET_NATIVE_HIDE_STYLE_ID = "tranlithion-hide-meet-captions";
 
@@ -55,9 +51,6 @@ export const MEET_NATIVE_HIDE_STYLE_ID = "tranlithion-hide-meet-captions";
  * can be dimmed by a selector that happens to match it too.
  */
 export const MEET_NATIVE_HIDE_ATTRIBUTE = "data-tranlithion-meet-captions";
-
-/** A display name longer than this is almost certainly a sentence, not a name. */
-export const MEET_MAX_SPEAKER_CHARS = 60;
 
 /**
  * Longest run of recognizer output translated as one line when the recognizer
@@ -144,7 +137,7 @@ export function settledSegmentEnd(text: string): number {
  */
 export function parseMeetCaptionBlock(block: Element): MeetCaptionBlock {
   return {
-    speaker: usableSpeaker(pickText(block, MEET_CAPTION_SPEAKER_SELECTORS)),
+    speaker: pickText(block, MEET_CAPTION_SPEAKER_SELECTORS) || null,
     text: pickText(block, MEET_CAPTION_TEXT_SELECTORS)
   };
 }
@@ -622,10 +615,6 @@ function captionBlockElements(region: Element): Element[] {
 function pickText(block: Element, selectors: readonly string[]): string {
   const matched = block.querySelector(selectors.join(", "));
   return matched ? normalizeSubtitleText(elementText(matched)) : "";
-}
-
-function usableSpeaker(speaker: string): string | null {
-  return speaker && speaker.length <= MEET_MAX_SPEAKER_CHARS ? speaker : null;
 }
 
 function elementText(element: Element): string {
