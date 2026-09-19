@@ -51,6 +51,30 @@ describe("translation session memory", () => {
     expect(store.getContext("session").map((line) => line.cueId)).toEqual(["cue-1", "cue-2"]);
   });
 
+  it("answers a repeat from a channel that has no cue to key on", () => {
+    // The machine-translation meeting channels never reach the model, so the
+    // text memory is what stops a sentence being paid for twice in one call.
+    const store = new TranslationSessionStore();
+    store.rememberText("session", "Figma.", result("Figma."));
+
+    expect(store.getCachedByText("session", "Figma.")?.text).toBe("Figma.");
+    // `snapshot` is exactly what reaches extension storage: a line handled
+    // this way leaves nothing of what was said behind it.
+    expect(store.snapshot("session")?.recent).toEqual([]);
+  });
+
+  it("accumulates terminology without the sentences it came from", () => {
+    const store = new TranslationSessionStore();
+    store.rememberEntityHints("session", [
+      { source: "Alice Chen", target: "Alice Chen", kind: "name" }
+    ]);
+
+    expect(store.getEntityHints("session")).toEqual([
+      { source: "Alice Chen", target: "Alice Chen", kind: "name" }
+    ]);
+    expect(store.snapshot("session")?.recent).toEqual([]);
+  });
+
   it("reuses translations by source text across different cue ids", () => {
     const store = new TranslationSessionStore();
     store.record(

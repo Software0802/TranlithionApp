@@ -19,7 +19,7 @@ export const MEETING_CONTENT_SCRIPT_ID = "tranlithion-meeting-hosts";
 
 export function isMeetingHost(hostname: string): boolean {
   const normalized = hostname.toLocaleLowerCase();
-  return MEETING_HOSTS.some((host) => normalized === host || normalized.endsWith(`.${host}`));
+  return MEETING_HOSTS.some((host) => normalized === host);
 }
 
 /**

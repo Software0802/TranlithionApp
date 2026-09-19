@@ -34,7 +34,8 @@ export type ExtensionMessage =
       /** Meeting mode: this channel is the caption, not an optional preview. */
       asFinal?: boolean;
     }
-  | { type: "TRANSLATE_PLAIN"; text: string }
+  /** `sessionId` marks a caption channel, whose session memory answers repeats. */
+  | { type: "TRANSLATE_PLAIN"; text: string; sessionId?: string }
   | { type: "TRANSLATE_PLAIN_BATCH"; texts: string[] }
   /**
    * A settled bilingual meeting line. The background worker owns both the

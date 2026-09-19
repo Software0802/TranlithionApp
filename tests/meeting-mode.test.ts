@@ -102,6 +102,9 @@ describe("meeting host detection", () => {
     expect(isMeetingHost("zoom.us")).toBe(false);
     // A lookalike domain must not switch meeting behaviour on.
     expect(isMeetingHost("meet.google.com.evil.example")).toBe(false);
+    // Nor a subdomain: the granted origin is that one host, so a page under
+    // any other name is a page meeting mode was never authorized to read.
+    expect(isMeetingHost("evil.meet.google.com")).toBe(false);
   });
 
   it("requires both the user's switch and an actual meeting host", () => {

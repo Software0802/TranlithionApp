@@ -212,7 +212,7 @@ describe("local LibreTranslate caption channel", () => {
       vi.stubGlobal("chrome", {
         runtime: { id: "tranlithion-test", sendMessage: () => NEVER }
       });
-      const channel = new LocalMtTranslator();
+      const channel = new LocalMtTranslator("meeting-1");
 
       const caption = channel.translate("こんにちは");
       await vi.advanceTimersByTimeAsync(4_000);
@@ -236,7 +236,7 @@ describe("local LibreTranslate caption channel", () => {
             })
         }
       });
-      const channel = new LocalMtTranslator();
+      const channel = new LocalMtTranslator("meeting-1");
 
       const caption = channel.translate("こんにちは");
       await vi.advanceTimersByTimeAsync(2_000);

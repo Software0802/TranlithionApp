@@ -98,6 +98,18 @@ describe("remote draft translator", () => {
     expect(await translateDraft({ text: "こんにちは", settings: DEEPL })).toBeNull();
   });
 
+  it("keeps a caption that reads the same in both languages", async () => {
+    // As the meeting's final channel there is nothing better coming: a name,
+    // an acronym or a figure simply reads the same, and reporting it as "no
+    // result" would call a working channel dead and take the caption away.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(jsonResponse({ translations: [{ text: "Figma." }] }))
+    );
+
+    expect(await translateDraft({ text: "Figma.", settings: DEEPL, asFinal: true })).toBe("Figma.");
+  });
+
   it("drops a draft whose caption was superseded before the request began", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);

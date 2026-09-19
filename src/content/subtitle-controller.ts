@@ -864,7 +864,7 @@ export class SubtitleController {
     if (this.meetingMode() && this.settings.meetingFinalChannel !== "llm") {
       this.meetingChannel =
         this.settings.meetingFinalChannel === "local-mt"
-          ? new LocalMtTranslator()
+          ? new LocalMtTranslator(this.sessionId)
           : createFastChannel(this.settings, this.sessionId, () => this.activeCue?.id ?? "", true);
       void this.meetingChannel?.prepare();
       return;

@@ -161,7 +161,7 @@ async function handleMessage(
       return { ok: true };
     }
     case "TRANSLATE_PLAIN": {
-      return translatePlain(message.text);
+      return translatePlain(message.text, message.sessionId);
     }
     case "TRANSLATE_PLAIN_BATCH": {
       return translatePlainBatch(message.texts);
@@ -327,6 +327,14 @@ async function draftTranslate(
     return { ok: false };
   }
 
+  // As the caption itself this channel carries a whole meeting, where the same
+  // sentence comes round again and again. What the session already learned is
+  // both faster and cheaper than asking the service a second time.
+  const remembered = asFinal ? sessionStore.getCachedByText(sessionId, text) : undefined;
+  if (remembered) {
+    return { ok: true, text: remembered.text };
+  }
+
   draftControllers.get(sessionId)?.abort();
   const controller = new AbortController();
   draftControllers.set(sessionId, controller);
@@ -337,7 +345,18 @@ async function draftTranslate(
       signal: controller.signal,
       asFinal
     });
-    return translated && !controller.signal.aborted ? { ok: true, text: translated } : { ok: false };
+    if (!translated || controller.signal.aborted) {
+      return { ok: false };
+    }
+    if (asFinal) {
+      sessionStore.rememberText(sessionId, text, {
+        text: translated,
+        provider: settings.provider,
+        latencyMs: 0,
+        entityHints: []
+      });
+    }
+    return { ok: true, text: translated };
   } finally {
     if (draftControllers.get(sessionId) === controller) {
       draftControllers.delete(sessionId);
@@ -376,6 +395,21 @@ async function recordMeetingLine(
   const entityHints: EntityHint[] = message.cue.speaker
     ? [{ source: message.cue.speaker, target: message.cue.speaker, kind: "name" }]
     : [];
+
+  if (!settings.meetingTranscript) {
+    // The user declined a record of this call, so nothing said in it is kept
+    // beyond the live session: the terms accumulate in memory, the sentences
+    // and the names they were said by are never written to storage.
+    sessionStore.rememberEntityHints(message.sessionId, entityHints);
+    sessionStore.rememberText(message.sessionId, message.cue.text, {
+      text: translation,
+      provider: settings.provider,
+      latencyMs: 0,
+      entityHints: []
+    });
+    return { ok: true };
+  }
+
   sessionStore.record(message.sessionId, message.cue, {
     text: translation,
     provider: settings.provider,
@@ -384,9 +418,6 @@ async function recordMeetingLine(
   });
   await persistSession(message.sessionId);
 
-  if (!settings.meetingTranscript) {
-    return { ok: true };
-  }
   await queueTranscriptStorageUpdate(async () => {
     // Only this meeting's own key is read and written, so one sentence never
     // pays to serialize every meeting on record.
@@ -439,7 +470,15 @@ async function meetingTranscriptSummary(): Promise<MeetingTranscriptResponse> {
   };
 }
 
-async function translatePlain(text: string): Promise<PlainTranslationResponse> {
+/**
+ * `sessionId` is present when this is a caption channel rather than a one-off
+ * page or selection translation: a meeting repeats itself, so the session's
+ * memory answers the second time a sentence is said.
+ */
+async function translatePlain(
+  text: string,
+  sessionId?: string
+): Promise<PlainTranslationResponse> {
   const settings = await getSettings();
   if (!settings.enabled) {
     return { ok: false, error: "翻译已暂停。" };
@@ -450,8 +489,23 @@ async function translatePlain(text: string): Promise<PlainTranslationResponse> {
   if (await localMtPermissionMissing(settings)) {
     return { ok: false, error: "尚未授权访问本机翻译服务地址。" };
   }
+  const remembered = sessionId ? sessionStore.getCachedByText(sessionId, text) : undefined;
+  if (remembered) {
+    return { ok: true, text: remembered.text };
+  }
   const translated = await translateWithLibreTranslate(text, settings);
-  return translated ? { ok: true, text: translated } : { ok: false, error: "本机翻译失败。请确认 LibreTranslate 已启动。" };
+  if (!translated) {
+    return { ok: false, error: "本机翻译失败。请确认 LibreTranslate 已启动。" };
+  }
+  if (sessionId) {
+    sessionStore.rememberText(sessionId, text, {
+      text: translated,
+      provider: settings.provider,
+      latencyMs: 0,
+      entityHints: []
+    });
+  }
+  return { ok: true, text: translated };
 }
 
 async function translatePlainBatch(texts: string[]): Promise<PlainBatchTranslationResponse> {

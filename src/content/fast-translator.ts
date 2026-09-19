@@ -268,6 +268,8 @@ export class RemoteDraftTranslator implements DraftChannel {
  * translated entirely on the user's own machine.
  */
 export class LocalMtTranslator implements DraftChannel {
+  constructor(private readonly sessionId: string) {}
+
   async prepare(): Promise<boolean> {
     return true;
   }
@@ -284,7 +286,8 @@ export class LocalMtTranslator implements DraftChannel {
       const response = await withTimeout(
         safeRuntimeSendMessage<PlainTranslationResponse>({
           type: "TRANSLATE_PLAIN",
-          text
+          text,
+          sessionId: this.sessionId
         } satisfies ExtensionMessage),
         FINAL_CHANNEL_TIMEOUT_MS
       );

@@ -72,32 +72,38 @@ export class TranslationSessionStore {
       session.cached.delete(oldestKey);
     }
 
-    const textKey = cue.text.trim();
-    if (textKey) {
-      // Re-insert so repeated lines refresh LRU order in the Map iteration.
-      session.cachedByText.delete(textKey);
-      session.cachedByText.set(textKey, translation);
-      while (session.cachedByText.size > MAX_CACHED_BY_TEXT) {
-        const oldestKey = session.cachedByText.keys().next().value;
-        if (oldestKey === undefined) {
-          break;
-        }
-        session.cachedByText.delete(oldestKey);
-      }
-    }
+    this.storeByText(session, cue.text, translation);
+    this.storeEntityHints(session, translation.entityHints);
+    session.lastTouchedAt = Date.now();
+    this.prune();
+  }
 
-    for (const hint of translation.entityHints) {
-      const key = hint.source.toLocaleLowerCase();
-      const existingIndex = session.entityHints.findIndex(
-        (entry) => entry.source.toLocaleLowerCase() === key
-      );
-      if (existingIndex >= 0) {
-        session.entityHints.splice(existingIndex, 1, hint);
-      } else {
-        session.entityHints.push(hint);
-      }
+  /**
+   * Remembers a finished translation by its source text alone.
+   *
+   * The machine-translation channels have no cue to key on and never reach
+   * the model's context window, but a line repeated later in the same session
+   * should still skip the network rather than be paid for twice.
+   */
+  rememberText(sessionId: string, sourceText: string, translation: TranslationResult): void {
+    const session = this.getSession(sessionId);
+    this.storeByText(session, sourceText, translation);
+    this.storeEntityHints(session, translation.entityHints);
+    session.lastTouchedAt = Date.now();
+    this.prune();
+  }
+
+  /**
+   * Terminology only: the pairs a session has learned, without the sentences
+   * they came from. This is what a meeting may accumulate when the user has
+   * declined to keep a record of what was said.
+   */
+  rememberEntityHints(sessionId: string, hints: EntityHint[]): void {
+    if (hints.length === 0) {
+      return;
     }
-    session.entityHints.splice(0, Math.max(0, session.entityHints.length - MAX_ENTITY_HINTS));
+    const session = this.getSession(sessionId);
+    this.storeEntityHints(session, hints);
     session.lastTouchedAt = Date.now();
     this.prune();
   }
@@ -132,6 +138,42 @@ export class TranslationSessionStore {
 
   clear(sessionId: string): void {
     this.sessions.delete(sessionId);
+  }
+
+  private storeByText(
+    session: SessionMemory,
+    sourceText: string,
+    translation: TranslationResult
+  ): void {
+    const textKey = sourceText.trim();
+    if (!textKey) {
+      return;
+    }
+    // Re-insert so repeated lines refresh LRU order in the Map iteration.
+    session.cachedByText.delete(textKey);
+    session.cachedByText.set(textKey, translation);
+    while (session.cachedByText.size > MAX_CACHED_BY_TEXT) {
+      const oldestKey = session.cachedByText.keys().next().value;
+      if (oldestKey === undefined) {
+        break;
+      }
+      session.cachedByText.delete(oldestKey);
+    }
+  }
+
+  private storeEntityHints(session: SessionMemory, hints: EntityHint[]): void {
+    for (const hint of hints) {
+      const key = hint.source.toLocaleLowerCase();
+      const existingIndex = session.entityHints.findIndex(
+        (entry) => entry.source.toLocaleLowerCase() === key
+      );
+      if (existingIndex >= 0) {
+        session.entityHints.splice(existingIndex, 1, hint);
+      } else {
+        session.entityHints.push(hint);
+      }
+    }
+    session.entityHints.splice(0, Math.max(0, session.entityHints.length - MAX_ENTITY_HINTS));
   }
 
   private getSession(sessionId: string): SessionMemory {

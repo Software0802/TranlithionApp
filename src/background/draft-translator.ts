@@ -73,9 +73,12 @@ export async function translateDraft(input: RemoteDraftInput): Promise<string | 
     if (!translated || controller.signal.aborted) {
       return null;
     }
-    // An echo of the source reads as a finished translation that silently
-    // failed, which is worse than leaving the caption to the main translator.
-    return translated === text ? null : translated;
+    // As a draft, an echo of the source reads as a finished translation that
+    // silently failed, which is worse than leaving the caption to the main
+    // translator. As the caption itself there is nothing behind it: a name or
+    // a figure simply reads the same in both languages, and reporting that as
+    // no result would call a working channel dead.
+    return !input.asFinal && translated === text ? null : translated;
   } catch {
     return null;
   } finally {
