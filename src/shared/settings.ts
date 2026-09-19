@@ -36,11 +36,14 @@ export const DEFAULT_SETTINGS: TranslationSettings = {
   draftApiKey: "",
   localMtEnabled: true,
   localMtUrl: "http://127.0.0.1:5000/translate",
-  meetingMode: true,
+  // Meeting mode is opt-in: reading what people say in a call, and keeping it
+  // on disk, starts when the user asks for it in settings — never because an
+  // earlier all-sites permission happens to cover meet.google.com.
+  meetingMode: false,
   meetingFinalChannel: "fast-mt",
   meetingMascot: false,
   meetingOverlayHidden: false,
-  meetingTranscript: true,
+  meetingTranscript: false,
   meetingTranscriptRetentionDays: DEFAULT_TRANSCRIPT_RETENTION_DAYS
 };
 

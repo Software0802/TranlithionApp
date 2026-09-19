@@ -64,6 +64,18 @@ export class FakeElement {
     this.ownText = text;
   }
 
+  getAttribute(name: string): string | null {
+    return this.attributes[name] ?? null;
+  }
+
+  setAttribute(name: string, value: string): void {
+    this.attributes[name] = value;
+  }
+
+  removeAttribute(name: string): void {
+    delete this.attributes[name];
+  }
+
   matches(selector: string): boolean {
     return selector
       .split(",")

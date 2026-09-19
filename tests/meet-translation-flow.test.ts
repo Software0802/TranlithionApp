@@ -1,7 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   MEET_CAPTION_SETTLE_DELAY_MS,
-  MEET_NATIVE_HIDE_STYLE_ID
+  MEET_NATIVE_HIDE_STYLE_ID,
+  MEET_REGION_POLL_INTERVAL_MS
 } from "../src/content/adapters/meet-caption-adapter";
 import { SubtitleController } from "../src/content/subtitle-controller";
 import { DEFAULT_SETTINGS, publicSettings } from "../src/shared/settings";
@@ -102,6 +103,7 @@ function createFixture() {
     },
     createElement: createNode,
     getElementById: (id: string) => documentStyles.get(id) ?? null,
+    querySelectorAll: (selector: string) => (region.matches(selector) ? [region] : []),
     querySelector: (selector: string) => (region.matches(selector) ? region : null),
     addEventListener: () => undefined,
     removeEventListener: () => undefined
@@ -151,6 +153,8 @@ function createFixture() {
     { kind: "page" },
     {
       ...publicSettings(DEFAULT_SETTINGS),
+      meetingMode: true,
+      meetingTranscript: true,
       draftProvider: "deepl",
       draftApiKeyConfigured: true
     },
@@ -195,7 +199,13 @@ function createFixture() {
     nativeCaptionsVisible: () => !documentStyles.has(MEET_NATIVE_HIDE_STYLE_ID),
     async render(turns: Turn[]) {
       rebuild(turns);
-      notifyMutation?.();
+      if (notifyMutation) {
+        notifyMutation();
+      } else {
+        // The region is only adopted once it is carrying caption rows, so the
+        // first strip is picked up by the discovery poll.
+        await vi.advanceTimersByTimeAsync(MEET_REGION_POLL_INTERVAL_MS);
+      }
       await vi.advanceTimersByTimeAsync(SETTLE_MS);
     },
     /** Advances the wall clock while the adapter's heartbeat runs. */

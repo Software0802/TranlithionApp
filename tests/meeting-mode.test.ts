@@ -8,11 +8,14 @@ import {
 } from "../src/shared/meeting";
 import {
   appendTranscriptLine,
-  listTranscriptSessions,
+  expiredTranscriptKeys,
+  isTranscriptSessionKey,
   MAX_TRANSCRIPT_SESSIONS,
-  pruneTranscripts,
-  readTranscriptStore,
-  type MeetingTranscriptStore
+  readTranscriptSession,
+  readTranscriptSessions,
+  retainedTranscriptSessions,
+  transcriptSessionKey,
+  type MeetingTranscriptSession
 } from "../src/shared/meeting-transcript";
 import { DEFAULT_SETTINGS, normalizeSettings } from "../src/shared/settings";
 
@@ -42,14 +45,20 @@ describe("meeting mode defaults", () => {
     expect(DEFAULT_SETTINGS.meetingFinalChannel).toBe("fast-mt");
   });
 
-  it("stores a meeting transcript locally and expires it after a week", () => {
-    expect(DEFAULT_SETTINGS.meetingTranscript).toBe(true);
+  it("reads no meeting and stores no transcript until the user opts in", () => {
+    // A host permission granted for something else must never be enough to
+    // start listening to a call or writing it to disk.
+    expect(DEFAULT_SETTINGS.meetingMode).toBe(false);
+    expect(DEFAULT_SETTINGS.meetingTranscript).toBe(false);
+    expect(isMeetingModeActive(DEFAULT_SETTINGS, "meet.google.com")).toBe(false);
+  });
+
+  it("expires a transcript the user does switch on after a week", () => {
     expect(DEFAULT_SETTINGS.meetingTranscriptRetentionDays).toBe(7);
   });
 
   it("starts with the overlay visible", () => {
     expect(DEFAULT_SETTINGS.meetingOverlayHidden).toBe(false);
-    expect(DEFAULT_SETTINGS.meetingMode).toBe(true);
   });
 
   it("rejects an unknown channel and clamps an out-of-range retention window", () => {
@@ -165,77 +174,119 @@ describe("meeting caption timing rules", () => {
 
 describe("local meeting transcript", () => {
   it("records a bilingual line with its speaker", () => {
-    const store = appendTranscriptLine({}, lineInput());
+    const meeting = appendTranscriptLine(null, lineInput());
 
-    expect(store["meeting-1"].lines).toEqual([
+    expect(meeting?.lines).toEqual([
       { atMs: 1_000, speaker: "Alice Chen", source: "Good morning.", translation: "早上好。" }
     ]);
-    expect(store["meeting-1"].title).toBe("Weekly sync");
+    expect(meeting?.title).toBe("Weekly sync");
+  });
+
+  it("keeps each meeting under its own storage key", () => {
+    // One line lands every few seconds for the length of a meeting, so a line
+    // may never cost a rewrite of every meeting ever recorded.
+    expect(transcriptSessionKey("meeting-1")).not.toBe(transcriptSessionKey("meeting-2"));
+    expect(isTranscriptSessionKey(transcriptSessionKey("meeting-1"))).toBe(true);
+    expect(isTranscriptSessionKey("translation-settings")).toBe(false);
   });
 
   it("does not record the same line twice when a revision settles unchanged", () => {
-    const once = appendTranscriptLine({}, lineInput());
+    const once = appendTranscriptLine(null, lineInput());
     const twice = appendTranscriptLine(once, lineInput({ atMs: 1_400 }));
 
-    expect(twice["meeting-1"].lines).toHaveLength(1);
+    expect(twice?.lines).toHaveLength(1);
+    // Unchanged: the caller skips the storage write entirely.
+    expect(twice).toBe(once);
   });
 
   it("records the same words again when a different person says them", () => {
-    const store = appendTranscriptLine(
-      appendTranscriptLine({}, lineInput()),
+    const meeting = appendTranscriptLine(
+      appendTranscriptLine(null, lineInput()),
       lineInput({ speaker: "Bob Tan", atMs: 1_400 })
     );
 
-    expect(store["meeting-1"].lines).toHaveLength(2);
+    expect(meeting?.lines).toHaveLength(2);
+  });
+
+  it("replaces a line the recognizer took back rather than keeping both", () => {
+    const withdrawn = appendTranscriptLine(null, lineInput({ source: "Hi everyone." }));
+    const corrected = appendTranscriptLine(
+      withdrawn,
+      lineInput({ source: "Hey everyone.", atMs: 1_400, replaces: ["Hi everyone."] })
+    );
+
+    expect(corrected?.lines.map((line) => line.source)).toEqual(["Hey everyone."]);
+  });
+
+  it("leaves lines alone when the withdrawn wording is not the last one", () => {
+    const first = appendTranscriptLine(null, lineInput({ source: "Good morning." }));
+    const second = appendTranscriptLine(first, lineInput({ source: "Let's begin.", atMs: 1_400 }));
+    const third = appendTranscriptLine(
+      second,
+      lineInput({ source: "Any questions?", atMs: 1_800, replaces: ["Good morning."] })
+    );
+
+    expect(third?.lines.map((line) => line.source)).toEqual([
+      "Good morning.",
+      "Let's begin.",
+      "Any questions?"
+    ]);
   });
 
   it("ignores a line with nothing on one side of it", () => {
-    expect(appendTranscriptLine({}, lineInput({ translation: "   " }))).toEqual({});
-    expect(appendTranscriptLine({}, lineInput({ source: "" }))).toEqual({});
+    expect(appendTranscriptLine(null, lineInput({ translation: "   " }))).toBeNull();
+    expect(appendTranscriptLine(null, lineInput({ source: "" }))).toBeNull();
   });
 
   it("deletes meetings older than the retention window", () => {
     const now = 100 * DAY_MS;
-    const store: MeetingTranscriptStore = {
-      fresh: session("fresh", now - 2 * DAY_MS),
-      stale: session("stale", now - 8 * DAY_MS)
-    };
+    const sessions = [session("fresh", now - 2 * DAY_MS), session("stale", now - 8 * DAY_MS)];
 
-    const pruned = pruneTranscripts(store, now, 7);
-
-    expect(Object.keys(pruned)).toEqual(["fresh"]);
+    expect(retainedTranscriptSessions(sessions, now, 7).map((one) => one.sessionId)).toEqual([
+      "fresh"
+    ]);
+    expect(expiredTranscriptKeys(sessions, now, 7)).toEqual([transcriptSessionKey("stale")]);
   });
 
   it("keeps a meeting that is exactly inside the window", () => {
     const now = 100 * DAY_MS;
-    const pruned = pruneTranscripts({ edge: session("edge", now - 7 * DAY_MS) }, now, 7);
+    const sessions = [session("edge", now - 7 * DAY_MS)];
 
-    expect(Object.keys(pruned)).toEqual(["edge"]);
+    expect(retainedTranscriptSessions(sessions, now, 7).map((one) => one.sessionId)).toEqual([
+      "edge"
+    ]);
+    expect(expiredTranscriptKeys(sessions, now, 7)).toEqual([]);
   });
 
   it("caps how many meetings are kept, newest first", () => {
-    let store: MeetingTranscriptStore = {};
-    for (let index = 0; index < MAX_TRANSCRIPT_SESSIONS + 5; index += 1) {
-      store = appendTranscriptLine(store, lineInput({
-        sessionId: `meeting-${index}`,
-        atMs: 1_000 + index
-      }));
-    }
+    const now = 100 * DAY_MS;
+    const sessions = Array.from({ length: MAX_TRANSCRIPT_SESSIONS + 5 }, (_, index) =>
+      session(`meeting-${index}`, now - index * 1_000)
+    );
 
-    const sessions = listTranscriptSessions(store);
-    expect(sessions).toHaveLength(MAX_TRANSCRIPT_SESSIONS);
-    expect(sessions[0].sessionId).toBe(`meeting-${MAX_TRANSCRIPT_SESSIONS + 4}`);
+    const retained = retainedTranscriptSessions(sessions, now, 7);
+
+    expect(retained).toHaveLength(MAX_TRANSCRIPT_SESSIONS);
+    expect(retained[0].sessionId).toBe("meeting-0");
+    expect(expiredTranscriptKeys(sessions, now, 7)).toHaveLength(5);
   });
 
-  it("drops anything in storage that is not a transcript", () => {
-    expect(readTranscriptStore("not a store")).toEqual({});
-    expect(readTranscriptStore({ broken: { sessionId: 7 } })).toEqual({});
-    const valid = appendTranscriptLine({}, lineInput());
-    expect(readTranscriptStore(valid)).toEqual(valid);
+  it("reads meetings out of storage and ignores everything else in it", () => {
+    const meeting = appendTranscriptLine(null, lineInput());
+
+    expect(readTranscriptSession("not a meeting")).toBeNull();
+    expect(readTranscriptSession({ sessionId: 7 })).toBeNull();
+    expect(
+      readTranscriptSessions({
+        "translation-settings": { enabled: true },
+        [transcriptSessionKey("meeting-1")]: meeting,
+        [transcriptSessionKey("broken")]: { sessionId: 7 }
+      })
+    ).toEqual([meeting]);
   });
 });
 
-function session(sessionId: string, updatedAtMs: number) {
+function session(sessionId: string, updatedAtMs: number): MeetingTranscriptSession {
   return {
     sessionId,
     host: "meet.google.com",

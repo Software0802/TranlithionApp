@@ -20,14 +20,17 @@ import type { SubtitleAdapter, SubtitleAdapterEvent } from "./types";
  */
 
 /**
- * The caption region. Semantic attributes come first because Meet's class
- * names are obfuscated and change between releases; `aria-label` is localized,
- * so the common scripts are listed explicitly.
+ * Candidate caption containers, semantic first, because Meet's class names are
+ * obfuscated and change between releases.
+ *
+ * Nothing here reads `aria-label`: that text is localized, so matching it would
+ * only work in the handful of languages we happened to list. A candidate is
+ * accepted on its role plus a structural check — it has to actually contain
+ * Meet's caption rows — which holds in every locale.
  */
 export const MEET_CAPTION_REGION_SELECTORS = [
-  '[role="region"][aria-label*="aption" i]',
-  '[role="region"][aria-label*="字幕"]',
-  '[role="region"][aria-label*="자막"]',
+  '[role="region"][aria-live]',
+  '[role="region"]',
   ".a4cQT"
 ] as const;
 
@@ -46,6 +49,13 @@ export const MEET_CAPTION_SPEAKER_SELECTORS = [".zs7s8d", ".KcIKyf"] as const;
 
 export const MEET_NATIVE_HIDE_STYLE_ID = "tranlithion-hide-meet-captions";
 
+/**
+ * Marks the one region the adapter is reading. The hide stylesheet keys off
+ * this attribute rather than the region selectors, so nothing else on the page
+ * can be dimmed by a selector that happens to match it too.
+ */
+export const MEET_NATIVE_HIDE_ATTRIBUTE = "data-tranlithion-meet-captions";
+
 /** A display name longer than this is almost certainly a sentence, not a name. */
 export const MEET_MAX_SPEAKER_CHARS = 60;
 
@@ -56,7 +66,8 @@ export const MEET_MAX_SPEAKER_CHARS = 60;
  */
 export const MEET_MAX_SEGMENT_CHARS = 160;
 
-const REGION_POLL_INTERVAL_MS = 750;
+/** How often to look for the caption region before one has been found. */
+export const MEET_REGION_POLL_INTERVAL_MS = 750;
 /** Collapse the burst of mutations Meet emits for one recognizer update. */
 export const MEET_CAPTION_SETTLE_DELAY_MS = 16;
 /** How often to re-check whether a silent caption region means the turn ended. */
@@ -69,10 +80,23 @@ const CAPTION_TICK_INTERVAL_MS = 200;
  * flicker the Netflix adapter was built to avoid.
  */
 export const MEET_CAPTION_HOLD_MS = 1_600;
+/**
+ * How long the caption region may show text no selector can read before the
+ * adapter calls the source unreadable, gives the user Meet's own captions back
+ * and says so. The window absorbs a repaint caught mid-flight; a strip that is
+ * merely empty between utterances never enters this state at all.
+ */
+export const MEET_CAPTION_UNREADABLE_GRACE_MS = 2_000;
 
 export interface MeetCaptionBlock {
   speaker: string | null;
   text: string;
+}
+
+/** One rendered turn together with the node it was read from. */
+export interface MeetCaptionEntry {
+  element: Element;
+  block: MeetCaptionBlock;
 }
 
 /**
@@ -126,14 +150,18 @@ export function parseMeetCaptionBlock(block: Element): MeetCaptionBlock {
 }
 
 /** Every speaker turn currently rendered in the caption region, oldest first. */
-export function readMeetCaptionBlocks(region: Element): MeetCaptionBlock[] {
+export function readMeetCaptionEntries(region: Element): MeetCaptionEntry[] {
   return captionBlockElements(region)
-    .map((block) => parseMeetCaptionBlock(block))
-    .filter((block) => block.text.length > 0);
+    .map((element) => ({ element, block: parseMeetCaptionBlock(element) }))
+    .filter((entry) => entry.block.text.length > 0);
+}
+
+export function readMeetCaptionBlocks(region: Element): MeetCaptionBlock[] {
+  return readMeetCaptionEntries(region).map((entry) => entry.block);
 }
 
 export function nativeMeetCaptionHideCss(): string {
-  return `${MEET_CAPTION_REGION_SELECTORS.join(", ")} { opacity: 0 !important; }`;
+  return `[${MEET_NATIVE_HIDE_ATTRIBUTE}] { opacity: 0 !important; }`;
 }
 
 export class MeetCaptionAdapter implements SubtitleAdapter {
@@ -150,14 +178,24 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
   private nativeCaptionsVisible = true;
   /** Speaker of the turn currently being read. */
   private speaker: string | null = null;
-  /** Full text of the caption block this turn is being read from. */
+  /** The caption block this turn is being read from. */
+  private blockElement: Element | null = null;
+  /** Its full text as of the last read. */
   private blockText = "";
   /** Prefix of this turn already published as a finished segment. */
   private emitted = "";
+  /** Each finished segment published from this block, oldest first. */
+  private settledSegments: { end: number; text: string }[] = [];
+  /** Published wording the recognizer withdrew, not yet reported. */
+  private retracted: string[] = [];
   /** The published segment ended a sentence, so new words open a new cue. */
   private segmentClosed = false;
   /** Clock reading when the region last had text in it. */
   private lastTextAtMs = 0;
+  /** A caption row has been parsed out of this region. */
+  private captionsReadable = false;
+  /** Clock reading when the region first showed text nothing could parse. */
+  private unreadableSinceMs: number | null = null;
 
   constructor(private readonly clock: ClockSource) {}
 
@@ -171,7 +209,7 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
     this.lastTextAtMs = this.clock.nowMs();
     this.applyNativeCaptionVisibility();
     this.discoverRegion();
-    this.pollTimer = window.setInterval(this.discoverRegion, REGION_POLL_INTERVAL_MS);
+    this.pollTimer = window.setInterval(this.discoverRegion, MEET_REGION_POLL_INTERVAL_MS);
     // Mutations stop arriving once the speaker stops talking, so ending a turn
     // needs its own heartbeat rather than a DOM event that will never come.
     this.tickTimer = window.setInterval(this.tick, CAPTION_TICK_INTERVAL_MS);
@@ -193,12 +231,17 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
     this.observer?.disconnect();
     this.observer = null;
     this.nativeCaptionsVisible = true;
-    removeNativeCaptionHideStyle();
+    this.captionsReadable = false;
+    this.unreadableSinceMs = null;
+    this.applyNativeCaptionVisibility();
     this.region = null;
     this.currentCue = null;
     this.speaker = null;
+    this.blockElement = null;
     this.blockText = "";
     this.emitted = "";
+    this.settledSegments = [];
+    this.retracted = [];
     this.segmentClosed = false;
     this.callback = null;
   }
@@ -207,8 +250,12 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
     const nextRegion = findMeetCaptionRegion(this.region);
     if (nextRegion !== this.region) {
       this.observer?.disconnect();
+      this.region?.removeAttribute(MEET_NATIVE_HIDE_ATTRIBUTE);
       this.region = nextRegion;
       this.observer = null;
+      this.captionsReadable = false;
+      this.unreadableSinceMs = null;
+      this.applyNativeCaptionVisibility();
       if (this.region) {
         this.observer = new MutationObserver(this.scheduleRead);
         this.observer.observe(this.region, {
@@ -219,7 +266,7 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
         this.scheduleRead();
       }
     }
-    this.setAvailability(Boolean(this.region));
+    this.refreshAvailability();
   };
 
   private readonly scheduleRead = (): void => {
@@ -234,10 +281,12 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
 
   /** Ends the turn once the caption region has stayed silent long enough. */
   private readonly tick = (): void => {
+    const entries = this.readEntries();
+    this.noteReadability(entries);
     if (!this.currentCue) {
       return;
     }
-    if (this.readLatestBlock()) {
+    if (entries.length > 0) {
       // Meet keeps the last line on screen after the speaker stops; the hold
       // only starts once the strip is actually clear.
       this.lastTextAtMs = this.clock.nowMs();
@@ -248,72 +297,68 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
     }
   };
 
-  private readBlocks(): MeetCaptionBlock[] {
-    return this.region ? readMeetCaptionBlocks(this.region) : [];
-  }
-
-  private readLatestBlock(): MeetCaptionBlock | null {
-    const blocks = this.readBlocks();
-    return blocks[blocks.length - 1] ?? null;
+  private readEntries(): MeetCaptionEntry[] {
+    return this.region ? readMeetCaptionEntries(this.region) : [];
   }
 
   /**
-   * Whether the newest block is a block we have not been reading, rather than
+   * Whether the newest row is a block we have not been reading, rather than
    * the one already open still growing.
    *
    * Meet merges a person's consecutive speech into one growing block and
    * starts a fresh block at a paragraph, so a new block ends the open line
-   * even when the same person keeps talking. The recognizer also rewrites
-   * words inside the block it is still growing, and that is a revision of the
-   * open line — the block we were reading being pushed up the strip is what
-   * tells the two apart.
+   * even when the same person keeps talking. The node the row is rendered in
+   * is what tells the two apart: the recognizer rewrites the text of the block
+   * it is still growing, so comparing text would take an edit for a new
+   * paragraph. Re-rendered nodes are the one exception — text that carries on
+   * from where we were reading is still the same line.
    */
-  private startsNewBlock(blocks: MeetCaptionBlock[]): boolean {
-    const latest = blocks[blocks.length - 1];
-    if (!this.blockText || !latest || latest.text.startsWith(this.blockText)) {
+  private startsNewBlock(latest: MeetCaptionEntry): boolean {
+    if (!this.blockElement || latest.element === this.blockElement) {
       return false;
     }
-    return blocks.slice(0, -1).some((block) => block.text === this.blockText);
+    return !latest.block.text.startsWith(this.blockText);
   }
 
   private readCaption(): void {
-    const blocks = this.readBlocks();
-    const latest = blocks[blocks.length - 1];
+    const entries = this.readEntries();
+    this.noteReadability(entries);
+    const latest = entries[entries.length - 1];
     if (!latest) {
       // A blank region is not evidence the turn is over; `tick` decides that.
       return;
     }
     this.lastTextAtMs = this.clock.nowMs();
 
-    if (latest.speaker !== this.speaker || this.startsNewBlock(blocks)) {
+    if (latest.block.speaker !== this.speaker || this.startsNewBlock(latest)) {
       // Either a different person is talking or Meet started a new paragraph
       // for the same one: the previous turn is genuinely over either way.
       this.finishCurrentTurn();
-      this.speaker = latest.speaker;
+      this.speaker = latest.block.speaker;
     }
 
-    const full = latest.text;
+    const full = latest.block.text;
+    const withdrawn = full.startsWith(this.emitted) ? [] : this.dropWithdrawnSegments(full);
+    this.blockElement = latest.element;
     this.blockText = full;
-    if (!full.startsWith(this.emitted)) {
-      // The recognizer rewrote words it had already shown, so the prefix we
-      // were counting from no longer exists. Start this turn's accounting over.
-      this.emitted = "";
-    }
     const remainder = full.slice(this.emitted.length);
     const pending = remainder.trimStart();
     if (!pending) {
       return;
     }
 
+    const corrects = withdrawn.length > 0;
     const leading = remainder.length - pending.length;
     const cut = settledSegmentEnd(pending);
     if (cut <= 0) {
-      this.publish(pending.trim());
+      this.publish(pending.trim(), corrects);
       return;
     }
 
+    const settled = pending.slice(0, cut).trim();
     this.emitted = full.slice(0, this.emitted.length + leading + cut);
-    this.publish(pending.slice(0, cut).trim());
+    this.settledSegments.push({ end: this.emitted.length, text: settled });
+    this.publish(settled, corrects);
     // The sentence is complete, so whatever the speaker says next is a new
     // line rather than a revision of this one.
     this.segmentClosed = true;
@@ -324,15 +369,82 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
   }
 
   /**
+   * Re-aligns the published prefix after the recognizer rewrote wording it had
+   * already shown.
+   *
+   * The sentences the rewrite left untouched stay published, so they are
+   * neither retranslated nor recorded twice. Everything after them was
+   * withdrawn: it is returned so the correction that replaces it can say which
+   * wording it supersedes.
+   */
+  private dropWithdrawnSegments(full: string): string[] {
+    let keep = this.settledSegments.length;
+    while (
+      keep > 0 &&
+      !full.startsWith(this.blockText.slice(0, this.settledSegments[keep - 1].end))
+    ) {
+      keep -= 1;
+    }
+    const withdrawn = this.settledSegments.slice(keep).map((segment) => segment.text);
+    this.settledSegments = this.settledSegments.slice(0, keep);
+    this.emitted = keep > 0 ? this.blockText.slice(0, this.settledSegments[keep - 1].end) : "";
+    this.retracted.push(...withdrawn);
+    return withdrawn;
+  }
+
+  /**
+   * Tracks whether the captions can actually be read, which is what decides
+   * whether hiding Meet's own strip is safe.
+   *
+   * An empty strip says nothing either way — Meet clears it between utterances
+   * and hiding an empty strip costs the user nothing. Text we cannot parse is
+   * the real failure: the selectors have moved, and every second we keep the
+   * strip hidden is a second of captions the user could have read.
+   */
+  private noteReadability(entries: MeetCaptionEntry[]): void {
+    if (entries.length > 0) {
+      this.unreadableSinceMs = null;
+      if (!this.captionsReadable) {
+        this.captionsReadable = true;
+        this.applyNativeCaptionVisibility();
+      }
+      this.refreshAvailability();
+      return;
+    }
+    if (!this.region || !regionHasText(this.region)) {
+      this.unreadableSinceMs = null;
+      this.refreshAvailability();
+      return;
+    }
+    this.unreadableSinceMs ??= this.clock.nowMs();
+    if (this.captionsUnreadable() && this.captionsReadable) {
+      this.captionsReadable = false;
+      this.applyNativeCaptionVisibility();
+    }
+    this.refreshAvailability();
+  }
+
+  private captionsUnreadable(): boolean {
+    return (
+      this.unreadableSinceMs !== null &&
+      this.clock.nowMs() - this.unreadableSinceMs >= MEET_CAPTION_UNREADABLE_GRACE_MS
+    );
+  }
+
+  /**
    * Puts one segment on screen. Within a sentence this revises the open cue in
    * place, which keeps the translation already showing frozen rather than
    * blanking it on every recognizer update.
    */
-  private publish(text: string): void {
+  private publish(text: string, corrects = false): void {
     if (!text) {
       return;
     }
-    if (this.currentCue && !this.segmentClosed) {
+    // A correction replaces the line on screen even when that line had already
+    // finished a sentence: the recognizer withdrew those words, so ending the
+    // cue would hand withdrawn wording to the translator and the transcript as
+    // if it had been spoken.
+    if (this.currentCue && (!this.segmentClosed || corrects)) {
       if (this.currentCue.text === text) {
         // Meet repaints the strip without changing a word; re-emitting would
         // cancel the translation in flight for the line already on screen.
@@ -349,11 +461,13 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
         return;
       }
       this.currentCue = revised;
+      this.segmentClosed = false;
       this.emit({
         type: "cue-revise",
         source: this.source,
         cue: revised,
-        previousCueId
+        previousCueId,
+        ...this.takeRetracted()
       });
       return;
     }
@@ -364,7 +478,17 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
     }
     this.segmentClosed = false;
     this.currentCue = cue;
-    this.emit({ type: "cue-start", source: this.source, cue });
+    this.emit({ type: "cue-start", source: this.source, cue, ...this.takeRetracted() });
+  }
+
+  /** Withdrawn wording to report with the correction that replaces it. */
+  private takeRetracted(): { retracts?: string[] } {
+    if (this.retracted.length === 0) {
+      return {};
+    }
+    const retracts = this.retracted;
+    this.retracted = [];
+    return { retracts };
   }
 
   private createCue(text: string, startMs: number): SubtitleCue | null {
@@ -381,8 +505,10 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
   /** Ends the open cue and forgets the turn's published prefix. */
   private finishCurrentTurn(): void {
     this.finishCurrentCue();
+    this.blockElement = null;
     this.blockText = "";
     this.emitted = "";
+    this.settledSegments = [];
     this.segmentClosed = false;
   }
 
@@ -404,14 +530,24 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
    * Hides Meet's own caption strip through a document stylesheet while the
    * translation is on, so the two do not stack on top of each other. The text
    * stays readable to `innerText`, and the strip comes straight back when the
-   * user pauses translation or hides the overlay for a screen share.
+   * user pauses translation, hides the overlay for a screen share, or the
+   * captions stop being readable at all.
+   *
+   * Nothing is hidden until a row has actually been parsed out of this region:
+   * hiding captions we cannot replace would leave the user with a blank strip.
    */
   private applyNativeCaptionVisibility(): void {
-    if (this.nativeCaptionsVisible) {
+    if (this.nativeCaptionsVisible || !this.captionsReadable || !this.region) {
+      this.region?.removeAttribute(MEET_NATIVE_HIDE_ATTRIBUTE);
       removeNativeCaptionHideStyle();
       return;
     }
     ensureNativeCaptionHideStyle();
+    this.region.setAttribute(MEET_NATIVE_HIDE_ATTRIBUTE, "");
+  }
+
+  private refreshAvailability(): void {
+    this.setAvailability(Boolean(this.region) && !this.captionsUnreadable());
   }
 
   private setAvailability(available: boolean): void {
@@ -444,19 +580,32 @@ function removeNativeCaptionHideStyle(): void {
 /**
  * The caption region currently in the page, preferring the one already being
  * read. Selectors are tried in order, so a renamed class cannot win over the
- * semantic attributes.
+ * semantic attributes, and a candidate only counts once it is carrying Meet's
+ * caption rows — which is what keeps `[role="region"]` from matching the rest
+ * of the meeting UI.
  */
 export function findMeetCaptionRegion(preferredRegion: Element | null): Element | null {
   if (preferredRegion?.isConnected) {
     return preferredRegion;
   }
   for (const selector of MEET_CAPTION_REGION_SELECTORS) {
-    const candidate = document.querySelector(selector);
-    if (candidate) {
-      return candidate;
+    for (const candidate of Array.from(document.querySelectorAll(selector))) {
+      if (candidate.querySelector(MEET_CAPTION_STRUCTURE_SELECTOR)) {
+        return candidate;
+      }
     }
   }
   return null;
+}
+
+/** What a caption strip is made of, whichever of the two layouts Meet ships. */
+const MEET_CAPTION_STRUCTURE_SELECTOR = [
+  ...MEET_CAPTION_BLOCK_SELECTORS,
+  ...MEET_CAPTION_TEXT_SELECTORS
+].join(", ");
+
+function regionHasText(region: Element): boolean {
+  return normalizeSubtitleText(elementText(region)).length > 0;
 }
 
 function captionBlockElements(region: Element): Element[] {

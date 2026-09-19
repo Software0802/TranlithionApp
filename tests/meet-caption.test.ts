@@ -4,6 +4,7 @@ import {
   hasMeetCaptionExpired,
   MEET_CAPTION_REGION_SELECTORS,
   MEET_MAX_SEGMENT_CHARS,
+  MEET_NATIVE_HIDE_ATTRIBUTE,
   nativeMeetCaptionHideCss,
   parseMeetCaptionBlock,
   readMeetCaptionBlocks,
@@ -26,6 +27,7 @@ function meetTurn(speaker: string, text: string) {
 /** A page exposing exactly these elements to a selector query, in order. */
 function stubDocument(nodes: FakeElement[]): void {
   vi.stubGlobal("document", {
+    querySelectorAll: (selector: string) => nodes.filter((node) => node.matches(selector)),
     querySelector: (selector: string) => nodes.find((node) => node.matches(selector)) ?? null
   });
 }
@@ -35,58 +37,88 @@ describe("Meet caption region", () => {
     vi.unstubAllGlobals();
   });
 
-  it("prefers the semantically labelled region over Meet's obfuscated class names", () => {
+  it("prefers the live region over Meet's obfuscated class names", () => {
     // Class names change between Meet releases, and a stale one can still be
-    // in the page. The captions region keeps its role and label, so discovery
-    // has to pick that one even when the class match comes first in the page.
+    // in the page. The captions region keeps its role, so discovery has to
+    // pick that one even when the class match comes first in the page.
     const classOnly = element({
       className: "a4cQT",
       children: [meetTurn("Bob Tan", "from the class node")]
     });
-    const labelled = element({
+    const live = element({
       className: "Kq7Fxb",
-      attributes: { role: "region", "aria-label": "Captions" },
-      children: [meetTurn("Alice Chen", "from the labelled region")]
+      attributes: { role: "region", "aria-live": "polite" },
+      children: [meetTurn("Alice Chen", "from the live region")]
     });
-    stubDocument([classOnly, labelled]);
+    stubDocument([classOnly, live]);
 
     const region = findMeetCaptionRegion(null);
 
     expect(region).not.toBeNull();
     expect(readMeetCaptionBlocks(region as Element)).toEqual([
-      { speaker: "Alice Chen", text: "from the labelled region" }
+      { speaker: "Alice Chen", text: "from the live region" }
     ]);
   });
 
-  it("still finds the region when only the class name is there", () => {
-    const classOnly = element({
-      className: "a4cQT",
-      children: [meetTurn("Bob Tan", "from the class node")]
+  it("finds the caption region whatever language its label is in", () => {
+    // The label is localized, so nothing may depend on reading it: the role
+    // plus the caption rows inside are what identify the strip.
+    const french = element({
+      attributes: { role: "region", "aria-label": "Sous-titres", "aria-live": "polite" },
+      children: [meetTurn("Alice Chen", "bonjour tout le monde")]
     });
-    stubDocument([classOnly]);
+    stubDocument([french]);
 
     expect(readMeetCaptionBlocks(findMeetCaptionRegion(null) as Element)).toEqual([
-      { speaker: "Bob Tan", text: "from the class node" }
+      { speaker: "Alice Chen", text: "bonjour tout le monde" }
     ]);
+  });
+
+  it("skips a region of the meeting UI that carries no captions", () => {
+    const settingsPanel = element({
+      attributes: { role: "region", "aria-live": "polite" },
+      children: [{ className: "settings-row", text: "Captions settings" }]
+    });
+    const captions = element({
+      className: "a4cQT",
+      children: [meetTurn("Bob Tan", "from the caption strip")]
+    });
+    stubDocument([settingsPanel, captions]);
+
+    expect(readMeetCaptionBlocks(findMeetCaptionRegion(null) as Element)).toEqual([
+      { speaker: "Bob Tan", text: "from the caption strip" }
+    ]);
+  });
+
+  it("reports no region at all when nothing in the page holds caption rows", () => {
+    const unrelated = element({
+      attributes: { role: "region", "aria-live": "polite" },
+      children: [{ className: "chat-row", text: "someone typed something" }]
+    });
+    stubDocument([unrelated]);
+
+    expect(findMeetCaptionRegion(null)).toBeNull();
   });
 
   it("keeps reading the region it already found", () => {
-    const labelled = element({
-      attributes: { role: "region", "aria-label": "Captions" },
+    const live = element({
+      attributes: { role: "region", "aria-live": "polite" },
       children: [meetTurn("Alice Chen", "still here")]
     });
     stubDocument([]);
 
-    expect(findMeetCaptionRegion(asElement(labelled))).toBe(asElement(labelled));
+    expect(findMeetCaptionRegion(asElement(live))).toBe(asElement(live));
   });
 
-  it("hides Meet's own captions with a selector stylesheet", () => {
+  it("hides only the region it is reading, not everything that looks like one", () => {
     const css = nativeMeetCaptionHideCss();
+
+    // Scoped to the marker attribute the adapter puts on that one region: a
+    // captions-settings panel matching the same selectors stays visible.
+    expect(css).toBe(`[${MEET_NATIVE_HIDE_ATTRIBUTE}] { opacity: 0 !important; }`);
     for (const selector of MEET_CAPTION_REGION_SELECTORS) {
-      expect(css).toContain(selector);
+      expect(css).not.toContain(selector);
     }
-    // Opacity rather than display: the text has to stay readable to innerText.
-    expect(css).toContain("opacity: 0 !important");
   });
 });
 

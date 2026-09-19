@@ -25,10 +25,13 @@ import {
 } from "../shared/meeting";
 import {
   appendTranscriptLine,
-  listTranscriptSessions,
-  MEETING_TRANSCRIPT_STORAGE_KEY,
-  pruneTranscripts,
-  readTranscriptStore
+  expiredTranscriptKeys,
+  isTranscriptSessionKey,
+  LEGACY_MEETING_TRANSCRIPT_KEY,
+  readTranscriptSession,
+  readTranscriptSessions,
+  retainedTranscriptSessions,
+  transcriptSessionKey
 } from "../shared/meeting-transcript";
 import {
   SessionJobQueue,
@@ -69,6 +72,8 @@ const hydratedSessionIds = new Set<string>();
 let contextStorageQueue: Promise<void> = Promise.resolve();
 let tabStatusStorageQueue: Promise<void> = Promise.resolve();
 let transcriptStorageQueue: Promise<void> = Promise.resolve();
+/** Meetings already told the user their transcript could not be stored. */
+const transcriptStorageFailures = new Set<string>();
 /** Hot-path cache: chrome.storage.local.get on every cue was adding tens of ms. */
 let settingsCache: TranslationSettings | null = null;
 let permissionCache:
@@ -147,13 +152,13 @@ async function handleMessage(
       return draftTranslate(message.sessionId, message.text, message.asFinal === true);
     }
     case "RECORD_MEETING_LINE": {
-      return recordMeetingLine(message);
+      return recordMeetingLine(message, sender.tab?.id);
     }
     case "GET_MEETING_TRANSCRIPTS": {
       return meetingTranscriptSummary();
     }
     case "CLEAR_MEETING_TRANSCRIPTS": {
-      await chrome.storage.local.remove(MEETING_TRANSCRIPT_STORAGE_KEY);
+      await clearStoredTranscripts();
       return { ok: true };
     }
     case "TRANSLATE_PLAIN": {
@@ -171,6 +176,7 @@ async function handleMessage(
       jobQueue.cancelLatest(message.sessionId);
       sessionStore.clear(message.sessionId);
       hydratedSessionIds.delete(message.sessionId);
+      transcriptStorageFailures.delete(message.sessionId);
       await removePersistedSession(message.sessionId);
       return { ok: true };
     }
@@ -348,13 +354,17 @@ async function draftTranslate(
  * The content script can reach this only for a meeting host, and nothing here
  * hands it anything back beyond an acknowledgement.
  */
-async function recordMeetingLine(message: {
-  sessionId: string;
-  host: string;
-  title: string;
-  cue: SubtitleCue;
-  translation: string;
-}): Promise<{ ok: boolean }> {
+async function recordMeetingLine(
+  message: {
+    sessionId: string;
+    host: string;
+    title: string;
+    cue: SubtitleCue;
+    translation: string;
+    replaces?: string[];
+  },
+  tabId?: number
+): Promise<{ ok: boolean }> {
   const translation = message.translation.trim();
   if (!isMeetingHost(message.host) || message.cue.source !== "meet-dom" || !translation) {
     return { ok: false };
@@ -379,35 +389,45 @@ async function recordMeetingLine(message: {
     return { ok: true };
   }
   await queueTranscriptStorageUpdate(async () => {
-    const stored = await chrome.storage.local.get(MEETING_TRANSCRIPT_STORAGE_KEY);
-    const pruned = pruneTranscripts(
-      readTranscriptStore(stored[MEETING_TRANSCRIPT_STORAGE_KEY]),
-      Date.now(),
-      settings.meetingTranscriptRetentionDays
-    );
-    const next = appendTranscriptLine(pruned, {
+    // Only this meeting's own key is read and written, so one sentence never
+    // pays to serialize every meeting on record.
+    const key = transcriptSessionKey(message.sessionId);
+    const stored = await chrome.storage.local.get(key);
+    const current = readTranscriptSession(stored[key]);
+    const next = appendTranscriptLine(current, {
       sessionId: message.sessionId,
       host: message.host,
       title: message.title,
       atMs: Date.now(),
       speaker: message.cue.speaker ?? null,
       source: message.cue.text,
-      translation
+      translation,
+      replaces: message.replaces
     });
-    await chrome.storage.local.set({ [MEETING_TRANSCRIPT_STORAGE_KEY]: next });
+    if (!next || next === current) {
+      return;
+    }
+    try {
+      await chrome.storage.local.set({ [key]: next });
+    } catch (error) {
+      await reportTranscriptStorageFailure(message.sessionId, tabId, error);
+      return;
+    }
+    if (!current) {
+      // A meeting starts: this is the moment to enforce retention and the
+      // session cap, rather than on every line of it.
+      await dropExpiredTranscripts(settings.meetingTranscriptRetentionDays);
+    }
   });
   return { ok: true };
 }
 
 async function meetingTranscriptSummary(): Promise<MeetingTranscriptResponse> {
   const settings = await getSettings();
-  const stored = await chrome.storage.local.get(MEETING_TRANSCRIPT_STORAGE_KEY);
-  const sessions = listTranscriptSessions(
-    pruneTranscripts(
-      readTranscriptStore(stored[MEETING_TRANSCRIPT_STORAGE_KEY]),
-      Date.now(),
-      settings.meetingTranscriptRetentionDays
-    )
+  const sessions = retainedTranscriptSessions(
+    readTranscriptSessions(await chrome.storage.local.get(null)),
+    Date.now(),
+    settings.meetingTranscriptRetentionDays
   );
   return {
     ok: true,
@@ -797,17 +817,64 @@ function queueTranscriptStorageUpdate(update: () => Promise<void>): Promise<void
  */
 async function pruneStoredTranscripts(): Promise<void> {
   const settings = await getSettings();
+  await queueTranscriptStorageUpdate(() =>
+    dropExpiredTranscripts(settings.meetingTranscriptRetentionDays)
+  );
+}
+
+/** Runs inside the transcript queue; never queue it again from within. */
+async function dropExpiredTranscripts(retentionDays: number): Promise<void> {
+  const stored = await chrome.storage.local.get(null);
+  const expired = expiredTranscriptKeys(
+    readTranscriptSessions(stored),
+    Date.now(),
+    retentionDays
+  );
+  // Meetings an earlier build wrote into one shared blob are dropped rather
+  // than migrated: they would otherwise sit in the quota past their window.
+  const legacy = LEGACY_MEETING_TRANSCRIPT_KEY in stored ? [LEGACY_MEETING_TRANSCRIPT_KEY] : [];
+  if (expired.length + legacy.length > 0) {
+    await chrome.storage.local.remove([...expired, ...legacy]);
+  }
+}
+
+async function clearStoredTranscripts(): Promise<void> {
   await queueTranscriptStorageUpdate(async () => {
-    const stored = await chrome.storage.local.get(MEETING_TRANSCRIPT_STORAGE_KEY);
-    const current = readTranscriptStore(stored[MEETING_TRANSCRIPT_STORAGE_KEY]);
-    if (Object.keys(current).length === 0) {
-      return;
-    }
-    const pruned = pruneTranscripts(current, Date.now(), settings.meetingTranscriptRetentionDays);
-    if (Object.keys(pruned).length !== Object.keys(current).length) {
-      await chrome.storage.local.set({ [MEETING_TRANSCRIPT_STORAGE_KEY]: pruned });
+    const keys = Object.keys(await chrome.storage.local.get(null)).filter(
+      (key) => isTranscriptSessionKey(key) || key === LEGACY_MEETING_TRANSCRIPT_KEY
+    );
+    if (keys.length > 0) {
+      await chrome.storage.local.remove(keys);
     }
   });
+}
+
+/**
+ * The profile's storage is shared and finite, and a transcript is the one
+ * thing here that grows without bound. A refused write is the user's business:
+ * translation keeps running, but the meeting is no longer being recorded and
+ * the popup says so once per meeting rather than on every line.
+ */
+async function reportTranscriptStorageFailure(
+  sessionId: string,
+  tabId: number | undefined,
+  error: unknown
+): Promise<void> {
+  if (tabId === undefined || transcriptStorageFailures.has(sessionId)) {
+    return;
+  }
+  transcriptStorageFailures.add(sessionId);
+  await setTabStatus(tabId, {
+    state: "error",
+    message: `会议记录未能写入本机存储（${errorText(error)}）：翻译继续，但这场会议不再被记录。可在设置页清除会议记录后重试。`,
+    source: "meet-dom",
+    updatedAt: Date.now()
+  });
+}
+
+function errorText(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return message.trim() || "存储空间可能已满";
 }
 
 function readPersistedSessions(value: unknown): Record<string, PersistedTranslationSession> {

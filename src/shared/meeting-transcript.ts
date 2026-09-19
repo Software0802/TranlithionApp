@@ -7,9 +7,16 @@
  * offers a one-click wipe. Nothing here leaves the browser profile; the store
  * is written only by the background worker, which already runs behind
  * `TRUSTED_CONTEXTS`, so a content script can never read another tab's meeting.
+ *
+ * Each meeting lives under its own storage key. A line lands every few seconds
+ * for the length of a meeting, and rewriting every meeting ever recorded on
+ * each of them would spend megabytes of serialization on one sentence.
  */
 
-export const MEETING_TRANSCRIPT_STORAGE_KEY = "meeting-transcripts";
+/** One meeting per key: `meeting-transcript:<sessionId>`. */
+export const MEETING_TRANSCRIPT_KEY_PREFIX = "meeting-transcript:";
+/** The single-blob key earlier builds wrote; dropped on the next prune. */
+export const LEGACY_MEETING_TRANSCRIPT_KEY = "meeting-transcripts";
 
 /** Caps so a long day of meetings cannot fill the profile's storage quota. */
 export const MAX_TRANSCRIPT_SESSIONS = 20;
@@ -35,8 +42,6 @@ export interface MeetingTranscriptSession {
   lines: MeetingTranscriptLine[];
 }
 
-export type MeetingTranscriptStore = Record<string, MeetingTranscriptSession>;
-
 export interface MeetingTranscriptInput {
   sessionId: string;
   host: string;
@@ -45,95 +50,131 @@ export interface MeetingTranscriptInput {
   speaker?: string | null;
   source: string;
   translation: string;
+  /**
+   * Wording the recognizer withdrew. A live caption rewrites sentences it has
+   * already finished, and the transcript is a record of what was said, not of
+   * every attempt at hearing it, so a stored line the correction supersedes is
+   * dropped rather than kept beside it.
+   */
+  replaces?: string[];
+}
+
+export function transcriptSessionKey(sessionId: string): string {
+  return `${MEETING_TRANSCRIPT_KEY_PREFIX}${sessionId}`;
+}
+
+export function isTranscriptSessionKey(key: string): boolean {
+  return key.startsWith(MEETING_TRANSCRIPT_KEY_PREFIX);
 }
 
 /**
- * Appends one bilingual line, creating the session on first use.
+ * Appends one bilingual line, creating the meeting on first use.
  *
- * Returns a new store rather than mutating: the caller reads storage, folds,
- * and writes back, and an accidental in-place edit of the read value would
- * silently diverge from what is persisted.
+ * Returns the session to store, or the one passed in when there is nothing new
+ * to write, so the caller can skip the storage round-trip. Never mutates: an
+ * accidental in-place edit of the read value would silently diverge from what
+ * is persisted.
  */
 export function appendTranscriptLine(
-  store: MeetingTranscriptStore,
+  session: MeetingTranscriptSession | null,
   input: MeetingTranscriptInput
-): MeetingTranscriptStore {
+): MeetingTranscriptSession | null {
   const source = input.source.trim();
   const translation = input.translation.trim();
   if (!input.sessionId || !source || !translation) {
-    return store;
+    return session;
   }
 
-  const existing = store[input.sessionId];
   const line: MeetingTranscriptLine = {
     atMs: input.atMs,
     speaker: input.speaker?.trim() || null,
     source,
     translation
   };
+  const kept = withoutRetracted(session?.lines ?? [], input.replaces);
   // The same line can be re-recorded when a revision settles to identical
   // text; recording it twice would double every repeated phrase in the export.
-  const previous = existing?.lines[existing.lines.length - 1];
-  if (
-    previous &&
+  const previous = kept[kept.length - 1];
+  const duplicate =
+    previous !== undefined &&
     previous.source === line.source &&
     previous.translation === line.translation &&
-    previous.speaker === line.speaker
-  ) {
-    return store;
+    previous.speaker === line.speaker;
+  if (duplicate && session && kept === session.lines) {
+    return session;
   }
 
-  const lines = [...(existing?.lines ?? []), line];
-  const session: MeetingTranscriptSession = {
+  const lines = duplicate ? kept : [...kept, line];
+  return {
     sessionId: input.sessionId,
-    host: existing?.host ?? input.host,
-    title: existing?.title ?? input.title,
-    startedAtMs: existing?.startedAtMs ?? input.atMs,
+    host: session?.host ?? input.host,
+    title: session?.title ?? input.title,
+    startedAtMs: session?.startedAtMs ?? input.atMs,
     updatedAtMs: input.atMs,
     lines: lines.slice(Math.max(0, lines.length - MAX_TRANSCRIPT_LINES))
   };
-
-  return capSessions({ ...store, [input.sessionId]: session });
 }
 
-/** Drops every session whose last line is older than the retention window. */
-export function pruneTranscripts(
-  store: MeetingTranscriptStore,
+/** Meetings still inside the retention window and the session cap, newest first. */
+export function retainedTranscriptSessions(
+  sessions: MeetingTranscriptSession[],
   nowMs: number,
   retentionDays: number
-): MeetingTranscriptStore {
+): MeetingTranscriptSession[] {
   const cutoff = nowMs - Math.max(1, retentionDays) * DAY_MS;
-  return capSessions(
-    Object.fromEntries(
-      Object.entries(store).filter(([, session]) => session.updatedAtMs >= cutoff)
-    )
+  return listTranscriptSessions(sessions)
+    .filter((session) => session.updatedAtMs >= cutoff)
+    .slice(0, MAX_TRANSCRIPT_SESSIONS);
+}
+
+/** Storage keys of the meetings that have expired or fallen past the cap. */
+export function expiredTranscriptKeys(
+  sessions: MeetingTranscriptSession[],
+  nowMs: number,
+  retentionDays: number
+): string[] {
+  const retained = new Set(
+    retainedTranscriptSessions(sessions, nowMs, retentionDays).map((session) => session.sessionId)
   );
+  return sessions
+    .filter((session) => !retained.has(session.sessionId))
+    .map((session) => transcriptSessionKey(session.sessionId));
 }
 
 /** Newest first, so the options page and any export show recent meetings up top. */
 export function listTranscriptSessions(
-  store: MeetingTranscriptStore
+  sessions: MeetingTranscriptSession[]
 ): MeetingTranscriptSession[] {
-  return Object.values(store).sort((left, right) => right.updatedAtMs - left.updatedAtMs);
+  return [...sessions].sort((left, right) => right.updatedAtMs - left.updatedAtMs);
 }
 
-export function readTranscriptStore(value: unknown): MeetingTranscriptStore {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return {};
-  }
-  return Object.fromEntries(
-    Object.entries(value).filter(([, session]) => isTranscriptSession(session))
-  ) as MeetingTranscriptStore;
+export function readTranscriptSession(value: unknown): MeetingTranscriptSession | null {
+  return isTranscriptSession(value) ? value : null;
 }
 
-function capSessions(store: MeetingTranscriptStore): MeetingTranscriptStore {
-  const sessions = listTranscriptSessions(store);
-  if (sessions.length <= MAX_TRANSCRIPT_SESSIONS) {
-    return store;
+/** Every meeting in a `chrome.storage.local` snapshot, ignoring other keys. */
+export function readTranscriptSessions(
+  stored: Record<string, unknown>
+): MeetingTranscriptSession[] {
+  return Object.entries(stored)
+    .filter(([key]) => isTranscriptSessionKey(key))
+    .map(([, value]) => readTranscriptSession(value))
+    .filter((session): session is MeetingTranscriptSession => session !== null);
+}
+
+function withoutRetracted(
+  lines: MeetingTranscriptLine[],
+  replaces: string[] | undefined
+): MeetingTranscriptLine[] {
+  if (!replaces?.length) {
+    return lines;
   }
-  return Object.fromEntries(
-    sessions.slice(0, MAX_TRANSCRIPT_SESSIONS).map((session) => [session.sessionId, session])
-  );
+  const withdrawn = new Set(replaces.map((text) => text.trim()).filter(Boolean));
+  let end = lines.length;
+  while (end > 0 && withdrawn.has(lines[end - 1].source)) {
+    end -= 1;
+  }
+  return end === lines.length ? lines : lines.slice(0, end);
 }
 
 function isTranscriptSession(value: unknown): value is MeetingTranscriptSession {

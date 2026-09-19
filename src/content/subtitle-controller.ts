@@ -112,6 +112,8 @@ export class SubtitleController {
   private readonly settleAbort = new AbortController();
   /** The meeting's only channel answered with nothing. */
   private meetingChannelBroken = false;
+  /** Recognizer wording withdrawn since the last line reached the transcript. */
+  private retractedLines: string[] = [];
 
   constructor(
     readonly target: CaptionTarget,
@@ -257,14 +259,26 @@ export class SubtitleController {
       return;
     }
     if (event.type === "cue-start") {
+      this.noteRetraction(event.retracts);
       this.handleCueStart(event.cue);
       return;
     }
     if (event.type === "cue-revise") {
+      this.noteRetraction(event.retracts);
       this.handleCueRevise(event.cue, event.previousCueId);
       return;
     }
     this.handleCueEnd(event.source, event.cueId);
+  }
+
+  /**
+   * Wording the recognizer took back. Whatever settles next carries it to the
+   * transcript, which drops the withdrawn line if it had already stored one.
+   */
+  private noteRetraction(retracts: string[] | undefined): void {
+    if (retracts?.length) {
+      this.retractedLines.push(...retracts);
+    }
   }
 
   private handleAvailabilityChange(event: Extract<SubtitleAdapterEvent, { type: "availability" }>): void {
@@ -758,13 +772,16 @@ export class SubtitleController {
     if (cue.source !== "meet-dom" || !this.meetingMode()) {
       return;
     }
+    const replaces = this.retractedLines;
+    this.retractedLines = [];
     void safeRuntimeSendMessage({
       type: "RECORD_MEETING_LINE",
       sessionId: this.sessionId,
       host: location.hostname,
       title: document.title,
       cue,
-      translation
+      translation,
+      ...(replaces.length > 0 ? { replaces } : {})
     } satisfies ExtensionMessage);
   }
 

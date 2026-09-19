@@ -1,6 +1,8 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   MEET_CAPTION_SETTLE_DELAY_MS,
+  MEET_NATIVE_HIDE_ATTRIBUTE,
+  MEET_REGION_POLL_INTERVAL_MS,
   MeetCaptionAdapter
 } from "../src/content/adapters/meet-caption-adapter";
 import type { SubtitleAdapterEvent } from "../src/content/adapters/types";
@@ -40,8 +42,8 @@ function createFixture() {
 
   vi.stubGlobal("window", globalThis);
   vi.stubGlobal("document", {
-    querySelector: (selector: string) =>
-      selector.includes('role="region"') || selector === ".a4cQT" ? region : null,
+    querySelectorAll: (selector: string) => (region.matches(selector) ? [region] : []),
+    querySelector: (selector: string) => (region.matches(selector) ? region : null),
     getElementById: () => null,
     createElement: (tag: string) => {
       if (tag !== "style") {
@@ -65,8 +67,13 @@ function createFixture() {
   );
 
   const events: string[] = [];
+  const retractions: string[][] = [];
+  const availability: boolean[] = [];
   const adapter = new MeetCaptionAdapter(clock);
   adapter.start((event: SubtitleAdapterEvent) => {
+    if (event.type === "availability") {
+      availability.push(event.available);
+    }
     if (event.type === "cue-start") {
       events.push(`start:${event.cue.speaker ?? "-"}|${event.cue.text}`);
     } else if (event.type === "cue-revise") {
@@ -74,11 +81,24 @@ function createFixture() {
     } else if (event.type === "cue-end") {
       events.push("end");
     }
+    if (event.type !== "availability" && event.type !== "cue-end" && event.retracts) {
+      retractions.push(event.retracts);
+    }
   });
 
+  /**
+   * Meet keeps the node of a turn it is still growing and appends a node for a
+   * new one, so rows are reused by position rather than re-rendered wholesale.
+   */
   function rebuild(turns: Turn[]): void {
-    region.children.length = 0;
-    for (const turn of turns) {
+    region.children.length = Math.min(region.children.length, turns.length);
+    turns.forEach((turn, index) => {
+      const existing = region.children[index];
+      if (existing) {
+        existing.querySelector(".zs7s8d")?.setText(turn.speaker);
+        existing.querySelector(".bh44bd")?.setText(turn.text);
+        return;
+      }
       region.children.push(
         element({
           className: "nMcdL",
@@ -89,16 +109,34 @@ function createFixture() {
           ]
         }) as FakeElement
       );
-    }
+    });
   }
 
   return {
     adapter,
     events,
+    retractions,
+    availability,
+    region,
+    /** A strip whose rows none of the adapter's selectors can read. */
+    async renderUnreadable(text: string) {
+      region.children.length = 0;
+      region.children.push(
+        element({ className: "xQ1a", children: [{ className: "cc", text }] }) as FakeElement
+      );
+      notifyMutation?.();
+      await vi.advanceTimersByTimeAsync(SETTLE_MS);
+    },
     /** Renders the caption strip and lets the adapter observe the change. */
     async render(turns: Turn[]) {
       rebuild(turns);
-      notifyMutation?.();
+      if (notifyMutation) {
+        notifyMutation();
+      } else {
+        // The region is only adopted once it is carrying caption rows, so the
+        // first strip is picked up by the discovery poll.
+        await vi.advanceTimersByTimeAsync(MEET_REGION_POLL_INTERVAL_MS);
+      }
       await vi.advanceTimersByTimeAsync(SETTLE_MS);
     },
     /** Advances the wall clock while the adapter's heartbeat runs. */
@@ -186,6 +224,22 @@ describe("Meet cue lifecycle", () => {
     expect(fixture.events).toEqual(["end", "start:Alice Chen|thanks"]);
   });
 
+  it("ends the line when the block it was reading is finalized and pushed up", async () => {
+    const fixture = createFixture();
+    await fixture.render([{ speaker: "Alice Chen", text: "over to you" }]);
+    fixture.events.length = 0;
+
+    // Meet punctuates the block it is leaving in the same update that appends
+    // the next one. The line we were reading still ended; its text changing on
+    // the way out must not hide that.
+    await fixture.render([
+      { speaker: "Alice Chen", text: "Over to you." },
+      { speaker: "Alice Chen", text: "thanks" }
+    ]);
+
+    expect(fixture.events).toEqual(["end", "start:Alice Chen|thanks"]);
+  });
+
   it("still revises in place when the recognizer corrects the open block", async () => {
     const fixture = createFixture();
     await fixture.render([{ speaker: "Alice Chen", text: "we should probably" }]);
@@ -246,22 +300,76 @@ describe("Meet cue lifecycle", () => {
     expect(fixture.events).toEqual([]);
   });
 
-  it("recovers when the recognizer rewrites words it had already shown", async () => {
+  it("replaces a sentence the recognizer takes back instead of ending it", async () => {
     const fixture = createFixture();
     await fixture.render([{ speaker: "Alice Chen", text: "Hi everyone." }]);
     fixture.events.length = 0;
 
-    // Same block, corrected from scratch: the published prefix no longer
-    // exists, so the adapter must not slice the new text against it. The
-    // already-closed sentence is replaced whole rather than mangled.
+    // Same block, corrected after it had already been punctuated. Ending the
+    // open cue here would hand "Hi everyone." to the translator and the
+    // transcript as if it had been spoken, so the line is replaced and the
+    // withdrawn wording is reported with its correction.
     await fixture.render([{ speaker: "Alice Chen", text: "Hey everyone. Let's" }]);
 
     expect(fixture.events).toEqual([
-      "end",
-      "start:Alice Chen|Hey everyone.",
+      "revise:Alice Chen|Hey everyone.",
       "end",
       "start:Alice Chen|Let's"
     ]);
+    expect(fixture.retractions).toEqual([["Hi everyone."]]);
+  });
+
+  it("keeps the sentences a correction did not touch", async () => {
+    const fixture = createFixture();
+    await fixture.render([{ speaker: "Alice Chen", text: "One." }]);
+    await fixture.render([{ speaker: "Alice Chen", text: "One. Two." }]);
+    fixture.events.length = 0;
+    fixture.retractions.length = 0;
+
+    // Only the last sentence was rewritten. The one before it stays published:
+    // re-publishing it would translate and record the same words twice.
+    await fixture.render([{ speaker: "Alice Chen", text: "One. Two, and three." }]);
+
+    expect(fixture.events).toEqual(["revise:Alice Chen|Two, and three."]);
+    expect(fixture.retractions).toEqual([["Two."]]);
+  });
+
+  it("hides Meet's own strip only once it has read a caption out of it", async () => {
+    const fixture = createFixture();
+    fixture.adapter.setNativeCaptionVisibility(false);
+
+    expect(fixture.region.getAttribute(MEET_NATIVE_HIDE_ATTRIBUTE)).toBeNull();
+
+    await fixture.render([{ speaker: "Alice Chen", text: "hello" }]);
+
+    expect(fixture.region.getAttribute(MEET_NATIVE_HIDE_ATTRIBUTE)).toBe("");
+  });
+
+  it("gives Meet's captions back when the strip stops being readable", async () => {
+    const fixture = createFixture();
+    fixture.adapter.setNativeCaptionVisibility(false);
+    await fixture.render([{ speaker: "Alice Chen", text: "hello" }]);
+
+    // Meet renames its caption classes mid-session: there is text on screen
+    // and we cannot read a word of it. Keeping it hidden behind our stylesheet
+    // would leave the user with nothing at all.
+    await fixture.renderUnreadable("字幕がここにある");
+    await fixture.wait(2_400);
+
+    expect(fixture.region.getAttribute(MEET_NATIVE_HIDE_ATTRIBUTE)).toBeNull();
+    expect(fixture.availability.at(-1)).toBe(false);
+  });
+
+  it("keeps the strip hidden while it is merely empty between utterances", async () => {
+    const fixture = createFixture();
+    fixture.adapter.setNativeCaptionVisibility(false);
+    await fixture.render([{ speaker: "Alice Chen", text: "hello" }]);
+
+    await fixture.render([]);
+    await fixture.wait(4_000);
+
+    expect(fixture.region.getAttribute(MEET_NATIVE_HIDE_ATTRIBUTE)).toBe("");
+    expect(fixture.availability.at(-1)).toBe(true);
   });
 
   it("does not re-emit an unchanged line", async () => {

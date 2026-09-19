@@ -39,7 +39,8 @@ Manifest V3 Chrome 扩展：在 YouTube / Netflix / Google Meet 等页已显示�
 - 存储读写须遵守 `TRUSTED_CONTEXTS` / 现有 settings 边界；新增存储字段不得扩大 content 可读密钥面。
 - 内容脚本与 background 通信用 `src/shared/extension-context.ts` 的安全封装（`safeRuntimeSendMessage` 等）；扩展重载后 context invalidated 时 **安静降级**，禁止未捕获拒绝刷屏。
 - 设置页「保存并测试」与「授权并启用 meet.google.com」会申请可选 host 权限：UI 须让用户看清目标域名。Meet 始终是 optional host，未授权前不注册内容脚本。
-- 会议本机记录（`chrome.storage.local`）默认保留 7 天并自动过期；设置页必须写清会议文本发往哪个服务、存多久、如何清除。不得在文档或 UI 中声称「完全不留痕」。
+- 会议模式与会议本机记录**默认关闭**（`DEFAULT_SETTINGS.meetingMode` / `meetingTranscript` 为 false）：读会议字幕、写本机记录都必须由用户亲自勾选，已有的全站 host 授权不得代替这个同意。
+- 会议本机记录（`chrome.storage.local`，一场会议一个 `meeting-transcript:<sessionId>` 键）保留 7 天并自动过期；单行写入不得改写整库。写入失败要如实告知用户，不能静默丢弃。设置页必须写清会议文本发往哪个服务、存多久、如何清除。不得在文档或 UI 中声称「完全不留痕」。
 - 文档与提交中禁止真实 Key；示例用占位符。
 
 ## 运行时行为要点
@@ -47,7 +48,8 @@ Manifest V3 Chrome 扩展：在 YouTube / Netflix / Google Meet 等页已显示�
 - 字幕线索统一为带起止时间的 `SubtitleCue`；避免同一句重复提交。
 - **视频页的结束判定跟 `video.currentTime`**，不跟墙钟、不把 DOM 短暂空白当结束（Netflix 重绘会闪空）。时钟源抽象见 `src/content/clock.ts`。
 - **会议页没有可用的播放时间轴**：用墙钟计时、Overlay 锚在视口（`SubtitleOverlay` 的 anchor 传 null）；空白同样不等于结束。
-- 会议字幕是 ASR 流：只提交**未提交过的增量**并在句末标点/长度上限处切段；说话人切换即结束当前句。
+- 会议字幕是 ASR 流：只提交**未提交过的增量**并在句末标点/长度上限处切段；说话人切换或另起字幕块（按渲染节点判断，不比文本）即结束当前句。识别器收回已断句的文本时**原地更正**，不得把收回的措辞当成说过的话去翻译或记录。
+- Meet 字幕区靠语义选择器 + 结构校验定位（不读本地化 `aria-label`）；**解析出第一行之前不隐藏**原生字幕条，读不出来就把它放回来并如实报不可用。
 - 翻译在 background **按观看会话串行**；带近期上下文、术语表、人物名线索；术语宜放在稳定 system 前缀以利缓存。
 - 双轨：可选草稿（本地 / DeepL / 自定义 HTTP）先上屏，主译覆盖；**晚到的草稿不得盖掉已定稿**。
 - 会议模式默认**单通道终稿**（机器翻译 / 本机 MT），大模型是可选项；通道没配好要如实报错，**不得**偷偷回落到大模型。
