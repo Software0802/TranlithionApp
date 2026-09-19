@@ -1,4 +1,4 @@
-import type { MeetingFinalChannel, TranslationSettings } from "./types";
+import type { MeetingFinalChannel, SubtitleSource, TranslationSettings } from "./types";
 
 /**
  * Meeting mode: the same caption pipeline pointed at a meeting page's own
@@ -20,6 +20,23 @@ export const MEETING_CONTENT_SCRIPT_ID = "tranlithion-meeting-hosts";
 export function isMeetingHost(hostname: string): boolean {
   const normalized = hostname.toLocaleLowerCase();
   return MEETING_HOSTS.some((host) => normalized === host);
+}
+
+/**
+ * Whether what was said in this cue may be kept in memory that reaches
+ * storage — the session context the model reads back, and the snapshot of it
+ * the worker restores after a sleep.
+ *
+ * A user who left the meeting transcript switched off declined a record of
+ * the call, and that answer holds for every channel: the terms the call
+ * teaches us still accumulate for its duration, the sentences and the names
+ * that said them are never written down.
+ */
+export function keepsSpokenRecord(
+  settings: Pick<TranslationSettings, "meetingTranscript">,
+  source: SubtitleSource
+): boolean {
+  return source !== "meet-dom" || settings.meetingTranscript;
 }
 
 /**

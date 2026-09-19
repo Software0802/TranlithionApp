@@ -3,6 +3,7 @@ import { isStickySource, reviseDebounceMs } from "../src/content/subtitle-contro
 import {
   isMeetingHost,
   isMeetingModeActive,
+  keepsSpokenRecord,
   MEETING_HOST_PERMISSIONS,
   meetingTextDestination
 } from "../src/shared/meeting";
@@ -105,6 +106,16 @@ describe("meeting host detection", () => {
     // Nor a subdomain: the granted origin is that one host, so a page under
     // any other name is a page meeting mode was never authorized to read.
     expect(isMeetingHost("evil.meet.google.com")).toBe(false);
+  });
+
+  it("keeps no record of what was said when the user declined one", () => {
+    // The answer holds on every channel, including the chat model, whose own
+    // context would otherwise write the last spoken lines and the names that
+    // said them into extension storage.
+    expect(keepsSpokenRecord({ meetingTranscript: false }, "meet-dom")).toBe(false);
+    expect(keepsSpokenRecord({ meetingTranscript: true }, "meet-dom")).toBe(true);
+    // A film's captions are not a record of a call and are unaffected.
+    expect(keepsSpokenRecord({ meetingTranscript: false }, "netflix-dom")).toBe(true);
   });
 
   it("requires both the user's switch and an actual meeting host", () => {

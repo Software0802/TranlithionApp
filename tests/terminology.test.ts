@@ -1,0 +1,48 @@
+import { describe, expect, it } from "vitest";
+import { applyTerminology } from "../src/shared/terminology";
+import type { GlossaryEntry } from "../src/shared/types";
+
+const term = (source: string, target: string, kind: GlossaryEntry["kind"] = "term") => ({
+  source,
+  target,
+  kind
+});
+
+describe("fixed renderings on a machine translation", () => {
+  it("renders a term the service left in the source language", () => {
+    // DeepL and LibreTranslate take no glossary, so a product name comes back
+    // untouched. The rendering the user pasted into settings is what the
+    // caption has to show.
+    expect(applyTerminology("我们在 Figma 里改了。", [term("Figma", "菲格玛")])).toBe(
+      "我们在 菲格玛 里改了。"
+    );
+  });
+
+  it("renders a speaker name the call taught us", () => {
+    expect(
+      applyTerminology("Alice Chen said yes.", [term("Alice Chen", "陈爱丽", "name")])
+    ).toBe("陈爱丽 said yes.");
+  });
+
+  it("matches a Latin term whatever its case", () => {
+    expect(applyTerminology("the figma file", [term("Figma", "菲格玛")])).toBe(
+      "the 菲格玛 file"
+    );
+  });
+
+  it("does not rewrite a term that is only part of another word", () => {
+    expect(applyTerminology("He said it plainly.", [term("AI", "人工智能")])).toBe(
+      "He said it plainly."
+    );
+  });
+
+  it("renders a term in a script that is written without spaces", () => {
+    expect(applyTerminology("悟空来了。", [term("悟空", "Goku", "name")])).toBe("Goku来了。");
+  });
+
+  it("leaves the translation alone when there is nothing to fix", () => {
+    expect(applyTerminology("早上好。", [])).toBe("早上好。");
+    expect(applyTerminology("早上好。", [term("Figma", "Figma")])).toBe("早上好。");
+    expect(applyTerminology("早上好。", [term("  ", "空")])).toBe("早上好。");
+  });
+});

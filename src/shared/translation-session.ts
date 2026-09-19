@@ -11,17 +11,44 @@ interface SessionMemory {
   entityHints: EntityHint[];
   cached: Map<string, TranslationResult>;
   cachedByText: Map<string, TranslationResult>;
+  /** The language pair everything remembered here was translated for. */
+  pair: string | null;
   lastTouchedAt: number;
 }
 
 export interface PersistedTranslationSession {
   recent: ContextLine[];
   entityHints: EntityHint[];
+  pair?: string;
   lastTouchedAt: number;
 }
 
 export class TranslationSessionStore {
   private readonly sessions = new Map<string, SessionMemory>();
+
+  /**
+   * Points a session at the pair it is translating now.
+   *
+   * Everything a session remembers — the cached translations, the context the
+   * model reads back, the renderings it learned for a name — is written in one
+   * target language. When the user changes the pair mid-session that memory is
+   * not stale by age but simply in the wrong language, so it goes rather than
+   * coming back as a caption nobody asked for.
+   */
+  useLanguagePair(sessionId: string, sourceLanguage: string, targetLanguage: string): void {
+    const pair = `${sourceLanguage}>${targetLanguage}`;
+    const session = this.getSession(sessionId);
+    if (session.pair === pair) {
+      return;
+    }
+    if (session.pair !== null) {
+      session.recent = [];
+      session.entityHints = [];
+      session.cached.clear();
+      session.cachedByText.clear();
+    }
+    session.pair = pair;
+  }
 
   getContext(sessionId: string): ContextLine[] {
     return [...this.getSession(sessionId).recent];
@@ -116,6 +143,7 @@ export class TranslationSessionStore {
     return {
       recent: session.recent.map((line) => ({ ...line })),
       entityHints: session.entityHints.map((hint) => ({ ...hint })),
+      ...(session.pair ? { pair: session.pair } : {}),
       lastTouchedAt: session.lastTouchedAt
     };
   }
@@ -131,6 +159,7 @@ export class TranslationSessionStore {
       entityHints: entityHints.map((hint) => ({ ...hint })),
       cached: new Map(),
       cachedByText: new Map(),
+      pair: typeof value.pair === "string" ? value.pair : null,
       lastTouchedAt: Number.isFinite(value.lastTouchedAt) ? value.lastTouchedAt : Date.now()
     });
     this.prune();
@@ -187,6 +216,7 @@ export class TranslationSessionStore {
       entityHints: [],
       cached: new Map(),
       cachedByText: new Map(),
+      pair: null,
       lastTouchedAt: Date.now()
     };
     this.sessions.set(sessionId, session);

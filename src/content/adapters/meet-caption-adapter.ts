@@ -34,7 +34,11 @@ export const MEET_CAPTION_REGION_SELECTORS = [
   ".a4cQT"
 ] as const;
 
-/** One speaker turn inside the region. Falls back to the region's children. */
+/**
+ * One speaker turn inside the region. Nothing else counts as a turn: picking
+ * arbitrary children of an unknown layout would read the oldest line on the
+ * strip forever while new speech scrolled past it, and say nothing about it.
+ */
 export const MEET_CAPTION_BLOCK_SELECTORS = [".nMcdL"] as const;
 
 /** The spoken text inside a turn. */
@@ -602,14 +606,7 @@ function regionHasText(region: Element): boolean {
 }
 
 function captionBlockElements(region: Element): Element[] {
-  const explicit = Array.from(
-    region.querySelectorAll(MEET_CAPTION_BLOCK_SELECTORS.join(", "))
-  );
-  if (explicit.length > 0) {
-    return explicit;
-  }
-  // Meet renders one child per speaker turn even when its class names change.
-  return Array.from(region.children);
+  return Array.from(region.querySelectorAll(MEET_CAPTION_BLOCK_SELECTORS.join(", ")));
 }
 
 function pickText(block: Element, selectors: readonly string[]): string {

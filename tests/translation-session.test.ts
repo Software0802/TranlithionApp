@@ -51,6 +51,44 @@ describe("translation session memory", () => {
     expect(store.getContext("session").map((line) => line.cueId)).toEqual(["cue-1", "cue-2"]);
   });
 
+  it("forgets what it learned for a pair the user has switched away from", () => {
+    // Everything a session remembers is written in one target language. After
+    // a mid-call switch it is not stale by age, it is simply the wrong
+    // language, and serving it would caption the meeting in a language nobody
+    // asked for.
+    const store = new TranslationSessionStore();
+    store.useLanguagePair("session", "ja", "zh-CN");
+    store.record("session", cue("cue-1", "こんにちは"), result("你好。", "悟空"));
+
+    store.useLanguagePair("session", "ja", "en");
+
+    expect(store.getCachedByText("session", "こんにちは")).toBeUndefined();
+    expect(store.getCached("session", "cue-1")).toBeUndefined();
+    expect(store.getContext("session")).toEqual([]);
+    expect(store.getEntityHints("session")).toEqual([]);
+  });
+
+  it("keeps everything while the pair stays the same", () => {
+    const store = new TranslationSessionStore();
+    store.useLanguagePair("session", "ja", "zh-CN");
+    store.record("session", cue("cue-1", "こんにちは"), result("你好。"));
+    store.useLanguagePair("session", "ja", "zh-CN");
+
+    expect(store.getCachedByText("session", "こんにちは")?.text).toBe("你好。");
+  });
+
+  it("keeps restored context when the worker wakes on the same pair", () => {
+    const store = new TranslationSessionStore();
+    store.useLanguagePair("session", "ja", "zh-CN");
+    store.record("session", cue("cue-1", "こんにちは"), result("你好。"));
+
+    const woken = new TranslationSessionStore();
+    woken.restore("session", store.snapshot("session"));
+    woken.useLanguagePair("session", "ja", "zh-CN");
+
+    expect(woken.getContext("session")).toHaveLength(1);
+  });
+
   it("answers a repeat from a channel that has no cue to key on", () => {
     // The machine-translation meeting channels never reach the model, so the
     // text memory is what stops a sentence being paid for twice in one call.

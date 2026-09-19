@@ -20,6 +20,7 @@ import {
 import { sampleSourceText } from "../shared/language";
 import {
   isMeetingHost,
+  keepsSpokenRecord,
   MEETING_CONTENT_SCRIPT_ID,
   MEETING_HOST_PERMISSIONS
 } from "../shared/meeting";
@@ -38,13 +39,16 @@ import {
   TranslationSessionStore,
   type PersistedTranslationSession
 } from "../shared/translation-session";
+import { applyTerminology } from "../shared/terminology";
 import type {
   EntityHint,
+  GlossaryEntry,
   RuntimeStatus,
   TabRuntimeStatus,
   SubtitleCue,
   TranslationFailure,
   TranslationResponse,
+  TranslationResult,
   TranslationSettings
 } from "../shared/types";
 import { translateDraft } from "./draft-translator";
@@ -232,6 +236,11 @@ async function translateCue(
   }
 
   await hydrate;
+  sessionStore.useLanguagePair(
+    request.sessionId,
+    settings.sourceLanguage,
+    settings.targetLanguage
+  );
 
   // Live captions that rewrite themselves: only the newest line is worth
   // finishing, and repeats hit the text cache instead of the network.
@@ -245,7 +254,7 @@ async function translateCue(
   // text cache immediately keeps live captions in sync without a network round-trip.
   if (cached) {
     if (latestOnly) {
-      sessionStore.record(request.sessionId, request.cue, { ...cached, latencyMs: 0 });
+      rememberTranslation(request.sessionId, request.cue, { ...cached, latencyMs: 0 }, settings);
     }
     return { ok: true, translation: { ...cached, latencyMs: 0 } };
   }
@@ -282,8 +291,9 @@ async function translateCue(
     if (signal?.aborted) {
       throw new TranslatorError("CANCELLED", "字幕已更新，已取消过期翻译。");
     }
-    sessionStore.record(request.sessionId, request.cue, result);
-    await persistSession(request.sessionId);
+    if (rememberTranslation(request.sessionId, request.cue, result, settings)) {
+      await persistSession(request.sessionId);
+    }
     return result;
   };
 
@@ -309,6 +319,33 @@ async function translateCue(
   }
 }
 
+/**
+ * Puts a finished translation into the session's memory under the consent the
+ * user gave for this call, and says whether it is worth persisting.
+ *
+ * A meeting the user has not asked to keep leaves only what it taught us: the
+ * terms stay for the rest of the session, the sentences and the names that
+ * said them are never written into the context that reaches storage.
+ */
+function rememberTranslation(
+  sessionId: string,
+  cue: SubtitleCue,
+  result: TranslationResult,
+  settings: TranslationSettings
+): boolean {
+  if (!keepsSpokenRecord(settings, cue.source)) {
+    sessionStore.rememberText(sessionId, cue.text, result);
+    return false;
+  }
+  sessionStore.record(sessionId, cue, result);
+  return true;
+}
+
+/** Everything a caption channel should render consistently: settings plus what the call taught us. */
+function sessionTerminology(sessionId: string, settings: TranslationSettings): GlossaryEntry[] {
+  return [...settings.glossary, ...sessionStore.getEntityHints(sessionId)];
+}
+
 async function draftTranslate(
   sessionId: string,
   text: string,
@@ -326,6 +363,7 @@ async function draftTranslate(
   if (await requiredDraftPermissionMissing(settings)) {
     return { ok: false };
   }
+  sessionStore.useLanguagePair(sessionId, settings.sourceLanguage, settings.targetLanguage);
 
   // As the caption itself this channel carries a whole meeting, where the same
   // sentence comes round again and again. What the session already learned is
@@ -348,15 +386,16 @@ async function draftTranslate(
     if (!translated || controller.signal.aborted) {
       return { ok: false };
     }
+    const caption = applyTerminology(translated, sessionTerminology(sessionId, settings));
     if (asFinal) {
       sessionStore.rememberText(sessionId, text, {
-        text: translated,
+        text: caption,
         provider: settings.provider,
         latencyMs: 0,
         entityHints: []
       });
     }
-    return { ok: true, text: translated };
+    return { ok: true, text: caption };
   } finally {
     if (draftControllers.get(sessionId) === controller) {
       draftControllers.delete(sessionId);
@@ -389,34 +428,32 @@ async function recordMeetingLine(
   }
   const settings = await getSettings();
   await restorePersistedSession(message.sessionId);
+  sessionStore.useLanguagePair(
+    message.sessionId,
+    settings.sourceLanguage,
+    settings.targetLanguage
+  );
 
   // Speaker names are exactly the proper nouns a meeting keeps repeating, so
-  // they join the session's term memory and reach the model's stable prefix.
+  // they join the session's term memory and reach every channel's rendering.
   const entityHints: EntityHint[] = message.cue.speaker
     ? [{ source: message.cue.speaker, target: message.cue.speaker, kind: "name" }]
     : [];
+  sessionStore.rememberEntityHints(message.sessionId, entityHints);
 
-  if (!settings.meetingTranscript) {
-    // The user declined a record of this call, so nothing said in it is kept
-    // beyond the live session: the terms accumulate in memory, the sentences
-    // and the names they were said by are never written to storage.
-    sessionStore.rememberEntityHints(message.sessionId, entityHints);
-    sessionStore.rememberText(message.sessionId, message.cue.text, {
-      text: translation,
-      provider: settings.provider,
-      latencyMs: 0,
-      entityHints: []
-    });
-    return { ok: true };
+  const recorded = rememberTranslation(
+    message.sessionId,
+    message.cue,
+    { text: translation, provider: settings.provider, latencyMs: 0, entityHints },
+    settings
+  );
+  if (recorded) {
+    await persistSession(message.sessionId);
   }
 
-  sessionStore.record(message.sessionId, message.cue, {
-    text: translation,
-    provider: settings.provider,
-    latencyMs: 0,
-    entityHints
-  });
-  await persistSession(message.sessionId);
+  if (!settings.meetingTranscript) {
+    return { ok: true };
+  }
 
   await queueTranscriptStorageUpdate(async () => {
     // Only this meeting's own key is read and written, so one sentence never
@@ -489,6 +526,9 @@ async function translatePlain(
   if (await localMtPermissionMissing(settings)) {
     return { ok: false, error: "尚未授权访问本机翻译服务地址。" };
   }
+  if (sessionId) {
+    sessionStore.useLanguagePair(sessionId, settings.sourceLanguage, settings.targetLanguage);
+  }
   const remembered = sessionId ? sessionStore.getCachedByText(sessionId, text) : undefined;
   if (remembered) {
     return { ok: true, text: remembered.text };
@@ -497,15 +537,17 @@ async function translatePlain(
   if (!translated) {
     return { ok: false, error: "本机翻译失败。请确认 LibreTranslate 已启动。" };
   }
-  if (sessionId) {
-    sessionStore.rememberText(sessionId, text, {
-      text: translated,
-      provider: settings.provider,
-      latencyMs: 0,
-      entityHints: []
-    });
+  if (!sessionId) {
+    return { ok: true, text: translated };
   }
-  return { ok: true, text: translated };
+  const caption = applyTerminology(translated, sessionTerminology(sessionId, settings));
+  sessionStore.rememberText(sessionId, text, {
+    text: caption,
+    provider: settings.provider,
+    latencyMs: 0,
+    entityHints: []
+  });
+  return { ok: true, text: caption };
 }
 
 async function translatePlainBatch(texts: string[]): Promise<PlainBatchTranslationResponse> {

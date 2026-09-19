@@ -182,6 +182,39 @@ describe("Meet caption block parsing", () => {
     ).toEqual([]);
   });
 
+  it("reads nothing when Meet wraps its turns in a layout we do not know", () => {
+    // Treating every child of the region as a turn would parse this wrapper
+    // as one turn, and the first speaker and text nodes inside it belong to
+    // the oldest line on the strip: the adapter would sit on that line,
+    // retranslating it while new speech scrolled past, and say nothing.
+    const region = element({
+      className: "a4cQT",
+      children: [
+        {
+          className: "scroller",
+          children: [
+            {
+              className: "row",
+              children: [
+                { className: "zs7s8d", text: "Alice Chen" },
+                { className: "bh44bd", text: "the first thing said" }
+              ]
+            },
+            {
+              className: "row",
+              children: [
+                { className: "zs7s8d", text: "Bob Tan" },
+                { className: "bh44bd", text: "what is being said now" }
+              ]
+            }
+          ]
+        }
+      ]
+    });
+
+    expect(readMeetCaptionBlocks(asElement(region))).toEqual([]);
+  });
+
   it("keeps a long display name instead of second-guessing the selector", () => {
     // Google account names carry titles, team suffixes and parenthetical
     // roles. Dropping one on length would silently take that person's name
