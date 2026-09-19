@@ -45,13 +45,22 @@ export class TranslationSessionStore {
 
   record(sessionId: string, cue: SubtitleCue, translation: TranslationResult): void {
     const session = this.getSession(sessionId);
-    session.recent.push({
+    const line: ContextLine = {
       cueId: cue.id,
       source: cue.text,
       translation: translation.text,
       atMs: Date.now(),
       ...(cue.speaker ? { speaker: cue.speaker } : {})
-    });
+    };
+    // One cue is one line of context. A meeting line is recorded again when it
+    // settles, and appending it twice would spend half the model's window
+    // repeating what it has already been told.
+    const existing = session.recent.findIndex((entry) => entry.cueId === cue.id);
+    if (existing >= 0) {
+      session.recent[existing] = line;
+    } else {
+      session.recent.push(line);
+    }
     session.recent.splice(0, Math.max(0, session.recent.length - MAX_CONTEXT_LINES));
 
     session.cached.set(cue.id, translation);

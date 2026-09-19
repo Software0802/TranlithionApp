@@ -5,6 +5,10 @@ import {
   MEET_REGION_POLL_INTERVAL_MS
 } from "../src/content/adapters/meet-caption-adapter";
 import { SubtitleController } from "../src/content/subtitle-controller";
+import {
+  appendTranscriptLine,
+  type MeetingTranscriptSession
+} from "../src/shared/meeting-transcript";
 import { DEFAULT_SETTINGS, publicSettings } from "../src/shared/settings";
 import type { SubtitleCue, TranslationResponse } from "../src/shared/types";
 import { element, type FakeElement } from "./helpers/fake-dom";
@@ -32,6 +36,7 @@ interface RecordedLine {
   source: string;
   translation: string;
   speaker?: string;
+  replaces?: string[];
 }
 
 interface FakeNode {
@@ -56,6 +61,9 @@ function createFixture() {
   const recorded: RecordedLine[] = [];
   /** Source lines the channel refuses to translate. */
   const draftFailures: string[] = [];
+  /** Source lines whose answer is held until the test releases it. */
+  const heldSources = new Set<string>();
+  const heldAnswers = new Map<string, (response: unknown) => void>();
 
   /** Enough of an element for the Overlay; none of it is asserted on. */
   function createNode(tag: string): FakeNode {
@@ -134,14 +142,23 @@ function createFixture() {
         if (message.type === "DRAFT_TRANSLATE") {
           const text = String(message.text);
           draftRequests.push(text);
-          return draftFailures.includes(text) ? { ok: false } : { ok: true, text: `[zh] ${text}` };
+          if (draftFailures.includes(text)) {
+            return { ok: false };
+          }
+          if (heldSources.has(text)) {
+            return new Promise((resolve) => {
+              heldAnswers.set(text, resolve);
+            });
+          }
+          return { ok: true, text: `[zh] ${text}` };
         }
         if (message.type === "RECORD_MEETING_LINE") {
           const cue = message.cue as SubtitleCue;
           recorded.push({
             source: cue.text,
             translation: String(message.translation),
-            speaker: cue.speaker
+            speaker: cue.speaker,
+            replaces: message.replaces as string[] | undefined
           });
         }
         return undefined;
@@ -174,9 +191,19 @@ function createFixture() {
   );
   controller.start();
 
+  /**
+   * Meet keeps the node of a turn it is still growing and appends a node for a
+   * new one, so rows are reused by position rather than re-rendered wholesale.
+   */
   function rebuild(turns: Turn[]): void {
-    region.children.length = 0;
-    for (const turn of turns) {
+    region.children.length = Math.min(region.children.length, turns.length);
+    turns.forEach((turn, index) => {
+      const existing = region.children[index];
+      if (existing) {
+        existing.querySelector(".zs7s8d")?.setText(turn.speaker);
+        existing.querySelector(".bh44bd")?.setText(turn.text);
+        return;
+      }
       region.children.push(
         element({
           className: "nMcdL",
@@ -186,7 +213,7 @@ function createFixture() {
           ]
         }) as FakeElement
       );
-    }
+    });
   }
 
   return {
@@ -197,6 +224,16 @@ function createFixture() {
     draftFailures,
     /** Whether Meet's own caption strip is readable to the user right now. */
     nativeCaptionsVisible: () => !documentStyles.has(MEET_NATIVE_HIDE_STYLE_ID),
+    /** Holds this line's translation until `release`, as a slow channel would. */
+    hold(source: string) {
+      heldSources.add(source);
+    },
+    async release(source: string) {
+      heldSources.delete(source);
+      heldAnswers.get(source)?.({ ok: true, text: `[zh] ${source}` });
+      heldAnswers.delete(source);
+      await vi.advanceTimersByTimeAsync(0);
+    },
     async render(turns: Turn[]) {
       rebuild(turns);
       if (notifyMutation) {
@@ -290,5 +327,37 @@ describe("meeting translation flow", () => {
     await fixture.wait(REVISE_DEBOUNCE_MS);
 
     expect(fixture.nativeCaptionsVisible()).toBe(false);
+  });
+
+  it("carries a retraction to the correction even when it lands mid-translation", async () => {
+    const fixture = createFixture();
+    // The channel holds this line, so its record waits in the queue while the
+    // recognizer takes the same sentence back.
+    fixture.hold("Hi everyone.");
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Hi everyone." }]);
+    await fixture.render([{ speaker: "Alice Chen", text: "Hi everyone. Let's" }]);
+    await fixture.render([{ speaker: "Alice Chen", text: "Hey everyone. Let's" }]);
+    await fixture.release("Hi everyone.");
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    // Folding what was recorded through the real store is the outcome that
+    // matters: the withdrawn wording must not survive in the D7 transcript.
+    const stored = fixture.recorded.reduce<MeetingTranscriptSession | null>(
+      (session, line, index) =>
+        appendTranscriptLine(session, {
+          sessionId: "meeting-1",
+          host: "meet.google.com",
+          title: "Weekly sync",
+          atMs: 1_000 + index,
+          speaker: line.speaker ?? null,
+          source: line.source,
+          translation: line.translation,
+          replaces: line.replaces
+        }),
+      null
+    );
+
+    expect(stored?.lines.map((line) => line.source)).toEqual(["Hey everyone."]);
   });
 });

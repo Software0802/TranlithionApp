@@ -150,9 +150,15 @@ export class DraftTranslator implements DraftChannel {
         return null;
       }
       const trimmed = translated.trim();
-      // An echo of the source is worse than showing nothing: it would look like
-      // a finished translation that simply failed to translate.
-      return trimmed && trimmed !== source ? trimmed : null;
+      if (!trimmed) {
+        return null;
+      }
+      // As a draft, an echo of the source is worse than showing nothing: it
+      // would look like a finished translation that failed to translate, and
+      // the real one is still on its way. As the caption itself there is
+      // nothing behind it — a name or a figure simply reads the same in both
+      // languages, and calling that a dead channel would be a lie.
+      return this.asFinal || trimmed !== source ? trimmed : null;
     } catch {
       return null;
     }
@@ -271,10 +277,17 @@ export class LocalMtTranslator implements DraftChannel {
       return null;
     }
     try {
-      const response = await safeRuntimeSendMessage<PlainTranslationResponse>({
-        type: "TRANSLATE_PLAIN",
-        text
-      } satisfies ExtensionMessage);
+      // The background's budget is the one a whole page can afford to wait
+      // for. This channel is a live caption on a serialized queue, so a slow
+      // local server must cost one dropped line rather than a backlog that
+      // pushes every later line minutes behind the conversation.
+      const response = await withTimeout(
+        safeRuntimeSendMessage<PlainTranslationResponse>({
+          type: "TRANSLATE_PLAIN",
+          text
+        } satisfies ExtensionMessage),
+        FINAL_CHANNEL_TIMEOUT_MS
+      );
       if (!response?.ok || typeof response.text !== "string" || signal?.aborted) {
         return null;
       }

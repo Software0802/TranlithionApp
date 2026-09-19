@@ -742,13 +742,18 @@ export class SubtitleController {
     }
     // Whatever is translating this sentence must survive the next cue-start.
     this.draftAbort = null;
+    // Taken now, not when the record runs: the record waits behind this
+    // line's translation, and a retraction arriving in that window belongs to
+    // the correction that follows, never to the line being settled.
+    const replaces = this.retractedLines;
+    this.retractedLines = [];
     this.runFinalTranslation(async () => {
       if (!this.localTextCache.has(cue.text)) {
         await this.translateSettledLine(cue);
       }
       const translation = this.localTextCache.get(cue.text);
       if (translation) {
-        this.recordMeetingLine(cue, translation);
+        this.recordMeetingLine(cue, translation, replaces);
       }
     });
   }
@@ -776,12 +781,10 @@ export class SubtitleController {
    * meeting captions are recorded, and only while the user has the transcript
    * switched on.
    */
-  private recordMeetingLine(cue: SubtitleCue, translation: string): void {
+  private recordMeetingLine(cue: SubtitleCue, translation: string, replaces: string[]): void {
     if (cue.source !== "meet-dom" || !this.meetingMode()) {
       return;
     }
-    const replaces = this.retractedLines;
-    this.retractedLines = [];
     void safeRuntimeSendMessage({
       type: "RECORD_MEETING_LINE",
       sessionId: this.sessionId,

@@ -39,6 +39,18 @@ describe("translation session memory", () => {
     expect(store.getCached("session", "cue-9")?.text).toBe("译文-9");
   });
 
+  it("keeps one context line per cue when the same line is recorded twice", () => {
+    // A meeting line is recorded once by the translation and again when it
+    // settles. Appending it twice would spend half the model's window
+    // repeating what it has already been told.
+    const store = new TranslationSessionStore();
+    store.record("session", cue("cue-1", "Good morning."), result("早上好。"));
+    store.record("session", cue("cue-2", "Let's begin."), result("我们开始吧。"));
+    store.record("session", cue("cue-1", "Good morning."), result("早上好。"));
+
+    expect(store.getContext("session").map((line) => line.cueId)).toEqual(["cue-1", "cue-2"]);
+  });
+
   it("reuses translations by source text across different cue ids", () => {
     const store = new TranslationSessionStore();
     store.record(

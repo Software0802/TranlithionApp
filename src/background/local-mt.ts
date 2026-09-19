@@ -52,10 +52,10 @@ export async function translateWithLibreTranslate(
       typeof (payload as { translatedText?: unknown }).translatedText === "string"
         ? (payload as { translatedText: string }).translatedText.trim()
         : "";
-    if (!translated || translated === source) {
-      return null;
-    }
-    return translated;
+    // Text that survives translation unchanged — a name, an acronym, a figure
+    // — is a result, not a failure. Callers that have nothing to gain from an
+    // identical string decide that for themselves.
+    return translated || null;
   } catch {
     return null;
   } finally {
