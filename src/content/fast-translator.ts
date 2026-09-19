@@ -5,7 +5,10 @@ import type {
 } from "../shared/messages";
 import { safeRuntimeSendMessage } from "../shared/extension-context";
 import { toShortLanguageCode } from "../shared/language";
+import { MEETING_FINAL_CHANNEL_TIMEOUT_MS } from "../shared/meeting";
+import { applyTerminology } from "../shared/terminology";
 import type {
+  GlossaryEntry,
   PublicTranslationSettings,
   SourceLanguage,
   TargetLanguage
@@ -35,12 +38,6 @@ import type {
 const PREPARE_TIMEOUT_MS = 10_000;
 /** A draft slower than this is pointless: the service answer is already close. */
 const DRAFT_TIMEOUT_MS = 800;
-/**
- * When this channel *is* the caption (meeting mode), nothing slower is waiting
- * behind it. A cold on-device model or a long sentence is worth waiting for;
- * giving up at the draft budget would drop the line entirely.
- */
-const FINAL_CHANNEL_TIMEOUT_MS = 4_000;
 
 /**
  * A source of immediate, lower-quality captions. Implementations must resolve
@@ -112,7 +109,14 @@ export class DraftTranslator implements DraftChannel {
     sourceLanguage: SourceLanguage,
     targetLanguage: TargetLanguage,
     /** This channel is the caption the user reads, not a preview of one. */
-    private readonly asFinal = false
+    private readonly asFinal = false,
+    /**
+     * The user's fixed renderings. Chrome's on-device translator takes no
+     * glossary and runs here rather than in the worker, so this is the only
+     * place they can be applied to its output. Read at call time: a glossary
+     * edited during a call takes effect on the next line.
+     */
+    private readonly terminology: () => GlossaryEntry[] = () => []
   ) {
     this.pair = {
       sourceLanguage: toTranslatorLanguage(sourceLanguage),
@@ -144,7 +148,7 @@ export class DraftTranslator implements DraftChannel {
     try {
       const translated = await withTimeout(
         instance.translate(source),
-        this.asFinal ? FINAL_CHANNEL_TIMEOUT_MS : DRAFT_TIMEOUT_MS
+        this.asFinal ? MEETING_FINAL_CHANNEL_TIMEOUT_MS : DRAFT_TIMEOUT_MS
       );
       if (signal?.aborted || typeof translated !== "string") {
         return null;
@@ -153,12 +157,16 @@ export class DraftTranslator implements DraftChannel {
       if (!trimmed) {
         return null;
       }
-      // As a draft, an echo of the source is worse than showing nothing: it
-      // would look like a finished translation that failed to translate, and
-      // the real one is still on its way. As the caption itself there is
-      // nothing behind it — a name or a figure simply reads the same in both
-      // languages, and calling that a dead channel would be a lie.
-      return this.asFinal || trimmed !== source ? trimmed : null;
+      if (!this.asFinal) {
+        // As a draft, an echo of the source is worse than showing nothing: it
+        // would look like a finished translation that failed to translate,
+        // and the real one is still on its way.
+        return trimmed !== source ? trimmed : null;
+      }
+      // As the caption itself there is nothing behind it — a name or a figure
+      // simply reads the same in both languages, and calling that a dead
+      // channel would be a lie.
+      return applyTerminology(trimmed, this.terminology());
     } catch {
       return null;
     }
@@ -289,7 +297,7 @@ export class LocalMtTranslator implements DraftChannel {
           text,
           sessionId: this.sessionId
         } satisfies ExtensionMessage),
-        FINAL_CHANNEL_TIMEOUT_MS
+        MEETING_FINAL_CHANNEL_TIMEOUT_MS
       );
       if (!response?.ok || typeof response.text !== "string" || signal?.aborted) {
         return null;
@@ -325,10 +333,16 @@ export function createFastChannel(
   settings: PublicTranslationSettings,
   sessionId: string,
   cueIdOf: () => string,
-  asFinal = false
+  asFinal = false,
+  terminology: () => GlossaryEntry[] = () => []
 ): DraftChannel | null {
   if (settings.draftProvider === "browser") {
-    return new DraftTranslator(settings.sourceLanguage, settings.targetLanguage, asFinal);
+    return new DraftTranslator(
+      settings.sourceLanguage,
+      settings.targetLanguage,
+      asFinal,
+      terminology
+    );
   }
   // A remote provider without a key would spend a request per caption to fail.
   if (settings.draftProvider === "deepl" && !settings.draftApiKeyConfigured) {

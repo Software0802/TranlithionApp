@@ -96,6 +96,29 @@ describe("on-device draft translator", () => {
     expect(await translator.translate("Figma")).toBe("Figma");
   });
 
+  it("renders the user's glossary onto the caption it produces", async () => {
+    // Chrome's on-device translator is the shipped default meeting channel
+    // and takes no glossary of its own, so the renderings the user pasted in
+    // have to be applied here or nowhere.
+    stubTranslatorApi({ translate: async () => "我们在 Figma 里改。" });
+    const translator = new DraftTranslator("ja", "zh-CN", true, () => [
+      { source: "Figma", target: "菲格玛", kind: "term" }
+    ]);
+
+    expect(await translator.translate("Figmaで直す。")).toBe("我们在 菲格玛 里改。");
+  });
+
+  it("leaves a film's draft caption exactly as the model wrote it", async () => {
+    // A draft is replaced by the model's answer, which follows the glossary
+    // itself; rewriting the draft would only make the two disagree on screen.
+    stubTranslatorApi({ translate: async () => "我们在 Figma 里改。" });
+    const translator = new DraftTranslator("ja", "zh-CN", false, () => [
+      { source: "Figma", target: "菲格玛", kind: "term" }
+    ]);
+
+    expect(await translator.translate("Figmaで直す。")).toBe("我们在 Figma 里改。");
+  });
+
   it("never throws when the local model fails", async () => {
     stubTranslatorApi({
       translate: async () => {

@@ -24,9 +24,16 @@ describe("fixed renderings on a machine translation", () => {
     ).toBe("陈爱丽 said yes.");
   });
 
-  it("matches a Latin term whatever its case", () => {
+  it("matches the spelling the user wrote and no other", () => {
+    // `IT = 信息技术` is exactly the kind of entry a meeting glossary carries,
+    // and an English caption is full of the word "it". Matching loosely would
+    // put a term nobody said into the middle of a sentence.
+    expect(applyTerminology("He said it plainly.", [term("IT", "信息技术")])).toBe(
+      "He said it plainly."
+    );
+    expect(applyTerminology("the IT team", [term("IT", "信息技术")])).toBe("the 信息技术 team");
     expect(applyTerminology("the figma file", [term("Figma", "菲格玛")])).toBe(
-      "the 菲格玛 file"
+      "the figma file"
     );
   });
 

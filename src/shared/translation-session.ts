@@ -169,6 +169,22 @@ export class TranslationSessionStore {
     this.sessions.delete(sessionId);
   }
 
+  /**
+   * Drops every sentence any session is holding — the context, the per-cue
+   * results and the repeat memory — and keeps only the terms they taught.
+   *
+   * A user who withdraws consent to a record of a call loses the record, not
+   * their glossary, and loses it in the call still running rather than only
+   * in the next one.
+   */
+  forgetSpokenLines(): void {
+    for (const session of this.sessions.values()) {
+      session.recent = [];
+      session.cached.clear();
+      session.cachedByText.clear();
+    }
+  }
+
   private storeByText(
     session: SessionMemory,
     sourceText: string,

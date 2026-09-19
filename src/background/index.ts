@@ -130,10 +130,14 @@ async function handleMessage(
       return { settings } satisfies SettingsResponse;
     }
     case "SAVE_SETTINGS": {
-      const settings = mergeSettings(await getSettings(), message.patch);
+      const previous = await getSettings();
+      const settings = mergeSettings(previous, message.patch);
       settingsCache = settings;
       permissionCache = null;
       await chrome.storage.local.set({ [SETTINGS_STORAGE_KEY]: settings });
+      if (previous.meetingTranscript && !settings.meetingTranscript) {
+        await forgetSpokenRecords();
+      }
       return { ok: true, settings };
     }
     case "GET_TAB_STATUS": {
@@ -381,21 +385,21 @@ async function draftTranslate(
       text,
       settings,
       signal: controller.signal,
-      asFinal
+      asFinal,
+      terminology: sessionTerminology(sessionId, settings)
     });
     if (!translated || controller.signal.aborted) {
       return { ok: false };
     }
-    const caption = applyTerminology(translated, sessionTerminology(sessionId, settings));
     if (asFinal) {
       sessionStore.rememberText(sessionId, text, {
-        text: caption,
+        text: translated,
         provider: settings.provider,
         latencyMs: 0,
         entityHints: []
       });
     }
-    return { ok: true, text: caption };
+    return { ok: true, text: translated };
   } finally {
     if (draftControllers.get(sessionId) === controller) {
       draftControllers.delete(sessionId);
@@ -439,7 +443,6 @@ async function recordMeetingLine(
   const entityHints: EntityHint[] = message.cue.speaker
     ? [{ source: message.cue.speaker, target: message.cue.speaker, kind: "name" }]
     : [];
-  sessionStore.rememberEntityHints(message.sessionId, entityHints);
 
   const recorded = rememberTranslation(
     message.sessionId,
@@ -936,6 +939,21 @@ async function clearStoredTranscripts(): Promise<void> {
     if (keys.length > 0) {
       await chrome.storage.local.remove(keys);
     }
+  });
+  await forgetSpokenRecords();
+}
+
+/**
+ * Consent withdrawn: what was said stops being remembered anywhere, including
+ * the snapshot that carries a session across a worker sleep. The terms the
+ * calls taught stay for as long as the worker lives; the sentences and the
+ * names that said them are gone, in a call still running as much as in one
+ * already over.
+ */
+async function forgetSpokenRecords(): Promise<void> {
+  sessionStore.forgetSpokenLines();
+  await queueContextStorageUpdate(async () => {
+    await chrome.storage.session.remove(SESSION_CONTEXT_STORAGE_KEY);
   });
 }
 

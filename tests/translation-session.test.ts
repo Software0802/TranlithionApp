@@ -89,6 +89,25 @@ describe("translation session memory", () => {
     expect(woken.getContext("session")).toHaveLength(1);
   });
 
+  it("drops every sentence but keeps the terms when consent is withdrawn", () => {
+    // Unchecking the transcript mid-call, or clearing the records, has to
+    // take back what is already remembered — including the snapshot that
+    // would otherwise outlive the call.
+    const store = new TranslationSessionStore();
+    store.useLanguagePair("session", "ja", "zh-CN");
+    store.record("session", cue("cue-1", "こんにちは"), result("你好。", "悟空"));
+
+    store.forgetSpokenLines();
+
+    expect(store.getContext("session")).toEqual([]);
+    expect(store.snapshot("session")?.recent).toEqual([]);
+    expect(store.getCached("session", "cue-1")).toBeUndefined();
+    expect(store.getCachedByText("session", "こんにちは")).toBeUndefined();
+    expect(store.getEntityHints("session")).toEqual([
+      { source: "悟空", target: "悟空", kind: "name" }
+    ]);
+  });
+
   it("answers a repeat from a channel that has no cue to key on", () => {
     // The machine-translation meeting channels never reach the model, so the
     // text memory is what stops a sentence being paid for twice in one call.

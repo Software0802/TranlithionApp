@@ -1,5 +1,7 @@
 import { toDeepLSource, toDeepLTarget } from "../shared/language";
-import type { TranslationSettings } from "../shared/types";
+import { MEETING_FINAL_CHANNEL_TIMEOUT_MS } from "../shared/meeting";
+import { applyTerminology } from "../shared/terminology";
+import type { GlossaryEntry, TranslationSettings } from "../shared/types";
 
 /**
  * Remote draft channel: a dedicated machine-translation endpoint that answers
@@ -19,12 +21,6 @@ import type { TranslationSettings } from "../shared/types";
  * lands, so it is dropped instead.
  */
 const REMOTE_DRAFT_TIMEOUT_MS = 1_200;
-/**
- * When this channel *is* the caption (meeting mode), there is nothing slower
- * waiting behind it, so it is worth waiting a little longer rather than
- * showing the user nothing.
- */
-const FINAL_CHANNEL_TIMEOUT_MS = 4_000;
 
 export interface RemoteDraftInput {
   text: string;
@@ -32,6 +28,13 @@ export interface RemoteDraftInput {
   signal?: AbortSignal;
   /** The caller is using this channel as the final caption, not as a preview. */
   asFinal?: boolean;
+  /**
+   * Fixed renderings for the caption this channel is about to become. They
+   * apply only to a final caption: a draft is replaced by the model's answer,
+   * which follows the glossary on its own, and rewriting it in between would
+   * make the two disagree in front of the viewer.
+   */
+  terminology?: GlossaryEntry[];
 }
 
 export async function translateDraft(input: RemoteDraftInput): Promise<string | null> {
@@ -55,7 +58,7 @@ export async function translateDraft(input: RemoteDraftInput): Promise<string | 
   input.signal?.addEventListener("abort", abortForNewerCue, { once: true });
   const timer = globalThis.setTimeout(
     () => controller.abort(),
-    input.asFinal ? FINAL_CHANNEL_TIMEOUT_MS : REMOTE_DRAFT_TIMEOUT_MS
+    input.asFinal ? MEETING_FINAL_CHANNEL_TIMEOUT_MS : REMOTE_DRAFT_TIMEOUT_MS
   );
 
   try {
@@ -73,12 +76,16 @@ export async function translateDraft(input: RemoteDraftInput): Promise<string | 
     if (!translated || controller.signal.aborted) {
       return null;
     }
-    // As a draft, an echo of the source reads as a finished translation that
-    // silently failed, which is worse than leaving the caption to the main
-    // translator. As the caption itself there is nothing behind it: a name or
-    // a figure simply reads the same in both languages, and reporting that as
-    // no result would call a working channel dead.
-    return !input.asFinal && translated === text ? null : translated;
+    if (!input.asFinal) {
+      // As a draft, an echo of the source reads as a finished translation that
+      // silently failed, which is worse than leaving the caption to the main
+      // translator.
+      return translated === text ? null : translated;
+    }
+    // As the caption itself there is nothing behind it: a name or a figure
+    // simply reads the same in both languages, and reporting that as no
+    // result would call a working channel dead.
+    return applyTerminology(translated, input.terminology ?? []);
   } catch {
     return null;
   } finally {

@@ -17,6 +17,16 @@ export const MEETING_HOST_PERMISSIONS = ["https://meet.google.com/*"] as const;
 
 export const MEETING_CONTENT_SCRIPT_ID = "tranlithion-meeting-hosts";
 
+/**
+ * How long a meeting channel may take to answer one line.
+ *
+ * When a channel *is* the caption there is nothing slower waiting behind it,
+ * so it is worth more than a draft's budget — but meeting jobs run one at a
+ * time, so an answer that never comes has to cost this line rather than every
+ * line after it. One rule for all three channels, stated once.
+ */
+export const MEETING_FINAL_CHANNEL_TIMEOUT_MS = 4_000;
+
 export function isMeetingHost(hostname: string): boolean {
   const normalized = hostname.toLocaleLowerCase();
   return MEETING_HOSTS.some((host) => normalized === host);
