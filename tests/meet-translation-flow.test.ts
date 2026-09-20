@@ -596,6 +596,29 @@ describe("meeting translation flow", () => {
     expect(fixture.errors().some((message) => message.includes("已跳过"))).toBe(false);
   });
 
+  it("forgets a superseded wording's budget even while the overlay is hidden", async () => {
+    const fixture = createFixture();
+    fixture.draftFailures.push("Hi everyone");
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Hi everyone" }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    // Screen share: nothing is translated or shown from here, but the line
+    // the recognizer replaces is still replaced.
+    fixture.setOverlayHidden(true);
+    await fixture.render([{ speaker: "Alice Chen", text: "Hi everybody" }]);
+    await fixture.wait(MEETING_FINAL_CHANNEL_TIMEOUT_MS + TICK_MS);
+
+    fixture.setOverlayHidden(false);
+    await fixture.render([{ speaker: "Alice Chen", text: "Hi everyone" }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    // Back on screen, the corrected wording is asked for afresh rather than
+    // judged against the deadline of an attempt the user never saw.
+    expect(fixture.draftRequests).toEqual(["Hi everyone", "Hi everyone"]);
+    expect(fixture.errors().some((message) => message.includes("已跳过"))).toBe(false);
+  });
+
   it("gives one sentence one budget however often it reaches the queue", async () => {
     const fixture = createFixture();
     fixture.hold("Good morning.");
