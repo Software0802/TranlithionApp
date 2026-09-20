@@ -16,6 +16,7 @@ import {
   MEETING_TRANSCRIPT_FAILURE_KEY,
   retainedTranscriptFailures,
   summarizeTranscripts,
+  transcriptPruneDue,
   MAX_TRANSCRIPT_LINES,
   MAX_TRANSCRIPT_SESSIONS,
   readTranscriptSession,
@@ -401,6 +402,26 @@ describe("local meeting transcript", () => {
         [transcriptSessionKey("broken")]: { sessionId: 7 }
       })
     ).toEqual([meeting]);
+  });
+});
+
+describe("how often the retention sweep reads the whole store", () => {
+  it("sweeps once a day rather than on every worker wake", () => {
+    const now = 100 * DAY_MS;
+
+    // An MV3 worker wakes for every popup and message; re-reading every
+    // stored meeting each time buys nothing, because expiry is counted in
+    // whole days.
+    expect(transcriptPruneDue(now - 60_000, now)).toBe(false);
+    expect(transcriptPruneDue(now - DAY_MS, now)).toBe(true);
+  });
+
+  it("sweeps when it has never swept, or when the clock moved backwards", () => {
+    const now = 100 * DAY_MS;
+
+    expect(transcriptPruneDue(undefined, now)).toBe(true);
+    expect(transcriptPruneDue("yesterday", now)).toBe(true);
+    expect(transcriptPruneDue(now + DAY_MS, now)).toBe(true);
   });
 });
 

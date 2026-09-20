@@ -338,6 +338,8 @@ function createFixture(overrides: Partial<PublicTranslationSettings> = {}) {
     },
     /** The last thing the popup was told. */
     lastStatus: () => statuses[statuses.length - 1],
+    /** Everything the popup was told, in order. */
+    statusMessages: () => statuses.map((status) => status.message),
     /** Every failure the popup was told about, in order. */
     errors: () => statuses.filter((status) => status.state === "error").map((s) => s.message),
     async render(turns: Turn[]) {
@@ -462,8 +464,11 @@ describe("meeting translation flow", () => {
     expect(fixture.draftRequests.filter((text) => text === "Good morning.")).toHaveLength(2);
   });
 
-  it("translates a one-word answer once the turn is over", async () => {
+  it("translates a one-word answer once the turn is over, and shows it", async () => {
     const fixture = createFixture();
+    // The channel is still working when the turn ends, so the answer lands
+    // against a cue that has already been torn down.
+    fixture.hold("No.");
 
     // "No." reads exactly like a title while it is the only text there, so
     // it waits — but the turn ending is what it was waiting for.
@@ -472,10 +477,42 @@ describe("meeting translation flow", () => {
     expect(fixture.draftRequests).toEqual([]);
 
     await fixture.render([]);
-    await fixture.wait(3_000);
+    await fixture.wait(2_000);
 
     expect(fixture.draftRequests).toEqual(["No."]);
+    expect(fixture.caption()).toBeNull();
+
+    await fixture.release("No.");
+
+    // Nothing has taken the slot, so the sticky overlay holds the line the
+    // user would otherwise never have seen.
     expect(fixture.recorded).toMatchObject([{ source: "No.", translation: "[zh] No." }]);
+    expect(fixture.caption()).toBe("[zh] No.");
+
+    await fixture.wait(1_500);
+
+    // And it is held for reading time, not forever.
+    expect(fixture.caption()).toBeNull();
+  });
+
+  it("says a line was translated when the meeting moved on before it landed", async () => {
+    const fixture = createFixture({ meetingFinalChannel: "llm" });
+    fixture.holdModel("Good morning.");
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Let's" }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    // The next line is already readable on screen from the draft channel.
+    expect(fixture.caption()).toBe("[zh] Let's");
+
+    await fixture.releaseModel("Good morning.");
+
+    // The finished sentence is not put back over it — but the user is told
+    // it was translated rather than left to wonder where it went.
+    expect(fixture.caption()).not.toContain("Good morning.");
+    expect(
+      fixture.statusMessages().some((message) => message.includes("没有再顶掉"))
+    ).toBe(true);
   });
 
   it("keeps a title with the sentence it belongs to", async () => {

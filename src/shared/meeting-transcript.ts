@@ -295,3 +295,22 @@ export function readTranscriptFailures(value: unknown): Record<string, Transcrip
     })
   );
 }
+
+/** Where the last full retention sweep is remembered. */
+export const MEETING_TRANSCRIPT_PRUNED_AT_KEY = "meeting-transcript-pruned-at";
+
+/**
+ * Whether the retention sweep is due again.
+ *
+ * The sweep reads every stored meeting to compare timestamps, and an MV3
+ * worker wakes for every popup, tab close and message — several megabytes
+ * re-read for nothing. Expiry is counted in whole days, so sweeping once a
+ * day removes exactly the same records as sweeping on every wake.
+ */
+export function transcriptPruneDue(lastPrunedAt: unknown, nowMs: number): boolean {
+  if (typeof lastPrunedAt !== "number" || !Number.isFinite(lastPrunedAt)) {
+    return true;
+  }
+  const sinceMs = nowMs - lastPrunedAt;
+  return sinceMs < 0 || sinceMs >= DAY_MS;
+}

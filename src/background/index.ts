@@ -30,11 +30,13 @@ import {
   expiredTranscriptKeys,
   isTranscriptSessionKey,
   MEETING_TRANSCRIPT_FAILURE_KEY,
+  MEETING_TRANSCRIPT_PRUNED_AT_KEY,
   readTranscriptFailures,
   readTranscriptSession,
   readTranscriptSessions,
   retainedTranscriptFailures,
   summarizeTranscripts,
+  transcriptPruneDue,
   transcriptSessionKey,
   type TranscriptFailure
 } from "../shared/meeting-transcript";
@@ -930,9 +932,14 @@ function queueTranscriptStorageUpdate(update: () => Promise<void>): Promise<void
  */
 async function pruneStoredTranscripts(): Promise<void> {
   const settings = await getSettings();
-  await queueTranscriptStorageUpdate(() =>
-    dropExpiredTranscripts(settings.meetingTranscriptRetentionDays)
-  );
+  await queueTranscriptStorageUpdate(async () => {
+    const stored = await chrome.storage.local.get(MEETING_TRANSCRIPT_PRUNED_AT_KEY);
+    if (!transcriptPruneDue(stored[MEETING_TRANSCRIPT_PRUNED_AT_KEY], Date.now())) {
+      return;
+    }
+    await dropExpiredTranscripts(settings.meetingTranscriptRetentionDays);
+    await chrome.storage.local.set({ [MEETING_TRANSCRIPT_PRUNED_AT_KEY]: Date.now() });
+  });
 }
 
 /** Runs inside the transcript queue; never queue it again from within. */

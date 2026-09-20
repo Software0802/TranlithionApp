@@ -124,6 +124,8 @@ export class SubtitleController {
   private readonly recordedCueIds = new Set<string>();
   /** The pair the answer currently streaming in was asked for. */
   private streamingPair: string | null = null;
+  /** The last line that reached the overlay, newer than which nothing older paints. */
+  private lastPaintedCue: SubtitleCue | null = null;
   /** One budget per sentence, keyed by its cue. See `runFinalTranslation`. */
   private readonly meetingLineBudgets = new Map<string, MeetingLineBudget>();
 
@@ -788,6 +790,7 @@ export class SubtitleController {
       }
       const painted = this.applyCaption(cue, "final", text);
       if (!painted && this.activeCue?.id !== cue.id) {
+        this.reportUnshownLine(cue);
         return;
       }
       this.report(
@@ -896,6 +899,7 @@ export class SubtitleController {
       this.lastStreamPaintAt = performance.now();
       this.lastStreamText = text;
     }
+    this.lastPaintedCue = cue;
     this.overlay.show({
       translation: text,
       original: cue.text,
@@ -903,27 +907,50 @@ export class SubtitleController {
       pending: stage === "streaming",
       draft: stage === "draft"
     });
+    if (superseded && !this.activeCue) {
+      // The cue this belongs to is over and nothing has taken the slot, so
+      // the sticky overlay is holding it alone: give it the same reading
+      // time any other line gets rather than leaving it up until the next.
+      this.scheduleTeardown(cue.source, MIN_TRANSLATION_VISIBLE_MS);
+    }
     return true;
   }
 
   /**
-   * Whether a sentence that has already ended may still go up while a newer
-   * cue is open.
+   * Whether a sentence that has already ended may still go up.
    *
    * A recognizer punctuates the line it just finished together with the first
    * words of the next one, so a meeting sentence is settled — and only then
-   * translated — when the cue after it is already the active one. Its
-   * translation is the newest text anyone has and the new cue has painted
-   * nothing, so withholding it would show the user the trailing fragment and
-   * never the sentence. Once the newer cue paints anything of its own, the
-   * finished sentence has had its turn and never comes back over it.
+   * translated — when the cue after it is already the active one, or when the
+   * turn is over and no cue is open at all. Either way its translation is the
+   * newest text anyone has, and the sticky overlay exists to hold exactly
+   * that. Once something newer has painted, the finished sentence has had its
+   * turn and never comes back over it.
    */
   private paintsAheadOfActiveCue(cue: SubtitleCue, stage: CaptionStage): boolean {
-    return (
-      cue.source === "meet-dom" &&
-      stage === "final" &&
-      this.activeCue !== null &&
-      this.activeCueStage === "none"
+    if (cue.source !== "meet-dom" || stage !== "final") {
+      return false;
+    }
+    if (!this.activeCue) {
+      return !this.lastPaintedCue || this.lastPaintedCue.startMs <= cue.startMs;
+    }
+    return this.activeCueStage === "none";
+  }
+
+  /**
+   * A line that was translated but never reached the screen, because the
+   * meeting had already moved on to a sentence the user is reading now.
+   * Silently dropping it would leave them with a transcript row for a line
+   * they never saw and no idea why.
+   */
+  private reportUnshownLine(cue: SubtitleCue): void {
+    if (cue.source !== "meet-dom" || !this.meetingMode()) {
+      return;
+    }
+    this.report(
+      "ready",
+      "这一句的译文回来时屏幕上已经是下一句了，没有再顶掉它。",
+      cue.source
     );
   }
 
@@ -1178,6 +1205,7 @@ export class SubtitleController {
 
       const painted = this.applyCaption(cue, "final", response.translation.text);
       if (!painted && this.activeCue?.id !== cue.id) {
+        this.reportUnshownLine(cue);
         return;
       }
       const mode = response.translation.provider === "mock" ? "演示翻译模式" : "正在同步显示译文";
