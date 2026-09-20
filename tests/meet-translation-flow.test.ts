@@ -50,7 +50,7 @@ interface FakeNode {
   [key: string]: unknown;
 }
 
-function createFixture() {
+function createFixture(overrides: Partial<PublicTranslationSettings> = {}) {
   let wallClockMs = 0;
   let notifyMutation: (() => void) | null = null;
 
@@ -69,6 +69,17 @@ function createFixture() {
   /** Source lines whose answer is held until the test releases it. */
   const heldSources = new Set<string>();
   const heldAnswers = new Map<string, (response: unknown) => void>();
+  /** The same, for the chat model, plus the request it is still answering. */
+  const heldModelSources = new Set<string>();
+  let inFlightModel: { text: string; resolve: (response: TranslationResponse) => void } | null =
+    null;
+
+  function modelAnswer(text: string): TranslationResponse {
+    return {
+      ok: true,
+      translation: { text: `[llm] ${text}`, provider: "mock", latencyMs: 1, entityHints: [] }
+    };
+  }
 
   /** Enough of an element for the Overlay; none of it is asserted on. */
   function createNode(tag: string): FakeNode {
@@ -192,22 +203,24 @@ function createFixture() {
     meetingMode: true,
     meetingTranscript: true,
     draftProvider: "deepl",
-    draftApiKeyConfigured: true
+    draftApiKeyConfigured: true,
+    ...overrides
   };
   const controller = new SubtitleController(
     { kind: "page" },
     settings,
     async (cue: SubtitleCue): Promise<TranslationResponse> => {
       modelRequests.push(cue.text);
-      return {
-        ok: true,
-        translation: {
-          text: `[llm] ${cue.text}`,
-          provider: "mock",
-          latencyMs: 1,
-          entityHints: []
-        }
-      };
+      // The background keeps only the newest meeting request, so a new one
+      // aborts whatever it finds in flight.
+      inFlightModel?.resolve({ ok: false, error: { code: "CANCELLED", message: "superseded" } });
+      inFlightModel = null;
+      if (!heldModelSources.has(cue.text)) {
+        return modelAnswer(cue.text);
+      }
+      return new Promise<TranslationResponse>((resolve) => {
+        inFlightModel = { text: cue.text, resolve };
+      });
     },
     () => undefined
   );
@@ -253,6 +266,19 @@ function createFixture() {
     /** Holds this line's translation until `release`, as a slow channel would. */
     hold(source: string) {
       heldSources.add(source);
+    },
+    /** The same for the chat model, so a request can be left in flight. */
+    holdModel(source: string) {
+      heldModelSources.add(source);
+    },
+    async releaseModel(source: string) {
+      heldModelSources.delete(source);
+      const pending = inFlightModel;
+      inFlightModel = null;
+      if (pending) {
+        pending.resolve(modelAnswer(pending.text));
+      }
+      await vi.advanceTimersByTimeAsync(0);
     },
     /** Hands the controller the cue-end it just saw a second time. */
     async redeliverLastCueEnd() {
@@ -375,6 +401,35 @@ describe("meeting translation flow", () => {
     await fixture.wait(REVISE_DEBOUNCE_MS);
 
     expect(fixture.nativeCaptionsVisible()).toBe(false);
+  });
+
+  it("finishes a settled line on the chat model while a cached line refreshes context", async () => {
+    const fixture = createFixture({ meetingFinalChannel: "llm" });
+
+    // Said once, so the next time these words come up they are painted from
+    // local memory and only the background's context is refreshed.
+    await fixture.render([{ speaker: "Alice Chen", text: "Okay." }]);
+    await fixture.render([]);
+    await fixture.wait(2_000);
+
+    fixture.holdModel("Good morning everyone.");
+    await fixture.render([{ speaker: "Bob Tan", text: "Good morning everyone. And" }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    await fixture.render([
+      { speaker: "Bob Tan", text: "Good morning everyone. And" },
+      { speaker: "Carol Diaz", text: "Okay." }
+    ]);
+    await fixture.releaseModel("Good morning everyone.");
+    await fixture.wait(2_400);
+
+    // The refresh waits its turn instead of superseding the sentence still
+    // being translated, which therefore still reaches the transcript.
+    expect(fixture.recorded).toContainEqual({
+      source: "Good morning everyone.",
+      translation: "[llm] Good morning everyone.",
+      speaker: "Bob Tan"
+    });
   });
 
   it("sends and records nothing more once the overlay is hidden mid-queue", async () => {

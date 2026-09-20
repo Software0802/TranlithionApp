@@ -676,12 +676,18 @@ export class SubtitleController {
    * Skipped whenever a single low-cost channel is the final translator: the
    * chat model never renders those captions, so a request here would spend a
    * model call purely to fill a context window nothing reads.
+   *
+   * It takes its turn in the meeting queue like every other meeting request.
+   * The background keeps only the newest request per meeting session, so a
+   * refresh sent while a settled sentence is still being translated would
+   * cancel that sentence — and this line is already on screen, while that one
+   * still owes the user a caption and the transcript a line.
    */
   private refreshSessionContext(cue: SubtitleCue): void {
     if (this.singleChannel()) {
       return;
     }
-    void this.translateActiveCue(cue);
+    this.runFinalTranslation(() => this.translateActiveCue(cue));
   }
 
   private async showDraftTranslation(cue: SubtitleCue, signal: AbortSignal): Promise<void> {
