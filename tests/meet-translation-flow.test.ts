@@ -60,6 +60,8 @@ function createFixture(overrides: Partial<PublicTranslationSettings> = {}) {
   });
   /** Stylesheets currently in the document head, by id. */
   const documentStyles = new Map<string, FakeNode>();
+  /** Every element the page built, so the overlay can be read back. */
+  const createdNodes: FakeNode[] = [];
 
   const draftRequests: string[] = [];
   const modelRequests: string[] = [];
@@ -81,8 +83,9 @@ function createFixture(overrides: Partial<PublicTranslationSettings> = {}) {
     };
   }
 
-  /** Enough of an element for the Overlay; none of it is asserted on. */
+  /** Enough of an element for the Overlay, and readable back as what it shows. */
   function createNode(tag: string): FakeNode {
+    const attributes: Record<string, string> = {};
     const node: FakeNode = {
       tagName: tag.toUpperCase(),
       id: "",
@@ -91,17 +94,34 @@ function createFixture(overrides: Partial<PublicTranslationSettings> = {}) {
       hidden: false,
       lang: "",
       parentElement: null,
-      style: { setProperty: () => undefined },
+      style: { setProperty: () => undefined } as Record<string, unknown>,
       dataset: {},
+      attributes,
       classList: { toggle: () => undefined },
-      setAttribute: () => undefined,
+      setAttribute: (name: string, value: string) => {
+        attributes[name] = value;
+      },
       append: () => undefined,
       attachShadow: () => ({ append: () => undefined }),
       remove: () => {
         documentStyles.delete(node.id);
       }
     };
+    createdNodes.push(node);
     return node;
+  }
+
+  /** The translation line the overlay is showing, or null when it is hidden. */
+  function caption(): string | null {
+    const host = createdNodes.find(
+      (node) => "data-tranlithion-overlay" in (node.attributes as Record<string, string>)
+    );
+    const style = host?.style as Record<string, unknown> | undefined;
+    if (style?.display !== "block") {
+      return null;
+    }
+    const line = createdNodes.find((node) => node.className === "translation");
+    return String(line?.textContent ?? "");
   }
 
   vi.stubGlobal("location", { hostname: "meet.google.com", pathname: "/abc-defg-hij" });
@@ -257,6 +277,7 @@ function createFixture(overrides: Partial<PublicTranslationSettings> = {}) {
     modelRequests,
     recorded,
     draftFailures,
+    caption,
     /** Whether Meet's own caption strip is readable to the user right now. */
     nativeCaptionsVisible: () => !documentStyles.has(MEET_NATIVE_HIDE_STYLE_ID),
     /** The one-click 「隐藏译文（共享屏幕）」 switch. */
@@ -335,6 +356,33 @@ describe("meeting translation flow", () => {
     expect(fixture.recorded).toMatchObject([
       { source: "Good morning.", translation: "[zh] Good morning.", speaker: "Alice Chen" }
     ]);
+  });
+
+  it("shows the sentence that just finished, not only the fragment after it", async () => {
+    const fixture = createFixture();
+
+    // One read carries the full stop and the words that follow it, so the
+    // finished sentence is settled while the next cue is already open.
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Let's" }]);
+
+    expect(fixture.caption()).toBe("[zh] Good morning.");
+  });
+
+  it("never puts a finished sentence back over a newer line already on screen", async () => {
+    const fixture = createFixture({ meetingFinalChannel: "llm" });
+    // The finished sentence waits on the model while the line after it is
+    // already readable on screen from the draft channel.
+    fixture.holdModel("Good morning.");
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Thanks" }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    expect(fixture.caption()).toBe("[zh] Thanks");
+
+    fixture.holdModel("Thanks");
+    await fixture.releaseModel("Good morning.");
+
+    expect(fixture.caption()).toBe("[zh] Thanks");
   });
 
   it("records only the settled line, not the prefixes it grew through", async () => {

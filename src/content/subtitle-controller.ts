@@ -624,15 +624,21 @@ export class SubtitleController {
         this.rememberLocalTranslation(cue.text, text);
         this.setMeetingChannelBroken(false);
       }
-      if (signal.aborted || this.activeCue?.id !== cue.id) {
+      if (signal.aborted) {
         return;
       }
       if (!text) {
+        if (this.activeCue?.id !== cue.id) {
+          return;
+        }
         this.setMeetingChannelBroken(true);
         this.report("error", this.singleChannelFailureMessage(), cue.source);
         return;
       }
-      this.applyCaption(cue, "final", text);
+      const painted = this.applyCaption(cue, "final", text);
+      if (!painted && this.activeCue?.id !== cue.id) {
+        return;
+      }
       this.report(
         "ready",
         `正在同步显示译文（${this.singleChannelLabel()}）`,
@@ -712,7 +718,11 @@ export class SubtitleController {
    * caption to lower-quality text.
    */
   private applyCaption(cue: SubtitleCue, stage: CaptionStage, text: string): boolean {
-    if (this.destroyed || this.activeCue?.id !== cue.id || this.overlayHidden()) {
+    if (this.destroyed || this.overlayHidden()) {
+      return false;
+    }
+    const superseded = this.activeCue?.id !== cue.id;
+    if (superseded && !this.paintsAheadOfActiveCue(cue, stage)) {
       return false;
     }
     // Streaming may refine the same stage in place; other stages stay monotonic.
@@ -725,7 +735,11 @@ export class SubtitleController {
     if (this.activeCueStage === "none") {
       this.captionShownAtMs = this.clock.nowMs();
     }
-    this.activeCueStage = stage;
+    if (!superseded) {
+      // The stage belongs to the cue that is open, and this text came from an
+      // older one: whatever the open cue produces still gets its turn.
+      this.activeCueStage = stage;
+    }
     if (stage === "streaming") {
       this.lastStreamPaintAt = performance.now();
       this.lastStreamText = text;
@@ -738,6 +752,27 @@ export class SubtitleController {
       draft: stage === "draft"
     });
     return true;
+  }
+
+  /**
+   * Whether a sentence that has already ended may still go up while a newer
+   * cue is open.
+   *
+   * A recognizer punctuates the line it just finished together with the first
+   * words of the next one, so a meeting sentence is settled — and only then
+   * translated — when the cue after it is already the active one. Its
+   * translation is the newest text anyone has and the new cue has painted
+   * nothing, so withholding it would show the user the trailing fragment and
+   * never the sentence. Once the newer cue paints anything of its own, the
+   * finished sentence has had its turn and never comes back over it.
+   */
+  private paintsAheadOfActiveCue(cue: SubtitleCue, stage: CaptionStage): boolean {
+    return (
+      cue.source === "meet-dom" &&
+      stage === "final" &&
+      this.activeCue !== null &&
+      this.activeCueStage === "none"
+    );
   }
 
   /**
@@ -919,13 +954,13 @@ export class SubtitleController {
       if (response.ok && response.translation) {
         this.rememberLocalTranslation(cue.text, response.translation.text);
       }
-      if (this.activeCue?.id !== cue.id) {
-        return;
-      }
       if (!isCueWithinPlaybackWindow(cue, this.clock.nowMs())) {
         return;
       }
       if (!response.ok || !response.translation) {
+        if (this.activeCue?.id !== cue.id) {
+          return;
+        }
         const message = response.error?.message ?? "翻译服务暂时不可用。";
         // A local draft is a usable translation. Replacing it with an error would
         // throw away readable text the viewer is already following.
@@ -951,7 +986,10 @@ export class SubtitleController {
         return;
       }
 
-      this.applyCaption(cue, "final", response.translation.text);
+      const painted = this.applyCaption(cue, "final", response.translation.text);
+      if (!painted && this.activeCue?.id !== cue.id) {
+        return;
+      }
       const mode = response.translation.provider === "mock" ? "演示翻译模式" : "正在同步显示译文";
       this.report("ready", mode, cue.source, response.translation.latencyMs);
     } catch {
