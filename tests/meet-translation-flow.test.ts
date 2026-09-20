@@ -577,6 +577,25 @@ describe("meeting translation flow", () => {
     ]);
   });
 
+  it("does not judge a re-created cue id against an abandoned deadline", async () => {
+    const fixture = createFixture();
+    fixture.draftFailures.push("Hi everyone");
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Hi everyone" }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+    await fixture.wait(MEETING_FINAL_CHANNEL_TIMEOUT_MS + TICK_MS);
+
+    // The recognizer rewrites the open line and then corrects itself back,
+    // which rebuilds the cue id the first attempt ran under. That wording is
+    // being asked for now, so it is not held to the abandoned deadline.
+    await fixture.render([{ speaker: "Alice Chen", text: "Hi everybody" }]);
+    await fixture.render([{ speaker: "Alice Chen", text: "Hi everyone" }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    expect(fixture.draftRequests).toEqual(["Hi everyone", "Hi everyone"]);
+    expect(fixture.errors().some((message) => message.includes("已跳过"))).toBe(false);
+  });
+
   it("gives one sentence one budget however often it reaches the queue", async () => {
     const fixture = createFixture();
     fixture.hold("Good morning.");

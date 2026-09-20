@@ -362,6 +362,11 @@ export class SubtitleController {
     if (!this.acceptSource(cue.source)) {
       return;
     }
+    // The wording this replaces is gone, and so is whatever budget it was
+    // running on. A recognizer that rewrites a line and then corrects itself
+    // back rebuilds the same cue id, and that line is being asked for now,
+    // not whenever the abandoned wording first went out.
+    this.meetingLineBudgets.delete(previousCueId);
     if (this.activeCue?.id !== previousCueId && this.activeCue?.id !== cue.id) {
       // Orphan revise after teardown; treat as a fresh start.
       this.handleCueStart(cue);
