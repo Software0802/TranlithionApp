@@ -1,12 +1,13 @@
 import type { SubtitleCue, SubtitleSource } from "../../shared/types";
 
 /**
- * Wording a live recognizer has published and then taken back. The cue
- * carrying this is the correction that replaces it, so a transcript that
- * already stored the withdrawn line can drop it again.
+ * Cues a live recognizer published and then took back. The cue carrying this
+ * is the correction that replaces them, so a transcript that already stored
+ * one of them can drop exactly that line — identity, not wording: two people
+ * saying "Okay." in one meeting is two things said.
  */
 interface CueRetraction {
-  retracts?: string[];
+  retractedCueIds?: string[];
 }
 
 export type SubtitleAdapterEvent =

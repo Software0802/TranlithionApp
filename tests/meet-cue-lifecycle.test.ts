@@ -68,6 +68,8 @@ function createFixture() {
 
   const events: string[] = [];
   const retractions: string[][] = [];
+  /** The cue each published text went out as, so a test can name it back. */
+  const cueIds = new Map<string, string>();
   const availability: boolean[] = [];
   const adapter = new MeetCaptionAdapter(clock);
   adapter.start((event: SubtitleAdapterEvent) => {
@@ -81,8 +83,11 @@ function createFixture() {
     } else if (event.type === "cue-end") {
       events.push("end");
     }
-    if (event.type !== "availability" && event.type !== "cue-end" && event.retracts) {
-      retractions.push(event.retracts);
+    if (event.type === "cue-start" || event.type === "cue-revise") {
+      cueIds.set(event.cue.text, event.cue.id);
+    }
+    if (event.type !== "availability" && event.type !== "cue-end" && event.retractedCueIds) {
+      retractions.push(event.retractedCueIds);
     }
   });
 
@@ -116,6 +121,7 @@ function createFixture() {
     adapter,
     events,
     retractions,
+    cueIdOf: (text: string) => cueIds.get(text),
     availability,
     region,
     /** A strip whose rows none of the adapter's selectors can read. */
@@ -316,7 +322,7 @@ describe("Meet cue lifecycle", () => {
       "end",
       "start:Alice Chen|Let's"
     ]);
-    expect(fixture.retractions).toEqual([["Hi everyone."]]);
+    expect(fixture.retractions).toEqual([[fixture.cueIdOf("Hi everyone.")]]);
   });
 
   it("keeps the sentences a correction did not touch", async () => {
@@ -331,7 +337,7 @@ describe("Meet cue lifecycle", () => {
     await fixture.render([{ speaker: "Alice Chen", text: "One. Two, and three." }]);
 
     expect(fixture.events).toEqual(["revise:Alice Chen|Two, and three."]);
-    expect(fixture.retractions).toEqual([["Two."]]);
+    expect(fixture.retractions).toEqual([[fixture.cueIdOf("Two.")]]);
   });
 
   it("hides Meet's own strip only once it has read a caption out of it", async () => {

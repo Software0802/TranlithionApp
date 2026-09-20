@@ -182,8 +182,8 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
   /** Prefix of this turn already published as a finished segment. */
   private emitted = "";
   /** Each finished segment published from this block, oldest first. */
-  private settledSegments: { end: number; text: string }[] = [];
-  /** Published wording the recognizer withdrew, not yet reported. */
+  private settledSegments: { end: number; text: string; cueId: string | null }[] = [];
+  /** Cues the recognizer withdrew, not yet reported. */
   private retracted: string[] = [];
   /** The published segment ended a sentence, so new words open a new cue. */
   private segmentClosed = false;
@@ -354,8 +354,10 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
 
     const settled = pending.slice(0, cut).trim();
     this.emitted = full.slice(0, this.emitted.length + leading + cut);
-    this.settledSegments.push({ end: this.emitted.length, text: settled });
+    const segment = { end: this.emitted.length, text: settled, cueId: null as string | null };
+    this.settledSegments.push(segment);
     this.publish(settled, corrects);
+    segment.cueId = this.currentCue?.id ?? null;
     // The sentence is complete, so whatever the speaker says next is a new
     // line rather than a revision of this one.
     this.segmentClosed = true;
@@ -371,8 +373,8 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
    *
    * The sentences the rewrite left untouched stay published, so they are
    * neither retranslated nor recorded twice. Everything after them was
-   * withdrawn: it is returned so the correction that replaces it can say which
-   * wording it supersedes.
+   * withdrawn: the cues it went out as are reported so the correction can
+   * name exactly the lines it supersedes.
    */
   private dropWithdrawnSegments(full: string): string[] {
     let keep = this.settledSegments.length;
@@ -382,7 +384,10 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
     ) {
       keep -= 1;
     }
-    const withdrawn = this.settledSegments.slice(keep).map((segment) => segment.text);
+    const withdrawn = this.settledSegments
+      .slice(keep)
+      .map((segment) => segment.cueId)
+      .filter((cueId): cueId is string => cueId !== null);
     this.settledSegments = this.settledSegments.slice(0, keep);
     this.emitted = keep > 0 ? this.blockText.slice(0, this.settledSegments[keep - 1].end) : "";
     this.retracted.push(...withdrawn);
@@ -478,14 +483,14 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
     this.emit({ type: "cue-start", source: this.source, cue, ...this.takeRetracted() });
   }
 
-  /** Withdrawn wording to report with the correction that replaces it. */
-  private takeRetracted(): { retracts?: string[] } {
+  /** Withdrawn cues to report with the correction that replaces them. */
+  private takeRetracted(): { retractedCueIds?: string[] } {
     if (this.retracted.length === 0) {
       return {};
     }
-    const retracts = this.retracted;
+    const retractedCueIds = this.retracted;
     this.retracted = [];
-    return { retracts };
+    return { retractedCueIds };
   }
 
   private createCue(text: string, startMs: number): SubtitleCue | null {

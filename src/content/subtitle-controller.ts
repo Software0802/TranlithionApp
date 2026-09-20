@@ -112,8 +112,8 @@ export class SubtitleController {
   private readonly settleAbort = new AbortController();
   /** The meeting's only channel answered with nothing. */
   private meetingChannelBroken = false;
-  /** Recognizer wording withdrawn since the last line reached the transcript. */
-  private retractedLines: string[] = [];
+  /** Cues the recognizer withdrew since the last line reached the transcript. */
+  private retractedCueIds: string[] = [];
 
   constructor(
     readonly target: CaptionTarget,
@@ -185,7 +185,7 @@ export class SubtitleController {
       // From here nothing is recorded, so a take-back still waiting for a
       // line to carry it would land on whatever is recorded after the user
       // comes back.
-      this.retractedLines = [];
+      this.retractedCueIds = [];
     }
     if (!settings.enabled) {
       this.overlay.hide();
@@ -265,12 +265,12 @@ export class SubtitleController {
       return;
     }
     if (event.type === "cue-start") {
-      this.noteRetraction(event.retracts);
+      this.noteRetraction(event.retractedCueIds);
       this.handleCueStart(event.cue);
       return;
     }
     if (event.type === "cue-revise") {
-      this.noteRetraction(event.retracts);
+      this.noteRetraction(event.retractedCueIds);
       this.handleCueRevise(event.cue, event.previousCueId);
       return;
     }
@@ -286,13 +286,13 @@ export class SubtitleController {
    * supersede — it would travel to whatever is recorded after the user comes
    * back and delete a line that really was spoken.
    */
-  private noteRetraction(retracts: string[] | undefined): void {
+  private noteRetraction(retractedCueIds: string[] | undefined): void {
     if (!this.settings.enabled || this.overlayHidden()) {
-      this.retractedLines = [];
+      this.retractedCueIds = [];
       return;
     }
-    if (retracts?.length) {
-      this.retractedLines.push(...retracts);
+    if (retractedCueIds?.length) {
+      this.retractedCueIds.push(...retractedCueIds);
     }
   }
 
@@ -773,15 +773,15 @@ export class SubtitleController {
     // Taken now, not when the record runs: the record waits behind this
     // line's translation, and a retraction arriving in that window belongs to
     // the correction that follows, never to the line being settled.
-    const replaces = this.retractedLines;
-    this.retractedLines = [];
+    const retractedCueIds = this.retractedCueIds;
+    this.retractedCueIds = [];
     this.runFinalTranslation(async () => {
       if (!this.localTextCache.has(cue.text)) {
         await this.translateSettledLine(cue);
       }
       const translation = this.localTextCache.get(cue.text);
       if (translation) {
-        this.recordMeetingLine(cue, translation, replaces);
+        this.recordMeetingLine(cue, translation, retractedCueIds);
       }
     });
   }
@@ -809,7 +809,11 @@ export class SubtitleController {
    * meeting captions are recorded, and only while the user has the transcript
    * switched on.
    */
-  private recordMeetingLine(cue: SubtitleCue, translation: string, replaces: string[]): void {
+  private recordMeetingLine(
+    cue: SubtitleCue,
+    translation: string,
+    retractedCueIds: string[]
+  ): void {
     if (cue.source !== "meet-dom" || !this.meetingMode()) {
       return;
     }
@@ -820,7 +824,7 @@ export class SubtitleController {
       title: document.title,
       cue,
       translation,
-      ...(replaces.length > 0 ? { replaces } : {})
+      ...(retractedCueIds.length > 0 ? { retractedCueIds } : {})
     } satisfies ExtensionMessage);
   }
 

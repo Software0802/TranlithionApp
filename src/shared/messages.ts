@@ -49,8 +49,8 @@ export type ExtensionMessage =
       title: string;
       cue: SubtitleCue;
       translation: string;
-      /** Wording the recognizer withdrew; this line is its correction. */
-      replaces?: string[];
+      /** Cues the recognizer withdrew; this line is their correction. */
+      retractedCueIds?: string[];
     }
   | { type: "GET_MEETING_TRANSCRIPTS" }
   | { type: "CLEAR_MEETING_TRANSCRIPTS" }

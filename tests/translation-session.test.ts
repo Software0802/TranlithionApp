@@ -146,18 +146,6 @@ describe("translation session memory", () => {
     expect(store.snapshot("session")?.recent).toEqual([]);
   });
 
-  it("accumulates terminology without the sentences it came from", () => {
-    const store = new TranslationSessionStore();
-    store.rememberEntityHints("session", [
-      { source: "Alice Chen", target: "Alice Chen", kind: "name" }
-    ]);
-
-    expect(store.getEntityHints("session")).toEqual([
-      { source: "Alice Chen", target: "Alice Chen", kind: "name" }
-    ]);
-    expect(store.snapshot("session")?.recent).toEqual([]);
-  });
-
   it("reuses translations by source text across different cue ids", () => {
     const store = new TranslationSessionStore();
     store.record(

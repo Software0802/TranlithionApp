@@ -31,6 +31,7 @@ function lineInput(overrides: Partial<Parameters<typeof appendTranscriptLine>[1]
     speaker: "Alice Chen",
     source: "Good morning.",
     translation: "早上好。",
+    cueId: "meet-dom:1000:open:aaa",
     ...overrides
   };
 }
@@ -229,7 +230,13 @@ describe("local meeting transcript", () => {
     const meeting = appendTranscriptLine(null, lineInput());
 
     expect(meeting?.lines).toEqual([
-      { atMs: 1_000, speaker: "Alice Chen", source: "Good morning.", translation: "早上好。" }
+      {
+        atMs: 1_000,
+        speaker: "Alice Chen",
+        source: "Good morning.",
+        translation: "早上好。",
+        cueId: "meet-dom:1000:open:aaa"
+      }
     ]);
     expect(meeting?.title).toBe("Weekly sync");
   });
@@ -261,22 +268,39 @@ describe("local meeting transcript", () => {
   });
 
   it("replaces a line the recognizer took back rather than keeping both", () => {
-    const withdrawn = appendTranscriptLine(null, lineInput({ source: "Hi everyone." }));
+    const withdrawn = appendTranscriptLine(
+      null,
+      lineInput({ source: "Hi everyone.", cueId: "cue-a" })
+    );
     const corrected = appendTranscriptLine(
       withdrawn,
-      lineInput({ source: "Hey everyone.", atMs: 1_400, replaces: ["Hi everyone."] })
+      lineInput({
+        source: "Hey everyone.",
+        atMs: 1_400,
+        cueId: "cue-b",
+        retractedCueIds: ["cue-a"]
+      })
     );
 
     expect(corrected?.lines.map((line) => line.source)).toEqual(["Hey everyone."]);
   });
 
-  it("takes back one line per withdrawn sentence, not every line that reads alike", () => {
-    // Two people saying "Okay." in the same meeting is two things said. The
-    // recognizer taking Bob's back says nothing about Alice's.
-    const alice = appendTranscriptLine(null, lineInput({ source: "Okay.", translation: "好的。" }));
+  it("takes back the line the withdrawn cue produced, not one that reads alike", () => {
+    // Two people saying "Okay." in the same meeting is two things said, and a
+    // recognizer take-back names a cue, not a sentence.
+    const alice = appendTranscriptLine(
+      null,
+      lineInput({ source: "Okay.", translation: "好的。", cueId: "alice-1" })
+    );
     const bob = appendTranscriptLine(
       alice,
-      lineInput({ source: "Okay.", translation: "好的。", speaker: "Bob Tan", atMs: 1_400 })
+      lineInput({
+        source: "Okay.",
+        translation: "好的。",
+        speaker: "Bob Tan",
+        atMs: 1_400,
+        cueId: "bob-1"
+      })
     );
     const corrected = appendTranscriptLine(
       bob,
@@ -285,7 +309,8 @@ describe("local meeting transcript", () => {
         translation: "好，说说预算。",
         speaker: "Bob Tan",
         atMs: 1_800,
-        replaces: ["Okay."]
+        cueId: "bob-2",
+        retractedCueIds: ["bob-1"]
       })
     );
 
@@ -295,18 +320,51 @@ describe("local meeting transcript", () => {
     ]);
   });
 
-  it("leaves lines alone when the withdrawn wording is not the last one", () => {
-    const first = appendTranscriptLine(null, lineInput({ source: "Good morning." }));
-    const second = appendTranscriptLine(first, lineInput({ source: "Let's begin.", atMs: 1_400 }));
+  it("takes back nothing when the withdrawn cue was never recorded", () => {
+    // A sentence the recognizer rewrote before its cue ever settled reached
+    // the screen but never the transcript. It has no line to supersede, and
+    // an earlier line that happens to read the same is not it.
+    const alice = appendTranscriptLine(
+      null,
+      lineInput({ source: "Okay.", translation: "好的。", cueId: "alice-1" })
+    );
+    const corrected = appendTranscriptLine(
+      alice,
+      lineInput({
+        source: "Okey.",
+        translation: "好的。",
+        speaker: "Bob Tan",
+        atMs: 1_400,
+        cueId: "bob-2",
+        retractedCueIds: ["bob-1-never-recorded"]
+      })
+    );
+
+    expect(corrected?.lines.map((line) => [line.speaker, line.source])).toEqual([
+      ["Alice Chen", "Okay."],
+      ["Bob Tan", "Okey."]
+    ]);
+  });
+
+  it("takes back a line that is no longer the last one", () => {
+    const first = appendTranscriptLine(null, lineInput({ source: "Hi all.", cueId: "cue-1" }));
+    const second = appendTranscriptLine(
+      first,
+      lineInput({ source: "Let's begin.", atMs: 1_400, cueId: "cue-2" })
+    );
     const third = appendTranscriptLine(
       second,
-      lineInput({ source: "Any questions?", atMs: 1_800, replaces: ["Good morning."] })
+      lineInput({
+        source: "Hey all.",
+        atMs: 1_800,
+        cueId: "cue-3",
+        retractedCueIds: ["cue-1"]
+      })
     );
 
     expect(third?.lines.map((line) => line.source)).toEqual([
-      "Good morning.",
       "Let's begin.",
-      "Any questions?"
+      "Hey all."
     ]);
   });
 

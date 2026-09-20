@@ -40,7 +40,8 @@ interface RecordedLine {
   source: string;
   translation: string;
   speaker?: string;
-  replaces?: string[];
+  cueId: string;
+  retractedCueIds?: string[];
 }
 
 interface FakeNode {
@@ -162,7 +163,8 @@ function createFixture() {
             source: cue.text,
             translation: String(message.translation),
             speaker: cue.speaker,
-            replaces: message.replaces as string[] | undefined
+            cueId: cue.id,
+            retractedCueIds: message.retractedCueIds as string[] | undefined
           });
         }
         return undefined;
@@ -283,7 +285,7 @@ describe("meeting translation flow", () => {
     await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
 
     expect(fixture.draftRequests).toContain("Good morning.");
-    expect(fixture.recorded).toEqual([
+    expect(fixture.recorded).toMatchObject([
       { source: "Good morning.", translation: "[zh] Good morning.", speaker: "Alice Chen" }
     ]);
   });
@@ -304,7 +306,7 @@ describe("meeting translation flow", () => {
     await fixture.render([]);
     await fixture.wait(2_000);
 
-    expect(fixture.recorded).toEqual([
+    expect(fixture.recorded).toMatchObject([
       {
         source: "Good morning everyone.",
         translation: "[zh] Good morning everyone.",
@@ -371,6 +373,29 @@ describe("meeting translation flow", () => {
     expect(storedSources(fixture.recorded)).toEqual(["Hey everyone."]);
   });
 
+  it("keeps a recorded line when a never-recorded sentence is taken back", async () => {
+    const fixture = createFixture();
+    await fixture.render([{ speaker: "Alice Chen", text: "Okay." }]);
+    await fixture.render([
+      { speaker: "Alice Chen", text: "Okay." },
+      { speaker: "Bob Tan", text: "Okay." }
+    ]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    // Bob's turn opened on a sentence boundary, so that cue is still open and
+    // has never been recorded. The recognizer now corrects it — a take-back
+    // of something the transcript never held, which must not reach back and
+    // delete Alice's line just because it reads the same.
+    await fixture.render([
+      { speaker: "Alice Chen", text: "Okay." },
+      { speaker: "Bob Tan", text: "Okey." }
+    ]);
+    await fixture.render([]);
+    await fixture.wait(2_400);
+
+    expect(storedSources(fixture.recorded)).toEqual(["Okay.", "Okey."]);
+  });
+
   it("keeps a recorded line a take-back from the hidden window would have deleted", async () => {
     const fixture = createFixture();
     await fixture.render([{ speaker: "Alice Chen", text: "Okay." }]);
@@ -417,7 +442,8 @@ function storedSources(recorded: RecordedLine[]): string[] | undefined {
         speaker: line.speaker ?? null,
         source: line.source,
         translation: line.translation,
-        replaces: line.replaces
+        cueId: line.cueId,
+        retractedCueIds: line.retractedCueIds
       }),
     null
   );

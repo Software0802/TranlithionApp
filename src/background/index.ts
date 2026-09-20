@@ -438,7 +438,7 @@ async function recordMeetingLine(
     title: string;
     cue: SubtitleCue;
     translation: string;
-    replaces?: string[];
+    retractedCueIds?: string[];
   },
   tabId?: number
 ): Promise<{ ok: boolean }> {
@@ -492,7 +492,8 @@ async function recordMeetingLine(
       speaker: message.cue.speaker ?? null,
       source: message.cue.text,
       translation,
-      replaces: message.replaces
+      cueId: message.cue.id,
+      retractedCueIds: message.retractedCueIds
     });
     if (!next || next === current) {
       return;

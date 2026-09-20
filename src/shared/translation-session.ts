@@ -132,21 +132,6 @@ export class TranslationSessionStore {
     this.prune();
   }
 
-  /**
-   * Terminology only: the pairs a session has learned, without the sentences
-   * they came from. This is what a meeting may accumulate when the user has
-   * declined to keep a record of what was said.
-   */
-  rememberEntityHints(sessionId: string, hints: EntityHint[]): void {
-    if (hints.length === 0) {
-      return;
-    }
-    const session = this.getSession(sessionId);
-    this.storeEntityHints(session, hints);
-    session.lastTouchedAt = Date.now();
-    this.prune();
-  }
-
   snapshot(sessionId: string): PersistedTranslationSession | undefined {
     const session = this.sessions.get(sessionId);
     if (!session) {
