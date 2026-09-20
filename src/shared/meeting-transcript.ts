@@ -167,9 +167,16 @@ function withoutRetracted(
   if (!replaces?.length) {
     return lines;
   }
-  const withdrawn = new Set(replaces.map((text) => text.trim()).filter(Boolean));
+  // One stored line per withdrawn sentence, newest first. Two people can say
+  // "Okay." in the same meeting: taking back one of them is not a reason to
+  // delete the other, so the walk stops at the first line that is not the
+  // next thing the recognizer took back.
   let end = lines.length;
-  while (end > 0 && withdrawn.has(lines[end - 1].source)) {
+  for (const text of [...replaces].reverse()) {
+    const withdrawn = text.trim();
+    if (!withdrawn || lines[end - 1]?.source !== withdrawn) {
+      break;
+    }
     end -= 1;
   }
   return end === lines.length ? lines : lines.slice(0, end);

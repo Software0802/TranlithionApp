@@ -232,6 +232,31 @@ describe("local meeting transcript", () => {
     expect(corrected?.lines.map((line) => line.source)).toEqual(["Hey everyone."]);
   });
 
+  it("takes back one line per withdrawn sentence, not every line that reads alike", () => {
+    // Two people saying "Okay." in the same meeting is two things said. The
+    // recognizer taking Bob's back says nothing about Alice's.
+    const alice = appendTranscriptLine(null, lineInput({ source: "Okay.", translation: "好的。" }));
+    const bob = appendTranscriptLine(
+      alice,
+      lineInput({ source: "Okay.", translation: "好的。", speaker: "Bob Tan", atMs: 1_400 })
+    );
+    const corrected = appendTranscriptLine(
+      bob,
+      lineInput({
+        source: "Okay, so about the budget.",
+        translation: "好，说说预算。",
+        speaker: "Bob Tan",
+        atMs: 1_800,
+        replaces: ["Okay."]
+      })
+    );
+
+    expect(corrected?.lines.map((line) => [line.speaker, line.source])).toEqual([
+      ["Alice Chen", "Okay."],
+      ["Bob Tan", "Okay, so about the budget."]
+    ]);
+  });
+
   it("leaves lines alone when the withdrawn wording is not the last one", () => {
     const first = appendTranscriptLine(null, lineInput({ source: "Good morning." }));
     const second = appendTranscriptLine(first, lineInput({ source: "Let's begin.", atMs: 1_400 }));
