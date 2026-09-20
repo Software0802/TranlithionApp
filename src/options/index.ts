@@ -1,6 +1,15 @@
 import { DEFAULT_SETTINGS, formatGlossary, parseGlossary } from "../shared/settings";
+import {
+  normalizeLanguagePair,
+  normalizeLanguageTag,
+  sampleSourceText
+} from "../shared/language";
+import { MEETING_HOST_PERMISSIONS, meetingTextDestination } from "../shared/meeting";
+import { describeTranscriptSummary } from "../shared/meeting-transcript";
 import type {
   ExtensionMessage,
+  MeetingTranscriptResponse,
+  MeetingTranscriptSummary,
   SaveSettingsResponse,
   SettingsResponse,
   TestTranslationResponse
@@ -17,7 +26,20 @@ const toggleKey = byId<HTMLButtonElement>("toggle-key");
 const websocketFields = byId<HTMLElement>("websocket-fields");
 const websocketUrl = byId<HTMLInputElement>("websocket-url");
 const position = byId<HTMLSelectElement>("position");
+const sourceLanguage = byId<HTMLSelectElement>("source-language");
+const targetLanguage = byId<HTMLSelectElement>("target-language");
 const showOriginal = byId<HTMLInputElement>("show-original-setting");
+const meetingMode = byId<HTMLInputElement>("meeting-mode");
+const meetingFinalChannel = byId<HTMLSelectElement>("meeting-final-channel");
+const meetingMascot = byId<HTMLInputElement>("meeting-mascot");
+const meetingOverlayHidden = byId<HTMLInputElement>("meeting-overlay-hidden");
+const meetingTranscript = byId<HTMLInputElement>("meeting-transcript");
+const meetingRetention = byId<HTMLSelectElement>("meeting-retention");
+const meetingDestination = byId<HTMLParagraphElement>("meeting-destination");
+const enableMeetingHosts = byId<HTMLButtonElement>("enable-meeting-hosts");
+const meetingPermissionResult = byId<HTMLParagraphElement>("meeting-permission-result");
+const clearTranscripts = byId<HTMLButtonElement>("clear-transcripts");
+const transcriptSummary = byId<HTMLParagraphElement>("transcript-summary");
 const draftCaptions = byId<HTMLInputElement>("draft-captions-setting");
 const draftProvider = byId<HTMLSelectElement>("draft-provider");
 const draftRemoteFields = byId<HTMLElement>("draft-remote-fields");
@@ -36,9 +58,19 @@ const saveResult = byId<HTMLParagraphElement>("save-result");
 const connectionResult = byId<HTMLParagraphElement>("connection-result");
 
 void loadSettings();
+void loadTranscriptSummary();
 
 provider.addEventListener("change", renderProviderFields);
 draftProvider.addEventListener("change", renderProviderFields);
+draftCaptions.addEventListener("change", renderProviderFields);
+meetingFinalChannel.addEventListener("change", renderProviderFields);
+sourceLanguage.addEventListener("change", renderLanguagePair);
+targetLanguage.addEventListener("change", renderLanguagePair);
+// D7: the disclosure names a host read from these fields, so it has to follow
+// them as they are typed — otherwise it keeps naming the previous service.
+for (const field of [draftEndpoint, localMtUrl, apiBaseUrl, websocketUrl, model]) {
+  field.addEventListener("input", renderMeetingDestination);
+}
 toggleKey.addEventListener("click", toggleApiKeyVisibility);
 fontSize.addEventListener("input", renderRangeOutputs);
 opacity.addEventListener("input", renderRangeOutputs);
@@ -47,6 +79,8 @@ form.addEventListener("submit", (event) => {
   void save(false);
 });
 testButton.addEventListener("click", () => void save(true));
+enableMeetingHosts.addEventListener("click", () => void grantMeetingHosts());
+clearTranscripts.addEventListener("click", () => void wipeTranscripts());
 
 async function loadSettings(): Promise<void> {
   try {
@@ -68,7 +102,20 @@ function hydrate(settings: TranslationSettings): void {
   apiKey.value = settings.apiKey;
   websocketUrl.value = settings.webSocketUrl;
   position.value = settings.position;
+  sourceLanguage.value = settings.sourceLanguage;
+  targetLanguage.value = settings.targetLanguage;
   showOriginal.checked = settings.showOriginal;
+  meetingMode.checked = settings.meetingMode;
+  meetingFinalChannel.value = settings.meetingFinalChannel;
+  meetingMascot.checked = settings.meetingMascot;
+  meetingOverlayHidden.checked = settings.meetingOverlayHidden;
+  meetingTranscript.checked = settings.meetingTranscript;
+  meetingRetention.value = String(settings.meetingTranscriptRetentionDays);
+  if (!meetingRetention.value) {
+    // A stored value with no matching option would read back as empty and
+    // silently reset the user's retention window on the next save.
+    meetingRetention.value = String(DEFAULT_SETTINGS.meetingTranscriptRetentionDays);
+  }
   draftCaptions.checked = settings.draftCaptions;
   draftProvider.value = settings.draftProvider;
   draftEndpoint.value = settings.draftEndpointUrl;
@@ -91,7 +138,41 @@ function renderProviderFields(): void {
   if (modelField) {
     modelField.hidden = selected !== "openai-compatible";
   }
-  testButton.textContent = selected === "mock" ? "保存并运行演示测试" : "保存并测试「こんにちは」";
+  const sample = sampleSourceText(
+    normalizeLanguageTag(sourceLanguage.value, DEFAULT_SETTINGS.sourceLanguage)
+  );
+  testButton.textContent = selected === "mock" ? "保存并运行演示测试" : `保存并测试「${sample}」`;
+  renderMeetingDestination();
+}
+
+/**
+ * The two language selects are independent, so the user can pick a pair that
+ * asks a provider to translate a line into the language it is already in.
+ * Correct it in place, visibly, rather than letting the save silently rewrite it.
+ */
+function renderLanguagePair(): void {
+  const pair = normalizeLanguagePair(
+    normalizeLanguageTag(sourceLanguage.value, DEFAULT_SETTINGS.sourceLanguage),
+    normalizeLanguageTag(targetLanguage.value, DEFAULT_SETTINGS.targetLanguage)
+  );
+  sourceLanguage.value = pair.source;
+  targetLanguage.value = pair.target;
+  renderMeetingDestination();
+}
+
+/** D7: name the service that will receive what people say in the meeting. */
+function renderMeetingDestination(): void {
+  meetingDestination.textContent = meetingTextDestination({
+    meetingFinalChannel: meetingFinalChannel.value as TranslationSettings["meetingFinalChannel"],
+    draftCaptions: draftCaptions.checked,
+    draftProvider: draftProvider.value as TranslationSettings["draftProvider"],
+    draftEndpointUrl: draftEndpoint.value || DEFAULT_SETTINGS.draftEndpointUrl,
+    localMtUrl: localMtUrl.value || DEFAULT_SETTINGS.localMtUrl,
+    provider: provider.value as TranslationSettings["provider"],
+    apiBaseUrl: apiBaseUrl.value || DEFAULT_SETTINGS.apiBaseUrl,
+    webSocketUrl: websocketUrl.value || DEFAULT_SETTINGS.webSocketUrl,
+    model: model.value
+  });
 }
 
 function renderRangeOutputs(): void {
@@ -150,6 +231,13 @@ function buildSettings(): TranslationSettings {
   if (selectedProvider === "openai-compatible" && !model.value.trim()) {
     throw new Error("请填写翻译模型名称。");
   }
+  if (meetingMode.checked && meetingFinalChannel.value === "local-mt" && !localMtEnabled.checked) {
+    throw new Error("会议译文通道选择了本机 LibreTranslate，请同时勾选下方「启用本机 LibreTranslate」。");
+  }
+  const languages = normalizeLanguagePair(
+    normalizeLanguageTag(sourceLanguage.value, DEFAULT_SETTINGS.sourceLanguage),
+    normalizeLanguageTag(targetLanguage.value, DEFAULT_SETTINGS.targetLanguage)
+  );
   return {
     enabled: true,
     provider: selectedProvider,
@@ -157,8 +245,8 @@ function buildSettings(): TranslationSettings {
     apiKey: apiKey.value.trim(),
     model: model.value.trim(),
     webSocketUrl: wsEndpoint,
-    sourceLanguage: "ja",
-    targetLanguage: "zh-CN",
+    sourceLanguage: languages.source,
+    targetLanguage: languages.target,
     showOriginal: showOriginal.checked,
     fontSizePx: Number(fontSize.value),
     position: position.value as TranslationSettings["position"],
@@ -173,7 +261,13 @@ function buildSettings(): TranslationSettings {
     localMtEnabled: localMtEnabled.checked,
     localMtUrl: localMtUrl.value.trim()
       ? validateUrl(localMtUrl.value, ["https:", "http:"], "本机翻译地址")
-      : DEFAULT_SETTINGS.localMtUrl
+      : DEFAULT_SETTINGS.localMtUrl,
+    meetingMode: meetingMode.checked,
+    meetingFinalChannel: meetingFinalChannel.value as TranslationSettings["meetingFinalChannel"],
+    meetingMascot: meetingMascot.checked,
+    meetingOverlayHidden: meetingOverlayHidden.checked,
+    meetingTranscript: meetingTranscript.checked,
+    meetingTranscriptRetentionDays: Number(meetingRetention.value)
   };
 }
 
@@ -213,7 +307,10 @@ async function requestEndpointPermission(settings: TranslationSettings): Promise
  * broken rather than unauthorized.
  */
 async function requestDraftPermission(settings: TranslationSettings): Promise<void> {
-  if (!settings.draftCaptions || settings.draftProvider === "browser") {
+  // Meeting mode can use this endpoint as its only translator, so the grant is
+  // needed even when draft captions themselves are switched off.
+  const usedByMeeting = settings.meetingMode && settings.meetingFinalChannel === "fast-mt";
+  if ((!settings.draftCaptions && !usedByMeeting) || settings.draftProvider === "browser") {
     return;
   }
   const url = new URL(settings.draftEndpointUrl);
@@ -239,6 +336,96 @@ async function requestLocalMtPermission(settings: TranslationSettings): Promise<
   const granted = await chrome.permissions.request({ origins: [origin] });
   if (!granted) {
     throw new Error(`未获得连接本机翻译服务 ${url.host} 的授权。`);
+  }
+}
+
+/**
+ * Meeting hosts are an optional permission, granted from here so the user sees
+ * the exact domain Chrome is being asked about. The content script is
+ * registered only after the grant.
+ */
+async function grantMeetingHosts(): Promise<void> {
+  enableMeetingHosts.disabled = true;
+  meetingPermissionResult.dataset.state = "pending";
+  meetingPermissionResult.textContent = "正在请求 meet.google.com 访问授权…";
+  try {
+    // Requested here, not in the worker: `permissions.request` needs the user
+    // gesture that belongs to this click.
+    const origins = [...MEETING_HOST_PERMISSIONS];
+    if (!(await chrome.permissions.contains({ origins }))) {
+      const granted = await chrome.permissions.request({ origins });
+      if (!granted) {
+        meetingPermissionResult.dataset.state = "error";
+        meetingPermissionResult.textContent = "未获得访问 meet.google.com 的授权。";
+        return;
+      }
+    }
+    const response = (await chrome.runtime.sendMessage({
+      type: "PAGE_COMMAND",
+      command: "enable-meeting-hosts"
+    } satisfies ExtensionMessage)) as { ok: boolean; message?: string; error?: string };
+    meetingPermissionResult.dataset.state = response.ok ? "success" : "error";
+    meetingPermissionResult.textContent = response.ok
+      ? response.message ?? "已启用。"
+      : response.error ?? "授权失败。";
+  } catch (error) {
+    meetingPermissionResult.dataset.state = "error";
+    meetingPermissionResult.textContent =
+      error instanceof Error ? error.message : "授权失败。";
+  } finally {
+    enableMeetingHosts.disabled = false;
+  }
+}
+
+/** The one round-trip that asks the worker what is stored right now. */
+async function fetchTranscriptSummary(): Promise<MeetingTranscriptSummary | null> {
+  const response = (await chrome.runtime.sendMessage({
+    type: "GET_MEETING_TRANSCRIPTS"
+  } satisfies ExtensionMessage)) as MeetingTranscriptResponse;
+  return response.summary ?? null;
+}
+
+async function loadTranscriptSummary(): Promise<void> {
+  try {
+    const summary = await fetchTranscriptSummary();
+    if (!summary) {
+      transcriptSummary.dataset.state = "success";
+      transcriptSummary.textContent = "本机当前没有保存任何会议记录。";
+      return;
+    }
+    const described = describeTranscriptSummary(summary);
+    transcriptSummary.dataset.state = described.state;
+    transcriptSummary.textContent = described.text;
+  } catch {
+    transcriptSummary.dataset.state = "error";
+    transcriptSummary.textContent = "无法读取会议记录状态。";
+  }
+}
+
+async function wipeTranscripts(): Promise<void> {
+  clearTranscripts.disabled = true;
+  try {
+    // The worker answers a refused wipe rather than throwing, and saying the
+    // records are gone while they are still on disk is the one mistake a
+    // delete button must never make.
+    const response = (await chrome.runtime.sendMessage({
+      type: "CLEAR_MEETING_TRANSCRIPTS"
+    } satisfies ExtensionMessage)) as { ok?: boolean; error?: string } | undefined;
+    if (response?.ok !== true) {
+      const summary = await fetchTranscriptSummary().catch(() => null);
+      transcriptSummary.dataset.state = "error";
+      transcriptSummary.textContent =
+        `清除失败（${response?.error ?? "请重试"}）：会议记录仍在本机。` +
+        (summary ? describeTranscriptSummary(summary).text : "");
+      return;
+    }
+    transcriptSummary.dataset.state = "success";
+    transcriptSummary.textContent = "已清除本机保存的全部会议记录。";
+  } catch {
+    transcriptSummary.dataset.state = "error";
+    transcriptSummary.textContent = "清除失败，请重试。";
+  } finally {
+    clearTranscripts.disabled = false;
   }
 }
 

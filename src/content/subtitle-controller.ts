@@ -1,5 +1,7 @@
 import type { ExtensionMessage } from "../shared/messages";
 import { safeRuntimeSendMessage } from "../shared/extension-context";
+import { languageLabel } from "../shared/language";
+import { isMeetingModeActive, meetingLineBudgetMs } from "../shared/meeting";
 import { isCueWithinPlaybackWindow } from "../shared/subtitle";
 import {
   shouldReplaceCaption,
@@ -10,90 +12,174 @@ import {
   type SubtitleSource,
   type TranslationResponse
 } from "../shared/types";
+import { MediaClock, WallClock, type ClockSource } from "./clock";
 import { TextTrackAdapter } from "./adapters/text-track-adapter";
 import type { SubtitleAdapter, SubtitleAdapterEvent } from "./adapters/types";
 import { YouTubeCaptionAdapter } from "./adapters/youtube-caption-adapter";
 import { NetflixCaptionAdapter } from "./adapters/netflix-caption-adapter";
-import { createDraftChannel, type DraftChannel } from "./fast-translator";
+import { MeetCaptionAdapter } from "./adapters/meet-caption-adapter";
+import { createDraftChannel, createFastChannel, LocalMtTranslator, type DraftChannel } from "./fast-translator";
 import { SubtitleOverlay } from "./overlay";
 
 /**
+ * What the captions are attached to.
+ *
+ * A film page has one video that owns both the timeline and the overlay's
+ * position. A meeting page has neither: Meet renders many small tiles, none of
+ * which tracks the conversation, so the controller runs on the wall clock and
+ * the overlay spans the viewport.
+ */
+export type CaptionTarget =
+  | { kind: "video"; video: HTMLVideoElement }
+  | { kind: "page" };
+
+/**
  * A translation always lands after the caption it belongs to, so ending both at
- * the same moment leaves the viewer less time to read the Chinese than the
+ * the same moment leaves the viewer less time to read the translation than the
  * source line was on screen for. Hold the translation briefly past the end of
  * its cue; a newer caption still replaces it immediately.
  *
- * Measured in media time so the hold follows the video: it does not expire
- * while paused, and it shortens correctly at higher playback speeds.
+ * Measured on the controller's clock, so on a video it follows playback: it
+ * does not expire while paused and shortens correctly at higher speeds.
  */
-const MIN_TRANSLATION_VISIBLE_MEDIA_MS = 900;
-/** Cap local text→translation memory so a long watch session cannot grow forever. */
+const MIN_TRANSLATION_VISIBLE_MS = 900;
+/** Cap local text→translation memory so a long session cannot grow forever. */
 const MAX_LOCAL_TEXT_CACHE = 200;
+/** The same for the meeting lines already shown; only the recent ones matter. */
+const MAX_PAINTED_CUE_IDS = 200;
 /** Skip near-duplicate streaming paints that would make the caption shimmer. */
 const STREAM_THROTTLE_MS = 40;
 const STREAM_MIN_CHAR_DELTA = 2;
 /**
  * Netflix often grows one on-screen line across several DOM writes. Wait for a
- * quiet window so we translate the settled Japanese once instead of aborting
- * and rewriting Chinese on every partial.
+ * quiet window so we translate the settled source once instead of aborting and
+ * rewriting the translation on every partial.
  */
 const NETFLIX_REVISE_DEBOUNCE_MS = 100;
+/**
+ * Speech recognition rewrites a meeting line far more often than a player
+ * repaints a subtitle — every few hundred milliseconds, including corrections
+ * to words already shown. A longer quiet window is what keeps one spoken
+ * sentence to roughly one translation request.
+ */
+const MEETING_REVISE_DEBOUNCE_MS = 400;
 /** First streamed paint needs at least this many characters to avoid flashing a lone glyph. */
-const NETFLIX_EARLY_STREAM_MIN_CHARS = 2;
+const EARLY_STREAM_MIN_CHARS = 2;
+
+/** How long to wait for a source to settle before translating it. */
+export function reviseDebounceMs(source: SubtitleSource): number {
+  return source === "meet-dom" ? MEETING_REVISE_DEBOUNCE_MS : NETFLIX_REVISE_DEBOUNCE_MS;
+}
+
+/** What one meeting sentence is allowed to spend, and what came of it. */
+interface MeetingLineBudget {
+  controller: AbortController;
+  deadlineAt: number;
+  answered: boolean;
+}
+
+/**
+ * Sources whose captions replace each other in place. The overlay never blanks
+ * between two of their cues: the previous translation stays until the next one
+ * is ready, because both a Netflix repaint and a recognizer revision would
+ * otherwise flicker the caption several times a second.
+ */
+export function isStickySource(source: SubtitleSource): boolean {
+  return source === "netflix-dom" || source === "meet-dom";
+}
 
 export class SubtitleController {
   readonly sessionId = `tranlithion:${location.pathname}:${crypto.randomUUID()}`;
 
   private settings: PublicTranslationSettings;
+  private readonly clock: ClockSource;
   private readonly overlay: SubtitleOverlay;
   private readonly adapters: SubtitleAdapter[];
+  private readonly textTrackAdapter: TextTrackAdapter | null;
   private readonly youtubeAdapter: YouTubeCaptionAdapter | null;
   private readonly netflixAdapter: NetflixCaptionAdapter | null;
+  private readonly meetAdapter: MeetCaptionAdapter | null;
   private readonly availability = new Map<SubtitleSource, boolean>();
   private activeSource: SubtitleSource | null = null;
   private activeCue: SubtitleCue | null = null;
   private activeCueStage: CaptionStage = "none";
   private draftTranslator: DraftChannel | null = null;
+  /** Meeting mode's single low-cost channel; null when the model is the final. */
+  private meetingChannel: DraftChannel | null = null;
   private draftAbort: AbortController | null = null;
-  private captionShownAtMediaMs = 0;
+  private captionShownAtMs = 0;
   private teardownTimer: number | null = null;
   private destroyed = false;
-  /** Instant Netflix hits without waiting for the background round-trip. */
+  /** Instant repeats without waiting for the background round-trip. */
   private readonly localTextCache = new Map<string, string>();
   private lastStreamPaintAt = 0;
   private lastStreamText = "";
   private reviseTimer: number | null = null;
   private pendingReviseCue: SubtitleCue | null = null;
+  /** Meeting translations, one at a time. See `runFinalTranslation`. */
+  private meetingQueue: Promise<void> = Promise.resolve();
+  /** Aborted on destroy only: a finished sentence outlives its on-screen slot. */
+  private readonly settleAbort = new AbortController();
+  /** The meeting's only channel answered with nothing. */
+  private meetingChannelBroken = false;
+  /** Settled cues already handed to the transcript, so each is recorded once. */
+  private readonly recordedCueIds = new Set<string>();
+  /** The pair the answer currently streaming in was asked for. */
+  private streamingPair: string | null = null;
+  /** The last line that reached the overlay, newer than which nothing older paints. */
+  private lastPaintedCue: SubtitleCue | null = null;
+  /**
+   * Meeting lines the user has already read, so a late answer cannot replay
+   * one. A streamed partial is not one of them: it is the blank being filled
+   * while the sentence is still being written, and the answer it is standing
+   * in for has not been seen yet.
+   */
+  private readonly paintedCueIds = new Set<string>();
+  /** One budget per sentence, keyed by its cue. See `runFinalTranslation`. */
+  private readonly meetingLineBudgets = new Map<string, MeetingLineBudget>();
 
   constructor(
-    readonly video: HTMLVideoElement,
+    readonly target: CaptionTarget,
     settings: PublicTranslationSettings,
     private readonly requestTranslation: (cue: SubtitleCue) => Promise<TranslationResponse>,
     private readonly reportStatus: (status: RuntimeStatus) => void
   ) {
     this.settings = settings;
-    this.overlay = new SubtitleOverlay(video, settings);
-    this.youtubeAdapter = isYouTubePage() ? new YouTubeCaptionAdapter(video) : null;
-    this.netflixAdapter = isNetflixPage() ? new NetflixCaptionAdapter(video) : null;
-    // Netflix must not share the page with TextTrack: a hidden track can steal
-    // activeSource and hide the sticky overlay mid-cue.
+    this.clock = target.kind === "video" ? new MediaClock(target.video) : new WallClock();
+    this.overlay = new SubtitleOverlay(
+      target.kind === "video" ? target.video : null,
+      settings
+    );
+
+    const video = target.kind === "video" ? target.video : null;
+    this.meetAdapter = this.meetingMode() ? new MeetCaptionAdapter(this.clock) : null;
+    this.youtubeAdapter = video && isYouTubePage() ? new YouTubeCaptionAdapter(video) : null;
+    this.netflixAdapter = video && isNetflixPage() ? new NetflixCaptionAdapter(video) : null;
+    // Netflix and Meet must not share the page with TextTrack: a hidden track
+    // can steal activeSource and hide the sticky overlay mid-cue.
+    const allowTextTrack = Boolean(video) && !this.netflixAdapter && !this.meetAdapter;
+    this.textTrackAdapter =
+      allowTextTrack && video ? new TextTrackAdapter(video, settings.sourceLanguage) : null;
     this.adapters = [
-      ...(this.netflixAdapter ? [] : [new TextTrackAdapter(video, settings.sourceLanguage)]),
+      ...(this.textTrackAdapter ? [this.textTrackAdapter] : []),
       ...(this.youtubeAdapter ? [this.youtubeAdapter] : []),
-      ...(this.netflixAdapter ? [this.netflixAdapter] : [])
+      ...(this.netflixAdapter ? [this.netflixAdapter] : []),
+      ...(this.meetAdapter ? [this.meetAdapter] : [])
     ];
   }
 
   start(): void {
     this.youtubeAdapter?.setNativeCaptionVisibility(!this.settings.enabled);
-    this.syncNetflixNativeVisibility();
-    this.syncDraftTranslator();
-    this.report("searching", "正在寻找可读取的日文文本字幕");
+    this.syncNativeCaptionVisibility();
+    this.syncTranslationChannels();
+    this.report("searching", this.searchingMessage());
     for (const adapter of this.adapters) {
       adapter.start((event) => this.handleAdapterEvent(event));
     }
     if (!this.settings.enabled) {
       this.report("idle", "翻译已暂停");
+    } else if (this.overlayHidden()) {
+      this.report("idle", "会议模式：译文已隐藏（共享屏幕用）");
     }
   }
 
@@ -101,21 +187,39 @@ export class SubtitleController {
     const previous = this.settings;
     this.settings = settings;
     this.youtubeAdapter?.setNativeCaptionVisibility(!settings.enabled);
-    this.syncNetflixNativeVisibility();
+    this.syncNativeCaptionVisibility();
     this.overlay.updateSettings(settings);
     if (
       settings.draftCaptions !== previous.draftCaptions ||
       settings.draftProvider !== previous.draftProvider ||
       settings.draftApiKeyConfigured !== previous.draftApiKeyConfigured ||
-      settings.sourceLanguage !== previous.sourceLanguage
+      settings.sourceLanguage !== previous.sourceLanguage ||
+      settings.targetLanguage !== previous.targetLanguage ||
+      settings.meetingFinalChannel !== previous.meetingFinalChannel
     ) {
-      this.syncDraftTranslator();
+      this.syncTranslationChannels();
+    }
+    if (
+      settings.sourceLanguage !== previous.sourceLanguage ||
+      settings.targetLanguage !== previous.targetLanguage
+    ) {
+      // Cached text is keyed by source text alone, so it is wrong for the new pair.
+      this.localTextCache.clear();
+    }
+    if (settings.sourceLanguage !== previous.sourceLanguage) {
+      // The track was picked for the language the user just left; reading on
+      // from it would hand one language's subtitles to a translator asked
+      // for another's.
+      this.textTrackAdapter?.setSourceLanguage(settings.sourceLanguage);
     }
     if (!settings.enabled) {
       this.overlay.hide();
       this.report("idle", "翻译已暂停");
+    } else if (this.overlayHidden()) {
+      this.overlay.hide();
+      this.report("idle", "会议模式：译文已隐藏（共享屏幕用）");
     } else if (!this.activeCue) {
-      this.report("searching", "正在等待日文文本字幕");
+      this.report("searching", this.searchingMessage());
     }
   }
 
@@ -124,12 +228,16 @@ export class SubtitleController {
       return;
     }
     this.destroyed = true;
+    this.meetingLineBudgets.clear();
     this.cancelTeardown();
     this.cancelReviseDebounce();
     this.draftAbort?.abort();
     this.draftAbort = null;
+    this.settleAbort.abort();
     this.draftTranslator?.destroy();
     this.draftTranslator = null;
+    this.meetingChannel?.destroy();
+    this.meetingChannel = null;
     for (const adapter of this.adapters) {
       adapter.stop();
     }
@@ -144,23 +252,35 @@ export class SubtitleController {
     if (
       sessionId !== this.sessionId ||
       !this.settings.enabled ||
+      this.overlayHidden() ||
       this.activeCue?.id !== cueId ||
-      this.activeCue.source !== "netflix-dom" ||
+      !isStickySource(this.activeCue.source) ||
+      // Tokens of an answer the user switched languages away from mid-stream.
+      this.streamingPair !== this.languagePair() ||
       !text.trim()
     ) {
       return;
     }
-    // Early stream only while nothing is on screen yet. If DeepL draft already
+    // Early stream only while nothing is on screen yet. If a draft already
     // painted, ignore tokens so the caption is not rewritten mid-line; final
     // may still replace draft once when the main model finishes.
     if (this.activeCueStage !== "none") {
       return;
     }
     const trimmed = text.trim();
-    if (trimmed.length < NETFLIX_EARLY_STREAM_MIN_CHARS) {
+    if (trimmed.length < EARLY_STREAM_MIN_CHARS) {
       return;
     }
     this.applyCaption(this.activeCue, "streaming", trimmed);
+  }
+
+  private meetingMode(): boolean {
+    return isMeetingModeActive(this.settings, location.hostname);
+  }
+
+  /** Screen-share escape hatch: nothing is drawn and nothing is translated. */
+  private overlayHidden(): boolean {
+    return this.meetingMode() && this.settings.meetingOverlayHidden;
   }
 
   private handleAdapterEvent(event: SubtitleAdapterEvent): void {
@@ -187,18 +307,18 @@ export class SubtitleController {
     if (!event.available && this.activeSource === event.source && !this.activeCue) {
       this.activeSource = null;
     }
-    if (!this.settings.enabled || this.activeCue) {
+    if (!this.settings.enabled || this.overlayHidden() || this.activeCue) {
       return;
     }
     if ([...this.availability.values()].some(Boolean)) {
       this.report("ready", "字幕源已就绪，正在等待下一句");
     } else {
-      this.report("unavailable", "未检测到可读取的字幕；请先在播放器中开启日文字幕");
+      this.report("unavailable", this.unavailableMessage());
     }
   }
 
   private handleCueStart(cue: SubtitleCue): void {
-    if (!this.settings.enabled) {
+    if (!this.settings.enabled || this.overlayHidden()) {
       return;
     }
     if (!this.acceptSource(cue.source)) {
@@ -218,33 +338,38 @@ export class SubtitleController {
     this.draftAbort?.abort();
     this.draftAbort = new AbortController();
 
-    if (cue.source === "netflix-dom") {
-      // Sticky overlay: never flash Japanese back, never blank the Chinese line.
-      // A local text hit paints immediately; otherwise the previous Chinese stays.
-      this.syncNetflixNativeVisibility();
+    if (isStickySource(cue.source)) {
+      // Sticky overlay: never flash the source language back, never blank the
+      // translation. A local text hit paints immediately; otherwise the
+      // previous translation stays until this one is ready.
+      this.syncNativeCaptionVisibility();
       const cached = this.localTextCache.get(cue.text);
       if (cached) {
         this.applyCaption(cue, "final", cached);
-        this.report("ready", "正在同步显示中文译文", cue.source, 0);
-        // Still refresh the background session / text cache for context memory.
-        void this.translateActiveCue(cue);
+        this.report("ready", "正在同步显示译文", cue.source, 0);
+        this.refreshSessionContext(cue);
+        return;
+      }
+      if (this.reportMissingMeetingChannel(cue.source)) {
         return;
       }
       this.report("translating", "正在翻译当前字幕", cue.source);
-      if (this.usesDeepLOnly()) {
-        // Skip DeepSeek entirely: DeepL is the sole on-screen translator for Netflix.
-        void this.translateWithDeepLOnly(cue, this.draftAbort.signal);
+      if (cue.source === "meet-dom") {
+        // A recognizer opens a turn with a word or two that the next read
+        // rewrites. Translating that costs a request per sentence for text
+        // nobody finishes reading, so the first fragment waits with the rest:
+        // it is translated once it stops growing, or when it settles.
+        this.scheduleSettledTranslation(cue);
         return;
       }
-      // DeepL draft + DeepSeek final when DeepL-only is not configured.
-      void this.showDraftTranslation(cue, this.draftAbort.signal);
-      void this.translateActiveCue(cue);
+      this.startFinalTranslation(cue, this.draftAbort.signal);
       return;
     }
 
     this.overlay.show({
       translation: "正在翻译…",
       original: cue.text,
+      speaker: cue.speaker,
       pending: true
     });
     this.report("translating", "正在翻译当前字幕", cue.source);
@@ -255,11 +380,18 @@ export class SubtitleController {
   }
 
   /**
-   * Same on-screen Netflix slot, new Japanese text. Keep the current Chinese
-   * frozen and only retranslate after the DOM stops churning.
+   * Same on-screen slot, new source text. Keep the current translation frozen
+   * and only retranslate after the DOM stops churning.
    */
   private handleCueRevise(cue: SubtitleCue, previousCueId: string): void {
-    if (!this.settings.enabled) {
+    // The wording this replaces is gone, and so is whatever budget it was
+    // running on. A recognizer that rewrites a line and then corrects itself
+    // back rebuilds the same cue id, and that line is being asked for now,
+    // not whenever the abandoned wording first went out. True however the
+    // overlay stands: the hide switch decides what is translated and shown,
+    // not whether the controller's own bookkeeping stays straight.
+    this.meetingLineBudgets.delete(previousCueId);
+    if (!this.settings.enabled || this.overlayHidden()) {
       return;
     }
     if (!this.acceptSource(cue.source)) {
@@ -273,21 +405,26 @@ export class SubtitleController {
 
     this.cancelTeardown();
     // Point activeCue at the new id immediately so stale streams/results for the
-    // previous id cannot paint. Do not reset stage or hide—freeze the Chinese
+    // previous id cannot paint. Do not reset stage or hide—freeze the text
     // already on screen until the debounced translate lands.
     this.activeCue = cue;
-    this.syncNetflixNativeVisibility();
+    this.syncNativeCaptionVisibility();
 
     const cached = this.localTextCache.get(cue.text);
     if (cached) {
       this.cancelReviseDebounce();
       this.activeCueStage = "none";
       this.applyCaption(cue, "final", cached);
-      this.report("ready", "正在同步显示中文译文", cue.source, 0);
-      void this.translateActiveCue(cue);
+      this.report("ready", "正在同步显示译文", cue.source, 0);
+      this.refreshSessionContext(cue);
       return;
     }
 
+    this.scheduleSettledTranslation(cue);
+  }
+
+  /** Translates this line once the source has stopped rewriting it. */
+  private scheduleSettledTranslation(cue: SubtitleCue): void {
     this.pendingReviseCue = cue;
     if (this.reviseTimer !== null) {
       window.clearTimeout(this.reviseTimer);
@@ -295,13 +432,19 @@ export class SubtitleController {
     this.reviseTimer = window.setTimeout(() => {
       this.reviseTimer = null;
       this.flushPendingRevise();
-    }, NETFLIX_REVISE_DEBOUNCE_MS);
+    }, reviseDebounceMs(cue.source));
   }
 
   private flushPendingRevise(): void {
     const cue = this.pendingReviseCue;
     this.pendingReviseCue = null;
-    if (this.destroyed || !cue || this.activeCue?.id !== cue.id || !this.settings.enabled) {
+    if (
+      this.destroyed ||
+      !cue ||
+      this.activeCue?.id !== cue.id ||
+      !this.settings.enabled ||
+      this.overlayHidden()
+    ) {
       return;
     }
 
@@ -309,8 +452,8 @@ export class SubtitleController {
     if (cached) {
       this.activeCueStage = "none";
       this.applyCaption(cue, "final", cached);
-      this.report("ready", "正在同步显示中文译文", cue.source, 0);
-      void this.translateActiveCue(cue);
+      this.report("ready", "正在同步显示译文", cue.source, 0);
+      this.refreshSessionContext(cue);
       return;
     }
 
@@ -320,13 +463,169 @@ export class SubtitleController {
     this.lastStreamText = "";
     this.draftAbort?.abort();
     this.draftAbort = new AbortController();
-    this.report("translating", "正在翻译当前字幕", cue.source);
-    if (this.usesDeepLOnly()) {
-      void this.translateWithDeepLOnly(cue, this.draftAbort.signal);
+    if (this.reportMissingMeetingChannel(cue.source)) {
       return;
     }
-    void this.showDraftTranslation(cue, this.draftAbort.signal);
-    void this.translateActiveCue(cue);
+    this.report("translating", "正在翻译当前字幕", cue.source);
+    this.startFinalTranslation(cue, this.draftAbort.signal);
+  }
+
+  /**
+   * Starts whatever produces the caption the user reads: one machine
+   * translation hop when a single channel is configured, otherwise a local
+   * draft plus the model's answer.
+   */
+  private startFinalTranslation(cue: SubtitleCue, signal: AbortSignal): void {
+    const single = this.singleChannel();
+    if (single) {
+      // One network hop only: the fast channel is the caption the user reads.
+      this.runFinalTranslation(
+        (lineSignal) =>
+          this.translateWithSingleChannel(cue, single, untilEither(signal, lineSignal)),
+        cue
+      );
+      return;
+    }
+    // Fast draft + model final when no single channel is configured.
+    void this.showDraftTranslation(cue, signal);
+    this.runFinalTranslation((lineSignal) => this.translateActiveCue(cue, lineSignal), cue);
+  }
+
+  /**
+   * Meeting captions translate one at a time.
+   *
+   * Both the background's draft channel and its job queue keep only the newest
+   * request per session, so two overlapping meeting requests cancel the older
+   * one — and in a meeting the older one is usually a sentence that has just
+   * finished and still has to reach the screen and the transcript. Speech
+   * arrives a sentence at a time, so queuing costs far less than losing a line.
+   *
+   * A queued job asks again whether it may run. Pausing or hiding the overlay
+   * for a screen share stops meeting text from leaving the page, and a line
+   * that was waiting its turn when the user hit the switch has not been sent
+   * yet, so it is dropped rather than translated a second later.
+   *
+   * The budget belongs to the sentence, not to the job. A sentence reaches
+   * the queue twice — once when it stops growing and again when its cue ends
+   * and it has to be recorded — and it gets one deadline, set when it first
+   * joined the queue, so waiting its turn ages it exactly as much as a slow
+   * channel does. One line may cost itself, never the whole conversation, and
+   * a line already given up on is not asked for a second time.
+   *
+   * What the budget bounds is waiting on a channel, not how long a cue stays
+   * open: a speaker can hold a finished sentence on screen for a minute, and
+   * the translation that came back in time still owes the transcript its row.
+   *
+   * A job that owns no caption — a context refresh behind a line already on
+   * screen — is abandoned in silence: nothing was skipped that the user can
+   * see, so saying otherwise would be a lie told over a good translation.
+   */
+  private runFinalTranslation(
+    job: (signal?: AbortSignal) => Promise<void>,
+    line?: SubtitleCue
+  ): void {
+    if (!this.meetingMode()) {
+      void job();
+      return;
+    }
+    const budgetMs = meetingLineBudgetMs(this.settings.meetingFinalChannel);
+    const budget = this.meetingLineBudget(line, budgetMs);
+    const run = async () => {
+      if (this.destroyed || !this.settings.enabled || this.overlayHidden()) {
+        return;
+      }
+      if (budget.controller.signal.aborted) {
+        return;
+      }
+      if (line && this.localTextCache.has(line.text)) {
+        await job().catch(() => undefined);
+        return;
+      }
+      if (budget.answered) {
+        return;
+      }
+      const remainingMs = budget.deadlineAt - this.clock.nowMs();
+      if (remainingMs <= 0) {
+        this.expireMeetingLine(budget.controller, budgetMs, line);
+        return;
+      }
+      const budgetTimer = window.setTimeout(
+        () => this.expireMeetingLine(budget.controller, budgetMs, line),
+        remainingMs
+      );
+      try {
+        await Promise.race([
+          job(budget.controller.signal).catch(() => undefined),
+          whenAborted(budget.controller.signal)
+        ]);
+      } finally {
+        window.clearTimeout(budgetTimer);
+      }
+      budget.answered = !budget.controller.signal.aborted;
+    };
+    this.meetingQueue = this.meetingQueue.then(run, run).catch(() => undefined);
+  }
+
+  /**
+   * The one deadline this sentence gets, however often it reaches the queue,
+   * and what became of it.
+   *
+   * `answered` is what the channel said — a translation or a refusal the user
+   * was already told about. Either way the line's outcome is settled, so a
+   * later job for it neither asks again nor lets the deadline it no longer
+   * needs contradict the answer the user has.
+   */
+  private meetingLineBudget(line: SubtitleCue | undefined, budgetMs: number): MeetingLineBudget {
+    const known = line ? this.meetingLineBudgets.get(line.id) : undefined;
+    if (known) {
+      return known;
+    }
+    const budget: MeetingLineBudget = {
+      controller: new AbortController(),
+      deadlineAt: this.clock.nowMs() + budgetMs,
+      answered: false
+    };
+    if (line) {
+      this.meetingLineBudgets.set(line.id, budget);
+    }
+    return budget;
+  }
+
+  /**
+   * Gives up on a line that ran out of budget, and says so once.
+   *
+   * Only once, and only when the user has nothing to read for it: a line the
+   * channel answered in time still owes the transcript its row, and a line
+   * already showing a draft is on screen and readable — putting Meet's own
+   * strip back over it and calling it skipped would contradict what the user
+   * is looking at.
+   */
+  private expireMeetingLine(
+    controller: AbortController,
+    budgetMs: number,
+    line?: SubtitleCue
+  ): void {
+    if (controller.signal.aborted || this.destroyed) {
+      return;
+    }
+    if (line && this.localTextCache.has(line.text)) {
+      return;
+    }
+    controller.abort();
+    if (!line || !this.settings.enabled || this.overlayHidden()) {
+      return;
+    }
+    if (this.activeCue?.id === line.id && this.activeCueStage !== "none") {
+      return;
+    }
+    this.setMeetingChannelBroken(true);
+    this.report("error", this.meetingBudgetMessage(budgetMs), "meet-dom");
+  }
+
+  private meetingBudgetMessage(budgetMs: number): string {
+    const label =
+      this.settings.meetingFinalChannel === "llm" ? "大模型" : this.singleChannelLabel();
+    return `${label}：这一句 ${Math.round(budgetMs / 1000)} 秒内没有答复，已跳过，以免后面的句子跟着堵住。`;
   }
 
   private cancelReviseDebounce(): void {
@@ -343,28 +642,22 @@ export class SubtitleController {
     }
     // A real end beats a pending revise for the same slot.
     this.cancelReviseDebounce();
+    this.settleMeetingLine(this.activeCue);
     // Nothing is on screen yet when no channel has answered, so there is no
     // reading time to protect and the cue can end immediately.
-    const shownForMediaMs = this.video.currentTime * 1_000 - this.captionShownAtMediaMs;
+    const shownForMs = this.clock.nowMs() - this.captionShownAtMs;
     let readingTimeLeft =
-      this.activeCueStage === "none"
-        ? 0
-        : MIN_TRANSLATION_VISIBLE_MEDIA_MS - shownForMediaMs;
-    // Netflix sticky Chinese often outlives stage=none (waiting on a late
-    // translation). Clearing on delay 0 blanks the overlay and looks like the
-    // line "ended instantly."
-    if (
-      source === "netflix-dom" &&
-      this.overlay.isShowing() &&
-      readingTimeLeft <= 0
-    ) {
-      readingTimeLeft = MIN_TRANSLATION_VISIBLE_MEDIA_MS;
+      this.activeCueStage === "none" ? 0 : MIN_TRANSLATION_VISIBLE_MS - shownForMs;
+    // A sticky translation often outlives stage=none (waiting on a late
+    // answer). Clearing on delay 0 blanks the overlay and looks like the line
+    // "ended instantly."
+    if (isStickySource(source) && this.overlay.isShowing() && readingTimeLeft <= 0) {
+      readingTimeLeft = MIN_TRANSLATION_VISIBLE_MS;
     }
-    // Always defer teardown. Netflix emits cue-end then cue-start/revise in the
-    // same turn when the line changes; a synchronous hide() would blank the
-    // sticky Chinese overlay before the next handler can cancel this timer.
-    const rate = this.video.playbackRate > 0 ? this.video.playbackRate : 1;
-    const delayMs = readingTimeLeft > 0 ? readingTimeLeft / rate : 0;
+    // Always defer teardown. A sticky source emits cue-end then cue-start or
+    // cue-revise in the same turn when the line changes; a synchronous hide()
+    // would blank the overlay before the next handler can cancel this timer.
+    const delayMs = readingTimeLeft > 0 ? readingTimeLeft / this.clock.rate() : 0;
     this.scheduleTeardown(source, delayMs);
   }
 
@@ -391,11 +684,11 @@ export class SubtitleController {
     this.activeCue = null;
     this.activeCueStage = "none";
     this.overlay.hide();
-    if (source === "netflix-dom") {
-      // Keep native captions suppressed for the whole enabled session.
-      this.syncNetflixNativeVisibility();
+    if (isStickySource(source)) {
+      // Keep the site's own captions suppressed for the whole enabled session.
+      this.syncNativeCaptionVisibility();
     }
-    if (this.settings.enabled) {
+    if (this.settings.enabled && !this.overlayHidden()) {
       this.report("ready", "正在等待下一句字幕", source);
     }
   }
@@ -415,6 +708,42 @@ export class SubtitleController {
     return this.activeSource === source;
   }
 
+  /**
+   * The channel that alone produces the caption the user reads, or null when
+   * the chat model is the final translator.
+   *
+   * Meetings default here: an hour of talk is several times an episode's line
+   * count, and a machine-translation hop is both cheaper and fast enough to
+   * keep up with speech.
+   */
+  private singleChannel(): DraftChannel | null {
+    if (this.meetingMode()) {
+      return this.meetingChannel;
+    }
+    return this.usesDeepLOnly() ? this.draftTranslator : null;
+  }
+
+  /**
+   * Says so plainly when meeting mode is pointed at a machine-translation
+   * channel the user has not finished configuring.
+   *
+   * Quietly falling back to the chat model would translate an hour of meeting
+   * on the expensive path the user explicitly opted out of, so nothing is
+   * translated until the channel is fixed. Returns true when it reported.
+   */
+  private reportMissingMeetingChannel(source: SubtitleSource): boolean {
+    if (!this.meetingMode() || this.settings.meetingFinalChannel === "llm" || this.meetingChannel) {
+      return false;
+    }
+    this.setMeetingChannelBroken(true);
+    this.report(
+      "error",
+      "会议翻译通道尚未配置：请在设置中填写 DeepL / 自定义机器翻译的地址与 Key，或改用本机 LibreTranslate。",
+      source
+    );
+    return true;
+  }
+
   /** Netflix: DeepL alone when the draft channel is configured for DeepL. */
   private usesDeepLOnly(): boolean {
     return (
@@ -425,30 +754,57 @@ export class SubtitleController {
   }
 
   /**
-   * DeepL is the only network hop. Result is painted as final (no underline,
-   * no later DeepSeek rewrite).
+   * One network hop. The result is painted as final (no underline, no later
+   * rewrite by the chat model).
    */
-  private async translateWithDeepLOnly(cue: SubtitleCue, signal: AbortSignal): Promise<void> {
+  private async translateWithSingleChannel(
+    cue: SubtitleCue,
+    channel: DraftChannel,
+    signal: AbortSignal
+  ): Promise<void> {
     try {
       const startedAt = performance.now();
-      const translator = this.draftTranslator;
-      if (!translator || !this.settings.enabled) {
-        this.report("error", "DeepL 未就绪；请在选项中开启草稿并填写 API Key。", cue.source);
+      if (!this.settings.enabled) {
         return;
       }
-      const text = await translator.translate(cue.text, signal);
-      if (signal.aborted || this.destroyed || this.activeCue?.id !== cue.id) {
+      const pair = this.languagePair();
+      const text = await channel.translate(cue.text, signal);
+      if (this.destroyed || pair !== this.languagePair()) {
         return;
+      }
+      if (text) {
+        // Cached by source text before the freshness check: a sentence the
+        // next line has already replaced on screen still owes the transcript
+        // its translation.
+        this.rememberLocalTranslation(cue.text, text);
+      }
+      if (signal.aborted) {
+        // Superseded, or answered after this line ran out of budget: the user
+        // has already been told it was skipped, so it changes nothing now.
+        return;
+      }
+      if (text) {
+        this.setMeetingChannelBroken(false);
       }
       if (!text) {
-        this.report("error", "DeepL 翻译失败或超时。", cue.source);
+        // A channel that cannot answer is a fact about the channel, not about
+        // the cue that happened to ask: the strip comes back and the user is
+        // told even when the line is long gone from the screen.
+        this.setMeetingChannelBroken(true);
+        if (this.activeCue?.id !== cue.id && !this.meetingMode()) {
+          return;
+        }
+        this.report("error", this.singleChannelFailureMessage(), cue.source);
         return;
       }
-      this.rememberLocalTranslation(cue.text, text);
-      this.applyCaption(cue, "final", text);
+      const painted = this.applyCaption(cue, "final", text);
+      if (!painted && this.activeCue?.id !== cue.id) {
+        this.reportUnshownLine(cue);
+        return;
+      }
       this.report(
         "ready",
-        "正在同步显示中文译文（DeepL）",
+        `正在同步显示译文（${this.singleChannelLabel()}）`,
         cue.source,
         Math.round(performance.now() - startedAt)
       );
@@ -457,14 +813,61 @@ export class SubtitleController {
     }
   }
 
+  private singleChannelLabel(): string {
+    if (!this.meetingMode()) {
+      return "DeepL";
+    }
+    if (this.settings.meetingFinalChannel === "local-mt") {
+      return "本机 LibreTranslate";
+    }
+    if (this.settings.draftProvider === "browser") {
+      return "Chrome 内置翻译";
+    }
+    return this.settings.draftProvider === "deepl" ? "DeepL" : "机器翻译";
+  }
+
+  private singleChannelFailureMessage(): string {
+    if (this.meetingMode() && this.settings.meetingFinalChannel === "local-mt") {
+      return "本机 LibreTranslate 未响应；请确认它已启动，或在设置中改用其他会议翻译通道。";
+    }
+    // The on-device translator has neither an address nor a Key, so sending
+    // the user to check them would be pointing at the wrong screen.
+    if (this.meetingMode() && this.settings.draftProvider === "browser") {
+      return "Chrome 内置翻译没有给出结果：这台设备或这个语言对可能不支持它。请在设置中把会议翻译通道改为 DeepL / 自定义机器翻译或本机 LibreTranslate。";
+    }
+    return `${this.singleChannelLabel()}：翻译失败或超时；请在设置中检查该通道的地址与 Key。`;
+  }
+
+  /**
+   * Refreshes the background session's context and text cache after a caption
+   * was served from local memory.
+   *
+   * Skipped whenever a single low-cost channel is the final translator: the
+   * chat model never renders those captions, so a request here would spend a
+   * model call purely to fill a context window nothing reads.
+   *
+   * It takes its turn in the meeting queue like every other meeting request.
+   * The background keeps only the newest request per meeting session, so a
+   * refresh sent while a settled sentence is still being translated would
+   * cancel that sentence — and this line is already on screen, while that one
+   * still owes the user a caption and the transcript a line.
+   */
+  private refreshSessionContext(cue: SubtitleCue): void {
+    if (this.singleChannel()) {
+      return;
+    }
+    this.runFinalTranslation((signal) => this.translateActiveCue(cue, signal));
+  }
+
   private async showDraftTranslation(cue: SubtitleCue, signal: AbortSignal): Promise<void> {
     try {
       const translator = this.draftTranslator;
       if (!translator || !this.settings.enabled) {
         return;
       }
+      const pair = this.languagePair();
       const draft = await translator.translate(cue.text, signal);
-      if (!draft || signal.aborted) {
+      if (!draft || signal.aborted || pair !== this.languagePair()) {
         return;
       }
       this.applyCaption(cue, "draft", draft);
@@ -479,7 +882,11 @@ export class SubtitleController {
    * caption to lower-quality text.
    */
   private applyCaption(cue: SubtitleCue, stage: CaptionStage, text: string): boolean {
-    if (this.destroyed || this.activeCue?.id !== cue.id) {
+    if (this.destroyed || this.overlayHidden()) {
+      return false;
+    }
+    const superseded = this.activeCue?.id !== cue.id;
+    if (superseded && !this.paintsAheadOfActiveCue(cue, stage)) {
       return false;
     }
     // Streaming may refine the same stage in place; other stages stay monotonic.
@@ -490,20 +897,179 @@ export class SubtitleController {
     // Reading time is measured from the first text shown, not from each
     // upgrade, so a late final translation cannot extend the hold indefinitely.
     if (this.activeCueStage === "none") {
-      this.captionShownAtMediaMs = this.video.currentTime * 1_000;
+      this.captionShownAtMs = this.clock.nowMs();
     }
-    this.activeCueStage = stage;
+    if (!superseded) {
+      // The stage belongs to the cue that is open, and this text came from an
+      // older one: whatever the open cue produces still gets its turn.
+      this.activeCueStage = stage;
+    }
     if (stage === "streaming") {
       this.lastStreamPaintAt = performance.now();
       this.lastStreamText = text;
     }
+    this.lastPaintedCue = cue;
+    if (cue.source === "meet-dom" && stage !== "streaming") {
+      this.rememberPaintedCue(cue.id);
+    }
     this.overlay.show({
       translation: text,
       original: cue.text,
+      speaker: cue.speaker,
       pending: stage === "streaming",
       draft: stage === "draft"
     });
+    if (superseded && !this.activeCue) {
+      // The cue this belongs to is over and nothing has taken the slot, so
+      // the sticky overlay is holding it alone: give it the same reading
+      // time any other line gets rather than leaving it up until the next.
+      this.scheduleTeardown(cue.source, MIN_TRANSLATION_VISIBLE_MS);
+    }
     return true;
+  }
+
+  /**
+   * Whether a sentence that has already ended may still go up.
+   *
+   * A recognizer punctuates the line it just finished together with the first
+   * words of the next one, so a meeting sentence is settled — and only then
+   * translated — when the cue after it is already the active one, or when the
+   * turn is over and no cue is open at all. Either way its translation is the
+   * newest text anyone has, and the sticky overlay exists to hold exactly
+   * that. Once something newer has painted — or this sentence itself has
+   * already had its turn on screen — it never comes back over what follows.
+   */
+  private paintsAheadOfActiveCue(cue: SubtitleCue, stage: CaptionStage): boolean {
+    if (cue.source !== "meet-dom" || stage !== "final") {
+      return false;
+    }
+    if (!this.activeCue) {
+      if (this.paintedCueIds.has(cue.id)) {
+        return false;
+      }
+      return !this.lastPaintedCue || this.lastPaintedCue.startMs <= cue.startMs;
+    }
+    return this.activeCueStage === "none";
+  }
+
+  /**
+   * A line that was translated but never reached the screen, because the
+   * meeting had already moved on to a sentence the user is reading now.
+   * Silently dropping it would leave them with a transcript row for a line
+   * they never saw and no idea why.
+   *
+   * Only that one cause is worth saying, and only once it is the cause that
+   * actually applies: a line held back because the user hid the overlay, one
+   * they already read before its own translation came back around, or one
+   * dropped while the screen is blank anyway was not lost to the next
+   * sentence, and claiming so would describe a meeting that did not happen.
+   */
+  private reportUnshownLine(cue: SubtitleCue): void {
+    if (cue.source !== "meet-dom" || !this.meetingMode()) {
+      return;
+    }
+    if (this.overlayHidden() || !this.settings.enabled || this.paintedCueIds.has(cue.id)) {
+      return;
+    }
+    if (!this.activeCue || !this.overlay.isShowing()) {
+      return;
+    }
+    this.report(
+      "ready",
+      "这一句的译文回来时屏幕上已经是下一句了，没有再顶掉它。",
+      cue.source
+    );
+  }
+
+  /**
+   * A meeting sentence is settled when its cue ends, and only a settled
+   * sentence belongs in the transcript: painting happens on every debounced
+   * revision, so recording there would keep "Good", "Good morning", "Good
+   * morning everyone" as three lines of one sentence.
+   *
+   * The translation is still wanted even when the next sentence has already
+   * taken the slot, so the request in flight for this line is detached from
+   * the active cue's abort and the recording waits for it on the meeting
+   * queue.
+   */
+  private settleMeetingLine(cue: SubtitleCue | null): void {
+    if (!cue || cue.source !== "meet-dom" || !this.meetingMode()) {
+      return;
+    }
+    if (this.settings.enabled && !this.overlayHidden()) {
+      // Whatever is translating this sentence must survive the next cue-start.
+      this.draftAbort = null;
+      this.runFinalTranslation(async (signal) => {
+        if (!this.localTextCache.has(cue.text)) {
+          await this.translateSettledLine(cue, signal);
+        }
+        if (signal?.aborted) {
+          return;
+        }
+        const translation = this.localTextCache.get(cue.text);
+        if (translation) {
+          this.recordMeetingLine(cue, translation);
+        }
+      }, cue);
+    }
+    // The cue is over, so that was the last job it can ask for — and the job
+    // already holds its budget. Dropping the entry keeps a long call from
+    // collecting one per sentence, and keeps a cue id the recognizer happens
+    // to recreate from inheriting a deadline that has nothing to do with it.
+    this.meetingLineBudgets.delete(cue.id);
+  }
+
+  private async translateSettledLine(cue: SubtitleCue, signal?: AbortSignal): Promise<void> {
+    if (this.destroyed || !this.settings.enabled) {
+      return;
+    }
+    const single = this.singleChannel();
+    if (single) {
+      await this.translateWithSingleChannel(
+        cue,
+        single,
+        untilEither(this.settleAbort.signal, signal)
+      );
+      return;
+    }
+    if (this.settings.meetingFinalChannel !== "llm") {
+      // The configured channel is missing. Finishing this line on the chat
+      // model is the silent fallback meeting mode promises not to make.
+      return;
+    }
+    await this.translateActiveCue(cue, signal);
+  }
+
+  /**
+   * D7: hand the settled bilingual line to the background worker, which owns
+   * both the retention-limited transcript and the session's term memory. Only
+   * meeting captions are recorded, and only while the user has the transcript
+   * switched on — a line whose translation came back after the user paused or
+   * hid the overlay is not written, however long it waited for it.
+   *
+   * A settled cue goes out once. A sentence the speaker really repeats is a
+   * second cue and is recorded again; the same cue reaching here twice is the
+   * same thing said once.
+   */
+  private recordMeetingLine(cue: SubtitleCue, translation: string): void {
+    if (this.destroyed || cue.source !== "meet-dom" || !this.meetingMode()) {
+      return;
+    }
+    if (!this.settings.enabled || this.overlayHidden()) {
+      return;
+    }
+    if (this.recordedCueIds.has(cue.id)) {
+      return;
+    }
+    this.recordedCueIds.add(cue.id);
+    void safeRuntimeSendMessage({
+      type: "RECORD_MEETING_LINE",
+      sessionId: this.sessionId,
+      host: location.hostname,
+      title: document.title,
+      cue,
+      translation
+    } satisfies ExtensionMessage);
   }
 
   private shouldPaintStreaming(text: string): boolean {
@@ -520,10 +1086,39 @@ export class SubtitleController {
     return elapsed >= STREAM_THROTTLE_MS || grew >= STREAM_MIN_CHAR_DELTA;
   }
 
-  private syncNetflixNativeVisibility(): void {
-    // While translation is on, Japanese stays hidden for the whole Netflix
-    // session so cue boundaries cannot flash the source line back on screen.
-    this.netflixAdapter?.setNativeCaptionVisibility(!this.settings.enabled);
+  /**
+   * While the translation is on, the site's own captions stay hidden for the
+   * whole session so cue boundaries cannot flash the source line back on
+   * screen. Hiding the overlay for a screen share brings them straight back.
+   */
+  private syncNativeCaptionVisibility(): void {
+    const nativeVisible = !this.settings.enabled || this.overlayHidden();
+    this.netflixAdapter?.setNativeCaptionVisibility(nativeVisible);
+    this.meetAdapter?.setNativeCaptionVisibility(nativeVisible || this.meetingChannelBroken);
+  }
+
+  /**
+   * A meeting whose only channel cannot answer would otherwise leave the user
+   * staring at an empty strip, because Meet's own captions are hidden for the
+   * whole enabled session. Reading the source language beats reading nothing,
+   * so they come back until the channel answers again.
+   */
+  private setMeetingChannelBroken(broken: boolean): void {
+    if (this.meetingChannelBroken === broken) {
+      return;
+    }
+    this.meetingChannelBroken = broken;
+    this.syncNativeCaptionVisibility();
+  }
+
+  /**
+   * The pair a request was sent under. An answer that comes back after the
+   * user switched languages is written in the language they switched away
+   * from: it is not shown, not recorded and not remembered, because keeping
+   * it would caption the rest of the session in the wrong language.
+   */
+  private languagePair(): string {
+    return `${this.settings.sourceLanguage}>${this.settings.targetLanguage}`;
   }
 
   private rememberLocalTranslation(sourceText: string, translation: string): void {
@@ -543,8 +1138,42 @@ export class SubtitleController {
     }
   }
 
-  private syncDraftTranslator(): void {
+  private rememberPaintedCue(cueId: string): void {
+    this.paintedCueIds.delete(cueId);
+    this.paintedCueIds.add(cueId);
+    while (this.paintedCueIds.size > MAX_PAINTED_CUE_IDS) {
+      const oldest = this.paintedCueIds.values().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.paintedCueIds.delete(oldest);
+    }
+  }
+
+  private syncTranslationChannels(): void {
+    // The user just changed the channel configuration; give it another chance
+    // before deciding the meeting has no translator.
+    this.setMeetingChannelBroken(false);
     this.draftTranslator?.destroy();
+    this.draftTranslator = null;
+    this.meetingChannel?.destroy();
+    this.meetingChannel = null;
+
+    if (this.meetingMode() && this.settings.meetingFinalChannel !== "llm") {
+      this.meetingChannel =
+        this.settings.meetingFinalChannel === "local-mt"
+          ? new LocalMtTranslator(this.sessionId)
+          : createFastChannel(
+              this.settings,
+              this.sessionId,
+              () => this.activeCue?.id ?? "",
+              true,
+              () => this.settings.glossary
+            );
+      void this.meetingChannel?.prepare();
+      return;
+    }
+
     this.draftTranslator = createDraftChannel(
       this.settings,
       this.sessionId,
@@ -555,33 +1184,57 @@ export class SubtitleController {
     void this.draftTranslator?.prepare();
   }
 
-  private async translateActiveCue(cue: SubtitleCue): Promise<void> {
+  private async translateActiveCue(cue: SubtitleCue, signal?: AbortSignal): Promise<void> {
     try {
+      const pair = this.languagePair();
+      this.streamingPair = pair;
       const response = await this.requestTranslation(cue);
-      if (this.destroyed || this.activeCue?.id !== cue.id) {
+      if (this.destroyed || pair !== this.languagePair()) {
         return;
       }
-      if (!isCueWithinPlaybackWindow(cue, this.video.currentTime * 1_000)) {
+      if (response.ok && response.translation) {
+        this.rememberLocalTranslation(cue.text, response.translation.text);
+      }
+      if (signal?.aborted) {
+        // Over the line's budget: the meeting moved on without it, and the
+        // queue has already said so. Showing or recording it now would date
+        // the transcript and the screen to a sentence nobody is still on.
         return;
+      }
+      if (!isCueWithinPlaybackWindow(cue, this.clock.nowMs())) {
+        return;
+      }
+      if (response.ok && response.translation) {
+        this.setMeetingChannelBroken(false);
       }
       if (!response.ok || !response.translation) {
         const message = response.error?.message ?? "翻译服务暂时不可用。";
+        // The meeting's only translator just failed, so Meet's own captions
+        // come back whether or not this line is still the one on screen.
+        this.setMeetingChannelBroken(true);
+        if (this.activeCue?.id !== cue.id) {
+          if (this.meetingMode()) {
+            this.report("error", message, cue.source);
+          }
+          return;
+        }
         // A local draft is a usable translation. Replacing it with an error would
         // throw away readable text the viewer is already following.
         if (this.activeCueStage === "draft" || this.activeCueStage === "streaming") {
           this.report("error", `${message}（当前显示可用译文）`, cue.source);
           return;
         }
-        if (cue.source === "netflix-dom") {
-          // Keep the sticky Chinese line if one is already showing from a prior cue.
+        if (isStickySource(cue.source)) {
+          // Keep the sticky line if one is already showing from a prior cue.
           if (this.activeCueStage === "none" && !this.overlayHasVisibleTranslation()) {
             this.overlay.hide();
           }
-          this.syncNetflixNativeVisibility();
+          this.syncNativeCaptionVisibility();
         } else {
           this.overlay.show({
             translation: "翻译服务不可用",
             original: cue.text,
+            speaker: cue.speaker,
             forceOriginal: true
           });
         }
@@ -589,9 +1242,12 @@ export class SubtitleController {
         return;
       }
 
-      this.rememberLocalTranslation(cue.text, response.translation.text);
-      this.applyCaption(cue, "final", response.translation.text);
-      const mode = response.translation.provider === "mock" ? "演示翻译模式" : "正在同步显示中文译文";
+      const painted = this.applyCaption(cue, "final", response.translation.text);
+      if (!painted && this.activeCue?.id !== cue.id) {
+        this.reportUnshownLine(cue);
+        return;
+      }
+      const mode = response.translation.provider === "mock" ? "演示翻译模式" : "正在同步显示译文";
       this.report("ready", mode, cue.source, response.translation.latencyMs);
     } catch {
       // Background gone after extension reload.
@@ -599,10 +1255,22 @@ export class SubtitleController {
   }
 
   private overlayHasVisibleTranslation(): boolean {
-    // Overlay does not expose internals; stage none means nothing Chinese was
-    // painted for this cue. Prior-cue text may still be on screen because we
-    // deliberately skipped hide() on Netflix cue-start.
+    // Overlay does not expose internals; stage none means nothing was painted
+    // for this cue. Prior-cue text may still be on screen because we
+    // deliberately skipped hide() on a sticky cue-start.
     return this.overlay.isShowing();
+  }
+
+  private searchingMessage(): string {
+    return this.meetAdapter
+      ? "正在等待 Google Meet 字幕"
+      : `正在寻找可读取的${languageLabel(this.settings.sourceLanguage)}文本字幕`;
+  }
+
+  private unavailableMessage(): string {
+    return this.meetAdapter
+      ? "未检测到 Meet 字幕；请在 Meet 底部工具栏点击「开启字幕」(CC)。"
+      : `未检测到可读取的字幕；请先在播放器中开启${languageLabel(this.settings.sourceLanguage)}字幕`;
   }
 
   private report(
@@ -613,6 +1281,18 @@ export class SubtitleController {
   ): void {
     this.reportStatus({ state, message, source, latencyMs, updatedAt: Date.now() });
   }
+}
+
+/** Stops the request when the cue is superseded or the line runs out of budget. */
+function untilEither(signal: AbortSignal, lineSignal?: AbortSignal): AbortSignal {
+  return lineSignal ? AbortSignal.any([signal, lineSignal]) : signal;
+}
+
+/** Settles when the budget runs out, so the queue stops waiting on the line. */
+function whenAborted(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
 }
 
 function isYouTubePage(): boolean {

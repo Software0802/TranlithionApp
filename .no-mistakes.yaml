@@ -1,0 +1,10 @@
+# Per-repo no-mistakes overrides.
+#
+# The canonical gate for this repository is `npm run verify`
+# (typecheck + test + build), as AGENTS.md「技术栈与命令」states. The two
+# command slots below name the halves no-mistakes invokes on their own; CI
+# runs the whole `verify` in one job so the pinned checks and the local
+# one-command gate cannot drift apart.
+commands:
+  lint: 'npm run typecheck'
+  test: 'npm test'

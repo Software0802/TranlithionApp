@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { DraftTranslator } from "../src/content/fast-translator";
+import { DraftTranslator, LocalMtTranslator } from "../src/content/fast-translator";
 
 const NEVER = new Promise<never>(() => undefined);
 
@@ -86,6 +86,39 @@ describe("on-device draft translator", () => {
     expect(await translator.translate("こんにちは")).toBeNull();
   });
 
+  it("keeps a caption that reads the same in both languages", async () => {
+    // As the final channel there is nothing better coming: a name, an acronym
+    // or a figure simply reads the same, and calling that "no result" would
+    // report a working channel as dead and take the caption off screen.
+    stubTranslatorApi({ translate: async (input) => input });
+    const translator = new DraftTranslator("ja", "zh-CN", true);
+
+    expect(await translator.translate("Figma")).toBe("Figma");
+  });
+
+  it("renders the user's glossary onto the caption it produces", async () => {
+    // Chrome's on-device translator is the shipped default meeting channel
+    // and takes no glossary of its own, so the renderings the user pasted in
+    // have to be applied here or nowhere.
+    stubTranslatorApi({ translate: async () => "我们在 Figma 里改。" });
+    const translator = new DraftTranslator("ja", "zh-CN", true, () => [
+      { source: "Figma", target: "菲格玛", kind: "term" }
+    ]);
+
+    expect(await translator.translate("Figmaで直す。")).toBe("我们在 菲格玛 里改。");
+  });
+
+  it("leaves a film's draft caption exactly as the model wrote it", async () => {
+    // A draft is replaced by the model's answer, which follows the glossary
+    // itself; rewriting the draft would only make the two disagree on screen.
+    stubTranslatorApi({ translate: async () => "我们在 Figma 里改。" });
+    const translator = new DraftTranslator("ja", "zh-CN", false, () => [
+      { source: "Figma", target: "菲格玛", kind: "term" }
+    ]);
+
+    expect(await translator.translate("Figmaで直す。")).toBe("我们在 Figma 里改。");
+  });
+
   it("never throws when the local model fails", async () => {
     stubTranslatorApi({
       translate: async () => {
@@ -139,6 +172,45 @@ describe("on-device draft translator", () => {
     }
   });
 
+  it("waits longer for the on-device model when it is the caption itself", async () => {
+    vi.useFakeTimers();
+    try {
+      // Meeting mode with stock settings makes this channel the final caption:
+      // nothing slower is waiting behind it, and a cold model that answers at
+      // 1.5 s is a line the user reads rather than a line that disappears.
+      let settle: ((text: string) => void) | undefined;
+      stubTranslatorApi({
+        translate: () => new Promise<string>((resolve) => {
+          settle = resolve;
+        })
+      });
+      const translator = new DraftTranslator("ja", "zh-CN", true);
+
+      const caption = translator.translate("こんにちは");
+      await vi.advanceTimersByTimeAsync(1_500);
+      settle?.("你好");
+
+      expect(await caption).toBe("你好");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("still gives up on a final-channel translation that never answers", async () => {
+    vi.useFakeTimers();
+    try {
+      stubTranslatorApi({ translateHangs: true });
+      const translator = new DraftTranslator("ja", "zh-CN", true);
+
+      const caption = translator.translate("こんにちは");
+      await vi.advanceTimersByTimeAsync(4_000);
+
+      expect(await caption).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("drops a draft whose caption was already superseded", async () => {
     stubTranslatorApi({});
     const translator = new DraftTranslator("ja", "zh-CN");
@@ -146,5 +218,56 @@ describe("on-device draft translator", () => {
     controller.abort();
 
     expect(await translator.translate("こんにちは", controller.signal)).toBeNull();
+  });
+});
+
+describe("local LibreTranslate caption channel", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  it("drops a line the local server is too slow to answer", async () => {
+    vi.useFakeTimers();
+    try {
+      // Meeting jobs run one at a time, so a local server that takes the
+      // background's full-page budget would push every later line minutes
+      // behind the conversation instead of costing this one line.
+      vi.stubGlobal("chrome", {
+        runtime: { id: "tranlithion-test", sendMessage: () => NEVER }
+      });
+      const channel = new LocalMtTranslator("meeting-1");
+
+      const caption = channel.translate("こんにちは");
+      await vi.advanceTimersByTimeAsync(4_000);
+
+      expect(await caption).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("shows a line the local server answers within the budget", async () => {
+    vi.useFakeTimers();
+    try {
+      let settle: ((response: unknown) => void) | undefined;
+      vi.stubGlobal("chrome", {
+        runtime: {
+          id: "tranlithion-test",
+          sendMessage: () =>
+            new Promise((resolve) => {
+              settle = resolve;
+            })
+        }
+      });
+      const channel = new LocalMtTranslator("meeting-1");
+
+      const caption = channel.translate("こんにちは");
+      await vi.advanceTimersByTimeAsync(2_000);
+      settle?.({ ok: true, text: "你好" });
+
+      expect(await caption).toBe("你好");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

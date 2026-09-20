@@ -1,6 +1,14 @@
-import type { DraftTranslationResponse, ExtensionMessage } from "../shared/messages";
-import { safeRuntimeSendMessage } from "../shared/extension-context";
 import type {
+  DraftTranslationResponse,
+  ExtensionMessage,
+  PlainTranslationResponse
+} from "../shared/messages";
+import { safeRuntimeSendMessage } from "../shared/extension-context";
+import { toShortLanguageCode } from "../shared/language";
+import { MEETING_FINAL_CHANNEL_TIMEOUT_MS } from "../shared/meeting";
+import { applyTerminology } from "../shared/terminology";
+import type {
+  GlossaryEntry,
   PublicTranslationSettings,
   SourceLanguage,
   TargetLanguage
@@ -74,7 +82,7 @@ function withTimeout<T>(work: Promise<T>, timeoutMs: number): Promise<T | null> 
 
 /** The Translator API expects a base BCP-47 tag; `zh-CN` is rejected by some builds. */
 function toTranslatorLanguage(language: SourceLanguage | TargetLanguage): string {
-  return language === "zh-CN" ? "zh" : language;
+  return toShortLanguageCode(language);
 }
 
 function readTranslatorFactory(): TranslatorFactory | null {
@@ -97,7 +105,19 @@ export class DraftTranslator implements DraftChannel {
   private preparation: Promise<TranslatorInstance | null> | null = null;
   private unsupported = false;
 
-  constructor(sourceLanguage: SourceLanguage, targetLanguage: TargetLanguage) {
+  constructor(
+    sourceLanguage: SourceLanguage,
+    targetLanguage: TargetLanguage,
+    /** This channel is the caption the user reads, not a preview of one. */
+    private readonly asFinal = false,
+    /**
+     * The user's fixed renderings. Chrome's on-device translator takes no
+     * glossary and runs here rather than in the worker, so this is the only
+     * place they can be applied to its output. Read at call time: a glossary
+     * edited during a call takes effect on the next line.
+     */
+    private readonly terminology: () => GlossaryEntry[] = () => []
+  ) {
     this.pair = {
       sourceLanguage: toTranslatorLanguage(sourceLanguage),
       targetLanguage: toTranslatorLanguage(targetLanguage)
@@ -126,14 +146,27 @@ export class DraftTranslator implements DraftChannel {
       return null;
     }
     try {
-      const translated = await withTimeout(instance.translate(source), DRAFT_TIMEOUT_MS);
+      const translated = await withTimeout(
+        instance.translate(source),
+        this.asFinal ? MEETING_FINAL_CHANNEL_TIMEOUT_MS : DRAFT_TIMEOUT_MS
+      );
       if (signal?.aborted || typeof translated !== "string") {
         return null;
       }
       const trimmed = translated.trim();
-      // An echo of the source is worse than showing nothing: it would look like
-      // a finished translation that simply failed to translate.
-      return trimmed && trimmed !== source ? trimmed : null;
+      if (!trimmed) {
+        return null;
+      }
+      if (!this.asFinal) {
+        // As a draft, an echo of the source is worse than showing nothing: it
+        // would look like a finished translation that failed to translate,
+        // and the real one is still on its way.
+        return trimmed !== source ? trimmed : null;
+      }
+      // As the caption itself there is nothing behind it — a name or a figure
+      // simply reads the same in both languages, and calling that a dead
+      // channel would be a lie.
+      return applyTerminology(trimmed, this.terminology());
     } catch {
       return null;
     }
@@ -195,7 +228,9 @@ export class DraftTranslator implements DraftChannel {
 export class RemoteDraftTranslator implements DraftChannel {
   constructor(
     private readonly sessionId: string,
-    private readonly cueIdOf: () => string
+    private readonly cueIdOf: () => string,
+    /** Meeting mode: this channel is the caption, so drafts being off must not disable it. */
+    private readonly asFinal = false
   ) {}
 
   /**
@@ -215,7 +250,8 @@ export class RemoteDraftTranslator implements DraftChannel {
         type: "DRAFT_TRANSLATE",
         sessionId: this.sessionId,
         cueId: this.cueIdOf(),
-        text
+        text,
+        asFinal: this.asFinal
       } satisfies ExtensionMessage);
       if (!response?.ok || typeof response.text !== "string" || signal?.aborted) {
         return null;
@@ -232,6 +268,51 @@ export class RemoteDraftTranslator implements DraftChannel {
   }
 }
 
+/**
+ * Local LibreTranslate as a caption channel.
+ *
+ * The background worker already owns the endpoint and its host permission for
+ * full-page translation; meeting mode reuses that path so a meeting can be
+ * translated entirely on the user's own machine.
+ */
+export class LocalMtTranslator implements DraftChannel {
+  constructor(private readonly sessionId: string) {}
+
+  async prepare(): Promise<boolean> {
+    return true;
+  }
+
+  async translate(text: string, signal?: AbortSignal): Promise<string | null> {
+    if (!text.trim() || signal?.aborted) {
+      return null;
+    }
+    try {
+      // The background's budget is the one a whole page can afford to wait
+      // for. This channel is a live caption on a serialized queue, so a slow
+      // local server must cost one dropped line rather than a backlog that
+      // pushes every later line minutes behind the conversation.
+      const response = await withTimeout(
+        safeRuntimeSendMessage<PlainTranslationResponse>({
+          type: "TRANSLATE_PLAIN",
+          text,
+          sessionId: this.sessionId
+        } satisfies ExtensionMessage),
+        MEETING_FINAL_CHANNEL_TIMEOUT_MS
+      );
+      if (!response?.ok || typeof response.text !== "string" || signal?.aborted) {
+        return null;
+      }
+      return response.text.trim() || null;
+    } catch {
+      return null;
+    }
+  }
+
+  destroy(): void {
+    // The background worker owns the request and its timeout.
+  }
+}
+
 export function createDraftChannel(
   settings: PublicTranslationSettings,
   sessionId: string,
@@ -240,12 +321,32 @@ export function createDraftChannel(
   if (!settings.draftCaptions) {
     return null;
   }
+  return createFastChannel(settings, sessionId, cueIdOf);
+}
+
+/**
+ * The fast machine-translation channel itself, independent of whether the user
+ * wants it as a draft. Meeting mode uses it as the final caption, so it must be
+ * constructible without `draftCaptions` being on.
+ */
+export function createFastChannel(
+  settings: PublicTranslationSettings,
+  sessionId: string,
+  cueIdOf: () => string,
+  asFinal = false,
+  terminology: () => GlossaryEntry[] = () => []
+): DraftChannel | null {
   if (settings.draftProvider === "browser") {
-    return new DraftTranslator(settings.sourceLanguage, settings.targetLanguage);
+    return new DraftTranslator(
+      settings.sourceLanguage,
+      settings.targetLanguage,
+      asFinal,
+      terminology
+    );
   }
   // A remote provider without a key would spend a request per caption to fail.
   if (settings.draftProvider === "deepl" && !settings.draftApiKeyConfigured) {
     return null;
   }
-  return new RemoteDraftTranslator(sessionId, cueIdOf);
+  return new RemoteDraftTranslator(sessionId, cueIdOf, asFinal);
 }

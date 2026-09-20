@@ -5,6 +5,7 @@ const BROWSER_OVERLAY_LAYER = "2147483646";
 export class SubtitleOverlay {
   private readonly host = document.createElement("div");
   private readonly shadow = this.host.attachShadow({ mode: "closed" });
+  private readonly speaker = document.createElement("p");
   private readonly translation = document.createElement("p");
   private readonly original = document.createElement("p");
   private readonly panel = document.createElement("section");
@@ -12,12 +13,18 @@ export class SubtitleOverlay {
   private visible = false;
   private lastTranslation = "";
   private lastOriginal = "";
+  private lastSpeaker = "";
   private lastPending = false;
   private lastDraft = false;
   private lastForceOriginal = false;
 
+  /**
+   * `anchor` is the element the overlay tracks. A meeting page has no single
+   * video to sit on, so it passes null and the overlay spans the viewport
+   * instead.
+   */
   constructor(
-    private readonly video: HTMLVideoElement,
+    private readonly anchor: Element | null,
     private settings: PublicTranslationSettings
   ) {
     this.host.setAttribute("data-tranlithion-overlay", "");
@@ -29,16 +36,18 @@ export class SubtitleOverlay {
     this.host.setAttribute("aria-label", "Tranlithion 实时翻译字幕");
     this.host.setAttribute("aria-live", "off");
 
+    this.speaker.className = "speaker";
+    this.speaker.hidden = true;
     this.translation.className = "translation";
-    this.translation.lang = "zh-CN";
     this.original.className = "original";
-    this.original.lang = "ja";
     this.panel.className = "caption";
-    this.panel.append(this.translation, this.original);
+    this.panel.append(this.speaker, this.translation, this.original);
     this.shadow.append(createStyles(), this.panel);
 
     document.body.append(this.host);
-    this.resizeObserver.observe(this.video);
+    if (this.anchor) {
+      this.resizeObserver.observe(this.anchor);
+    }
     window.addEventListener("resize", this.syncBounds, { passive: true });
     window.addEventListener("scroll", this.syncBounds, { passive: true, capture: true });
     document.addEventListener("fullscreenchange", this.handleFullscreenChange);
@@ -59,6 +68,8 @@ export class SubtitleOverlay {
   show(input: {
     translation: string;
     original: string;
+    /** Meeting captions only; rendered as its own line, never translated. */
+    speaker?: string;
     pending?: boolean;
     draft?: boolean;
     forceOriginal?: boolean;
@@ -66,11 +77,13 @@ export class SubtitleOverlay {
     const pending = Boolean(input.pending);
     const draft = Boolean(input.draft);
     const forceOriginal = Boolean(input.forceOriginal);
+    const speaker = input.speaker ?? "";
     const showOriginal = this.settings.showOriginal || forceOriginal;
     const unchanged =
       this.visible &&
       this.lastTranslation === input.translation &&
       this.lastOriginal === input.original &&
+      this.lastSpeaker === speaker &&
       this.lastPending === pending &&
       this.lastDraft === draft &&
       this.lastForceOriginal === forceOriginal &&
@@ -81,12 +94,15 @@ export class SubtitleOverlay {
 
     this.lastTranslation = input.translation;
     this.lastOriginal = input.original;
+    this.lastSpeaker = speaker;
     this.lastPending = pending;
     this.lastDraft = draft;
     this.lastForceOriginal = forceOriginal;
     this.translation.textContent = input.translation;
     this.original.textContent = input.original;
     this.original.hidden = !showOriginal;
+    this.speaker.textContent = speaker;
+    this.speaker.hidden = !speaker;
     this.panel.classList.toggle("is-pending", pending);
     // A draft is real, readable text, so it stays at full contrast. The marker
     // only has to be honest that a better translation may still replace it.
@@ -100,6 +116,7 @@ export class SubtitleOverlay {
     this.visible = false;
     this.lastTranslation = "";
     this.lastOriginal = "";
+    this.lastSpeaker = "";
     this.lastPending = false;
     this.lastDraft = false;
     this.lastForceOriginal = false;
@@ -118,11 +135,20 @@ export class SubtitleOverlay {
     this.host.style.setProperty("--caption-font-size", `${settings.fontSizePx}px`);
     this.host.style.setProperty("--caption-backdrop", String(settings.backgroundOpacity));
     this.host.dataset.position = settings.position;
+    // Both lines carry their real language so a screen reader or font stack
+    // picks the right script when the pair is not ja → zh-CN.
+    this.translation.lang = settings.targetLanguage;
+    this.original.lang = settings.sourceLanguage;
   }
 
   private readonly handleFullscreenChange = (): void => {
     const fullscreenTarget = document.fullscreenElement;
-    const nextParent = fullscreenTarget?.contains(this.video) ? fullscreenTarget : document.body;
+    // With no anchor the overlay belongs to the page as a whole, so it follows
+    // whatever went fullscreen — a presented tab in a meeting, for instance.
+    const followsFullscreen = this.anchor
+      ? Boolean(fullscreenTarget?.contains(this.anchor))
+      : Boolean(fullscreenTarget);
+    const nextParent = followsFullscreen && fullscreenTarget ? fullscreenTarget : document.body;
     if (this.host.parentElement !== nextParent) {
       nextParent.append(this.host);
     }
@@ -133,7 +159,17 @@ export class SubtitleOverlay {
     if (!this.visible) {
       return;
     }
-    const rect = this.video.getBoundingClientRect();
+    if (!this.anchor) {
+      // Viewport-anchored: a meeting page has no single element whose box the
+      // captions belong to, and tile layouts reflow constantly.
+      this.host.style.display = "block";
+      this.host.style.left = "0px";
+      this.host.style.top = "0px";
+      this.host.style.width = "100%";
+      this.host.style.height = "100%";
+      return;
+    }
+    const rect = this.anchor.getBoundingClientRect();
     const isVisible = rect.width >= 120 && rect.height >= 90;
     this.host.style.display = isVisible ? "block" : "none";
     if (!isVisible) {
@@ -173,6 +209,13 @@ function createStyles(): HTMLStyleElement {
     :host([data-position="bottom"]) .caption { bottom: 12%; }
     :host([data-position="middle"]) .caption { top: 50%; transform: translate(-50%, -50%); }
     :host([data-position="top"]) .caption { top: 8%; }
+    .speaker {
+      margin: 0 0 0.12em;
+      color: oklch(0.86 0.012 110);
+      font-size: calc(var(--caption-font-size) * 0.6);
+      font-weight: 600;
+      letter-spacing: 0.02em;
+    }
     .translation {
       margin: 0;
       font-size: var(--caption-font-size);

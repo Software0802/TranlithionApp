@@ -17,8 +17,36 @@ export class TextTrackAdapter implements SubtitleAdapter {
 
   constructor(
     private readonly video: HTMLVideoElement,
-    private readonly sourceLanguage: SourceLanguage
+    private sourceLanguage: SourceLanguage
   ) {}
+
+  /**
+   * The user picked a different source language, so the track is chosen
+   * again for it rather than left as whatever matched the language they
+   * left. When a track matches the new language the reader moves to it and
+   * the line it was reading ends; when none matches, the page's one readable
+   * track is still read, exactly as it would be on a fresh load — the
+   * setting alone never makes readable subtitles unavailable.
+   *
+   * Landing on the same track is therefore the ordinary case, and it must
+   * not disturb the line on screen: the viewer is still reading it.
+   */
+  setSourceLanguage(sourceLanguage: SourceLanguage): void {
+    if (sourceLanguage === this.sourceLanguage) {
+      return;
+    }
+    this.sourceLanguage = sourceLanguage;
+    if (!this.callback) {
+      return;
+    }
+    if ((chooseSubtitleTrack(this.video.textTracks, sourceLanguage) ?? null) === this.track) {
+      return;
+    }
+    this.endActiveCue();
+    this.detachTrack();
+    this.emit({ type: "availability", source: this.source, available: false });
+    this.refresh();
+  }
 
   start(onEvent: (event: SubtitleAdapterEvent) => void): void {
     this.callback = onEvent;
@@ -68,19 +96,25 @@ export class TextTrackAdapter implements SubtitleAdapter {
     if (nextCue?.id === this.activeCue?.id) {
       return;
     }
-    if (this.activeCue) {
-      this.emit({
-        type: "cue-end",
-        source: this.source,
-        cueId: this.activeCue.id,
-        atMs: Math.round(this.video.currentTime * 1_000)
-      });
-    }
+    this.endActiveCue();
     this.activeCue = nextCue;
     if (nextCue) {
       this.emit({ type: "cue-start", source: this.source, cue: nextCue });
     }
   };
+
+  private endActiveCue(): void {
+    if (!this.activeCue) {
+      return;
+    }
+    this.emit({
+      type: "cue-end",
+      source: this.source,
+      cueId: this.activeCue.id,
+      atMs: Math.round(this.video.currentTime * 1_000)
+    });
+    this.activeCue = null;
+  }
 
   private readActiveCue(): SubtitleCue | null {
     if (!this.track?.activeCues?.length) {

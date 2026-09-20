@@ -1,12 +1,13 @@
 # 项目规则（Tranlithion 字幕翻译）
 
-Manifest V3 Chrome 扩展：在 YouTube / Netflix 等页已显示、**可访问**的日文文本字幕上，同步叠加简体中文译文。
+Manifest V3 Chrome 扩展：在 YouTube / Netflix / Google Meet 等页已显示、**可访问**的文本字幕上同步叠加译文。语言对为 ja / en / zh-CN 三向互译。
 
 ## 阅读顺序
 
 - 先读本文件，再读 **`README.md`**（能力、架构、配置、Netflix/YouTube 行为细节的操作真源）。
 - 产品定位与设计原则：**`PRODUCT.md`**（冷静、低打扰；反仪表盘/反花哨特效）。
 - 本机 LibreTranslate 草稿通道：`docs/local-libretranslate.md`。
+- 会议模式（Google Meet）的启用步骤、译文通道、计时规则与本机记录保留策略：README「会议模式」章节。
 - 改行为时同步更新 README / 本文件中过时的硬约束；不要只改代码不改文档。
 
 ## 仓库结构
@@ -14,10 +15,10 @@ Manifest V3 Chrome 扩展：在 YouTube / Netflix 等页已显示、**可访问*
 | 路径 | 职责 |
 | --- | --- |
 | `src/content/` | 内容脚本：适配器、字幕控制器、Overlay、页内/快译 |
-| `src/content/adapters/` | `text-track` / YouTube DOM / Netflix DOM |
+| `src/content/adapters/` | `text-track` / YouTube DOM / Netflix DOM / Meet DOM |
 | `src/background/` | MV3 service worker：主译、草稿译、本地 MT |
 | `src/popup/` `src/options/` | 弹窗与设置页 |
-| `src/shared/` | 设置、消息、字幕类型、会话、扩展上下文安全封装 |
+| `src/shared/` | 设置、语言对、消息、字幕类型、会话、会议记录、扩展上下文安全封装 |
 | `src/demo/` | 演示页相关 |
 | `public/manifest.json` | 扩展清单（构建写入 `dist/`） |
 | `tests/` | Vitest |
@@ -27,7 +28,8 @@ Manifest V3 Chrome 扩展：在 YouTube / Netflix 等页已显示、**可访问*
 
 - **不**绕过 DRM、站点访问限制或版权保护。
 - **不**处理烧录字幕；**不**读加密媒体流、不下载受保护音视频轨当 ASR 源。
-- Netflix 等适配只读**页面已公开到 DOM / TextTrack 的文本**；读不到就如实失败，不 hack 播放器内部。
+- Netflix / Meet 等适配只读**页面已公开到 DOM / TextTrack 的文本**；读不到就如实失败，不 hack 播放器或会议客户端内部。
+- 会议场景**不**碰音频：无 tabCapture、无麦克风、无 ASR、无会议 SDK、不录制会议。
 - **不**伪造翻译成功：未配置服务、无字幕、超时/失败必须对用户说清楚（可保留已有可读草稿/上一句，避免把好译文换成吓人空白）。
 - V1 优先 **观看稳定与上下文一致**，不是「所有视频都强行能译」。
 
@@ -36,15 +38,23 @@ Manifest V3 Chrome 扩展：在 YouTube / Netflix 等页已显示、**可访问*
 - API Key **只**存在当前 Chrome 配置文件、扩展信任上下文可访问的存储；**永远不要**发给视频网站或 **content script**。
 - 存储读写须遵守 `TRUSTED_CONTEXTS` / 现有 settings 边界；新增存储字段不得扩大 content 可读密钥面。
 - 内容脚本与 background 通信用 `src/shared/extension-context.ts` 的安全封装（`safeRuntimeSendMessage` 等）；扩展重载后 context invalidated 时 **安静降级**，禁止未捕获拒绝刷屏。
-- 设置页「保存并测试」会申请可选 host 权限：UI 须让用户看清目标域名。
+- 设置页「保存并测试」与「授权并启用 meet.google.com」会申请可选 host 权限：UI 须让用户看清目标域名。Meet 始终是 optional host，未授权前不注册内容脚本。
+- 会议模式与会议本机记录**默认关闭**（`DEFAULT_SETTINGS.meetingMode` / `meetingTranscript` 为 false）：读会议字幕、写本机记录都必须由用户亲自勾选，已有的全站 host 授权不得代替这个同意。
+- 会议本机记录（`chrome.storage.local`，一场会议一个 `meeting-transcript:<sessionId>` 键）保留 7 天并自动过期；单行写入不得改写整库。写入失败要如实告知用户，不能静默丢弃。设置页必须写清会议文本发往哪个服务、存多久、如何清除。不得在文档或 UI 中声称「完全不留痕」。
+- 未勾选本机记录时，会话记忆**只在内存里留术语/重复句**：不得把原话或发言人姓名写进任何 `chrome.storage`（含 `storage.session` 的会话上下文）。这条对大模型通道同样成立，判定见 `keepsSpokenRecord`。取消勾选或清除会议记录时要**当场作废**这场会话记下的原话与发言人姓名（`forgetMeetingSessions` + 从 `storage.session` 上下文里剔除会议会话）；**只动会议会话**，别把影视标签页的上下文/缓存一起清掉（会话来源标在 `PersistedTranslationSession.meeting`）。取消勾选不删已写入的本机记录——那要按「立即清除全部会议记录」或等保留期到。会议三个机器翻译通道都先读会话记忆再发请求；它们不收术语表，由通道自己用 `applyTerminology`（严格大小写、仅 `asFinal`）把用户译名替换回译文——影视页草稿不得被改写。
+- 会话记忆按语言对隔离（`TranslationSessionStore.useLanguagePair`）：中途改语言对必须整块作废，旧目标语的缓存/上下文/译名不得当成新语言的结果。
 - 文档与提交中禁止真实 Key；示例用占位符。
 
 ## 运行时行为要点
 
 - 字幕线索统一为带起止时间的 `SubtitleCue`；避免同一句重复提交。
-- **结束判定跟 `video.currentTime`**，不跟墙钟、不把 DOM 短暂空白当结束（Netflix 重绘会闪空）。
+- **视频页的结束判定跟 `video.currentTime`**，不跟墙钟、不把 DOM 短暂空白当结束（Netflix 重绘会闪空）。时钟源抽象见 `src/content/clock.ts`。
+- **会议页没有可用的播放时间轴**：用墙钟计时、Overlay 锚在视口（`SubtitleOverlay` 的 anchor 传 null）；空白同样不等于结束。
+- 会议字幕是 ASR 流：只提交**未提交过的增量**并在句末标点/长度上限处切段；说话人切换或另起字幕块（按渲染节点判断，不比文本）即结束当前句。识别器收回已断句的文本时**原地更正**（在适配器内重开同一条 cue），不得把收回的措辞当成新的一句去翻译或记录。**已写入本机记录的行一律不回头删改**：更正只是后面新的一行，听到的与更正后的措辞都留着。去重按**定稿 cue 的身份**在提交侧做（每个 cue 只记一次），绝不按文本比对——同一场会里「Okay.」说两遍就是两行。
+- Meet 字幕区靠语义选择器 + 结构校验定位（不读本地化 `aria-label`）；**解析出第一行之前不隐藏**原生字幕条，读不出来就把它放回来并如实报不可用。
 - 翻译在 background **按观看会话串行**；带近期上下文、术语表、人物名线索；术语宜放在稳定 system 前缀以利缓存。
 - 双轨：可选草稿（本地 / DeepL / 自定义 HTTP）先上屏，主译覆盖；**晚到的草稿不得盖掉已定稿**。
+- 会议模式默认**单通道终稿**（机器翻译 / 本机 MT），大模型是可选项；通道没配好要如实报错，**不得**偷偷回落到大模型。
 - YouTube：译开时可视觉隐藏原字幕，停译恢复。Netflix：会话内隐藏原字幕 + Overlay 粘性更新，防闪回日文。
 - MV3 worker 休眠：会话上下文用 `chrome.storage.session` 等现有机制恢复；离页清理。
 
@@ -65,7 +75,9 @@ npm run verify   # typecheck + test + build
 
 | 意图 | 优先看 |
 | --- | --- |
-| 新站点 / 读字幕方式 | `src/content/adapters/*`、`subtitle-controller.ts` |
+| 新站点 / 读字幕方式 | `src/content/adapters/*`、`subtitle-controller.ts`、`clock.ts` |
+| 会议模式（判定 / 文案 / 本机记录） | `src/shared/meeting.ts`、`meeting-transcript.ts` |
+| 语言对与语言代码映射 | `src/shared/language.ts`（DeepL / LibreTranslate / Translator API 代码都在这里） |
 | Overlay 显示与原生字幕显隐 | `src/content/overlay.ts` 及站点分支 |
 | 主翻译协议 / 队列 / 缓存 | `src/background/translator.ts`、`translation-session` |
 | 草稿通道 | `draft-translator.ts`、`local-mt.ts`、`fast-translator.ts` |
@@ -75,7 +87,8 @@ npm run verify   # typecheck + test + build
 ## 验证期望
 
 - 逻辑变更：补或更新 `tests/` 中对应 vitest；`npm run verify` 通过。
-- Netflix/YouTube 时序与「空白不结束」类行为：优先单测（见现有 `netflix-*.test.ts` 等），真机账号页回归由船长或任务说明要求时再做。
+- Netflix/YouTube/Meet 时序与「空白不结束」类行为：优先单测（见 `netflix-*.test.ts`、`meet-*.test.ts`），真机账号页回归由船长或任务说明要求时再做。
+- 测试环境无 jsdom：DOM 夹具用 `tests/helpers/fake-dom.ts`，`document` 按 `*-cue-lifecycle.test.ts` 的方式 stub。
 - 改 manifest 权限：说明为何需要，默认最小权限；可选 host 保持 optional。
 - UI 文案与状态：符合 PRODUCT——直接、可行动；尊重 `prefers-reduced-motion`；不靠纯颜色传达状态。
 
@@ -84,3 +97,10 @@ npm run verify   # typecheck + test + build
 - 把 Key 下发到 content script 或页面 `window`。
 - 为「读到更多字幕」而注入破解、抓媒体请求或绕过 DRM 的代码。
 - 默认打开吵闹的调试 UI 抢占视频区（吉祥物/演示须可关且不挡观看）。
+
+## Maintaining this file
+
+Keep this file for knowledge useful to almost every future agent session in this project.
+Do not repeat what the codebase already shows; point to the authoritative file or command instead.
+Prefer rewriting or pruning existing entries over appending new ones.
+When updating this file, preserve this bar for all agents and keep entries concise.

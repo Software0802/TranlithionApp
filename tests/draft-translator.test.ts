@@ -98,6 +98,52 @@ describe("remote draft translator", () => {
     expect(await translateDraft({ text: "こんにちは", settings: DEEPL })).toBeNull();
   });
 
+  it("keeps a caption that reads the same in both languages", async () => {
+    // As the meeting's final channel there is nothing better coming: a name,
+    // an acronym or a figure simply reads the same, and reporting it as "no
+    // result" would call a working channel dead and take the caption away.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(jsonResponse({ translations: [{ text: "Figma." }] }))
+    );
+
+    expect(await translateDraft({ text: "Figma.", settings: DEEPL, asFinal: true })).toBe("Figma.");
+  });
+
+  it("renders the user's glossary onto a meeting's final caption", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(jsonResponse({ translations: [{ text: "在 Figma 里改。" }] }))
+    );
+
+    const caption = await translateDraft({
+      text: "Figmaで直す。",
+      settings: DEEPL,
+      asFinal: true,
+      terminology: [{ source: "Figma", target: "菲格玛", kind: "term" }]
+    });
+
+    expect(caption).toBe("在 菲格玛 里改。");
+  });
+
+  it("leaves a film's draft caption exactly as the service wrote it", async () => {
+    // Drafts run on YouTube and Netflix too, where the model's answer is
+    // still coming and applies the glossary itself. Rewriting the draft in
+    // between would only make the two disagree in front of the viewer.
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(jsonResponse({ translations: [{ text: "在 Figma 里改。" }] }))
+    );
+
+    const draft = await translateDraft({
+      text: "Figmaで直す。",
+      settings: DEEPL,
+      terminology: [{ source: "Figma", target: "菲格玛", kind: "term" }]
+    });
+
+    expect(draft).toBe("在 Figma 里改。");
+  });
+
   it("drops a draft whose caption was superseded before the request began", async () => {
     const fetchMock = vi.fn();
     vi.stubGlobal("fetch", fetchMock);

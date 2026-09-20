@@ -112,6 +112,55 @@ describe("translation agent", () => {
     expect(response).toMatchObject({ text: "你好。", entityHints: [] });
   });
 
+  it("hands the model one rendering per name, the user's", async () => {
+    const encoder = new TextEncoder();
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"早上好。"}}]}\n\n'));
+            controller.close();
+          }
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } }
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    await translateWithAgent({
+      cue: {
+        id: "meeting-line",
+        startMs: 0,
+        endMs: null,
+        text: "Good morning.",
+        isFinal: true,
+        source: "meet-dom",
+        speaker: "Alice Chen"
+      },
+      settings: {
+        ...DEFAULT_SETTINGS,
+        provider: "openai-compatible",
+        apiBaseUrl: "https://api.deepseek.com/v1",
+        apiKey: "test-key",
+        model: "deepseek-v4-flash",
+        glossary: [{ source: "Alice Chen", target: "陈爱丽", kind: "name" }]
+      },
+      recentContext: [],
+      // What a meeting registers for a speaker it has heard from.
+      rememberedTerms: [{ source: "Alice Chen", target: "Alice Chen", kind: "name" }],
+      onPartial: () => undefined
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const body = JSON.parse(String(init.body)) as {
+      messages: Array<{ role: string; content: string }>;
+    };
+    const [system] = body.messages;
+
+    expect(system.content).toContain("Alice Chen=陈爱丽");
+    expect(system.content.match(/Alice Chen=/g)).toHaveLength(1);
+  });
+
   it("keeps terminology in the cacheable system prefix, not the per-cue message", async () => {
     const encoder = new TextEncoder();
     const fetchMock = vi.fn().mockResolvedValue(

@@ -1,10 +1,16 @@
-import type { ExtensionMessage, SaveSettingsResponse, SettingsResponse, TabStatusResponse } from "../shared/messages";
+import type { ExtensionMessage, PageCommand, SaveSettingsResponse, SettingsResponse, TabStatusResponse } from "../shared/messages";
+import { languageLabel, languagePairLabel } from "../shared/language";
+import { isMeetingHost, meetingFinalChannelLabel } from "../shared/meeting";
 import { publicSettings } from "../shared/settings";
 import type { PublicTranslationSettings, RuntimeStatus } from "../shared/types";
 
 const enabledToggle = byId<HTMLButtonElement>("enabled-toggle");
 const enabledLabel = byId<HTMLSpanElement>("enabled-label");
+const languagePair = byId<HTMLParagraphElement>("language-pair");
 const showOriginal = byId<HTMLInputElement>("show-original");
+const meetingControls = byId<HTMLElement>("meeting-controls");
+const meetingOverlayHidden = byId<HTMLInputElement>("meeting-overlay-hidden");
+const meetingChannelNote = byId<HTMLSpanElement>("meeting-channel-note");
 const statusDot = byId<HTMLSpanElement>("status-dot");
 const runtimeMessage = byId<HTMLParagraphElement>("runtime-message");
 const runtimeDetail = byId<HTMLParagraphElement>("runtime-detail");
@@ -15,6 +21,8 @@ const translatePage = byId<HTMLButtonElement>("translate-page");
 const restorePage = byId<HTMLButtonElement>("restore-page");
 
 let settings: PublicTranslationSettings | null = null;
+/** True while the active tab is a meeting host, which unlocks the hide switch. */
+let onMeetingTab = false;
 
 void initialize();
 
@@ -32,6 +40,15 @@ showOriginal.addEventListener("change", () => {
   void savePatch({ showOriginal: showOriginal.checked });
 });
 
+// One click before sharing a screen: the overlay goes away, no meeting text is
+// sent anywhere, and Meet's own captions come straight back.
+meetingOverlayHidden.addEventListener("change", () => {
+  if (!settings) {
+    return;
+  }
+  void savePatch({ meetingOverlayHidden: meetingOverlayHidden.checked });
+});
+
 openOptions.addEventListener("click", () => {
   void chrome.runtime.openOptionsPage();
 });
@@ -46,9 +63,7 @@ restorePage.addEventListener("click", () => {
   void runPageCommand("restore-page");
 });
 
-async function runPageCommand(
-  command: "translate-page" | "restore-page" | "ensure-hosts"
-): Promise<void> {
+async function runPageCommand(command: PageCommand): Promise<void> {
   renderRuntime({
     state: "translating",
     message: command === "ensure-hosts" ? "正在请求全站权限…" : "正在处理页面…",
@@ -93,10 +108,14 @@ async function initialize(): Promise<void> {
 
 async function loadRuntimeStatus(): Promise<void> {
   const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+  onMeetingTab = isMeetingTabUrl(tab?.url);
+  if (settings) {
+    renderSettings(settings);
+  }
   if (tab?.id === undefined) {
     renderRuntime({
       state: "idle",
-      message: "请打开一个 YouTube 或 Netflix 视频页面",
+      message: "请打开一个视频页面或 Google Meet 会议",
       updatedAt: Date.now()
     });
     return;
@@ -114,7 +133,11 @@ async function loadRuntimeStatus(): Promise<void> {
   );
 }
 
-async function savePatch(patch: { enabled?: boolean; showOriginal?: boolean }): Promise<void> {
+async function savePatch(patch: {
+  enabled?: boolean;
+  showOriginal?: boolean;
+  meetingOverlayHidden?: boolean;
+}): Promise<void> {
   if (!settings) {
     return;
   }
@@ -147,6 +170,17 @@ function renderSettings(nextSettings: PublicTranslationSettings): void {
   enabledLabel.textContent = nextSettings.enabled ? "已开启" : "已暂停";
   enabledToggle.setAttribute("aria-label", nextSettings.enabled ? "暂停翻译" : "开启翻译");
   showOriginal.checked = nextSettings.showOriginal;
+  languagePair.textContent = languagePairLabel(
+    nextSettings.sourceLanguage,
+    nextSettings.targetLanguage
+  );
+  // The hide switch only means something on a meeting page, so it only appears
+  // there rather than sitting inert on every other tab.
+  meetingControls.hidden = !(onMeetingTab && nextSettings.meetingMode);
+  meetingOverlayHidden.checked = nextSettings.meetingOverlayHidden;
+  meetingChannelNote.textContent = `会议译文：${meetingFinalChannelLabel(
+    nextSettings.meetingFinalChannel
+  )}`;
 
   if (nextSettings.provider === "mock") {
     serviceName.textContent = "演示翻译模式";
@@ -167,7 +201,7 @@ function renderRuntime(status: RuntimeStatus): void {
 
 function runtimeDetailFor(status: RuntimeStatus): string {
   if (status.state === "unavailable") {
-    return "Tranlithion 只读取网页公开的文本字幕，不处理烧录字幕或受保护内容。";
+    return "Tranlithion 只读取网页公开的文本字幕，不处理烧录字幕、会议音频或受保护内容。";
   }
   if (status.state === "error") {
     return "打开设置检查服务地址、API Key 与网站访问授权。";
@@ -184,7 +218,26 @@ function runtimeDetailFor(status: RuntimeStatus): string {
   if (status.source === "netflix-dom") {
     return ["正在读取 Netflix 已显示的文本字幕。", latency].filter(Boolean).join(" ");
   }
-  return "请在 YouTube 或 Netflix 播放器中开启日文字幕。";
+  if (status.source === "meet-dom") {
+    return ["正在读取 Google Meet 已显示的字幕，不读取会议音频。", latency]
+      .filter(Boolean)
+      .join(" ");
+  }
+  const sourceName = settings ? languageLabel(settings.sourceLanguage) : "源语言";
+  return onMeetingTab
+    ? "请在 Meet 底部工具栏点击「开启字幕」(CC)。"
+    : `请在 YouTube 或 Netflix 播放器中开启${sourceName}字幕。`;
+}
+
+function isMeetingTabUrl(url: string | undefined): boolean {
+  if (!url) {
+    return false;
+  }
+  try {
+    return isMeetingHost(new URL(url).hostname);
+  } catch {
+    return false;
+  }
 }
 
 function formatLatency(latencyMs: number): string {

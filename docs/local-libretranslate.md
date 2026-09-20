@@ -2,6 +2,7 @@
 
 视频字幕（Netflix 等）继续走 DeepL。
 网页全文与选中文字默认走本机 LibreTranslate，不经过云端大模型。
+会议模式也可以把本机 LibreTranslate 选作会议译文通道：启用步骤、地址是否为回环地址决定的文本去向，见 README「会议模式」章节。
 
 ## 要求
 

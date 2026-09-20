@@ -1,11 +1,19 @@
 import type {
   PublicTranslationSettings,
   RuntimeStatus,
+  SubtitleCue,
   TabRuntimeStatus,
   TranslationRequest,
   TranslationResponse,
   TranslationSettings
 } from "./types";
+
+export type PageCommand =
+  | "translate-page"
+  | "restore-page"
+  | "ensure-hosts"
+  /** Grants only the meeting hosts and registers their content script. */
+  | "enable-meeting-hosts";
 
 export type ExtensionMessage =
   | { type: "GET_PUBLIC_SETTINGS" }
@@ -18,10 +26,50 @@ export type ExtensionMessage =
   | { type: "TEST_TRANSLATION"; settings: TranslationSettings }
   | { type: "SETTINGS_UPDATED"; settings: PublicTranslationSettings }
   | { type: "TRANSLATION_PARTIAL"; sessionId: string; cueId: string; text: string }
-  | { type: "DRAFT_TRANSLATE"; sessionId: string; cueId: string; text: string }
-  | { type: "TRANSLATE_PLAIN"; text: string }
+  | {
+      type: "DRAFT_TRANSLATE";
+      sessionId: string;
+      cueId: string;
+      text: string;
+      /** Meeting mode: this channel is the caption, not an optional preview. */
+      asFinal?: boolean;
+    }
+  /** `sessionId` marks a caption channel, whose session memory answers repeats. */
+  | { type: "TRANSLATE_PLAIN"; text: string; sessionId?: string }
   | { type: "TRANSLATE_PLAIN_BATCH"; texts: string[] }
-  | { type: "PAGE_COMMAND"; command: "translate-page" | "restore-page" | "ensure-hosts" };
+  /**
+   * A settled bilingual meeting line. The background worker owns both the
+   * retention-limited transcript and the session's term memory, so the
+   * content script reports the line instead of storing anything itself.
+   */
+  | {
+      type: "RECORD_MEETING_LINE";
+      sessionId: string;
+      host: string;
+      title: string;
+      cue: SubtitleCue;
+      translation: string;
+    }
+  | { type: "GET_MEETING_TRANSCRIPTS" }
+  | { type: "CLEAR_MEETING_TRANSCRIPTS" }
+  | { type: "PAGE_COMMAND"; command: PageCommand };
+
+export interface MeetingTranscriptSummary {
+  sessions: number;
+  lines: number;
+  retentionDays: number;
+  /**
+   * Meetings whose recording stopped because the browser refused a write.
+   * The live status line says so once and is gone with the next caption, so
+   * this is how the user can still find out afterwards.
+   */
+  stopped: { meetings: number; reason: string } | null;
+}
+
+export interface MeetingTranscriptResponse {
+  ok: boolean;
+  summary?: MeetingTranscriptSummary;
+}
 
 export interface DraftTranslationResponse {
   ok: boolean;

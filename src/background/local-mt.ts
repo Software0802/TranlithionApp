@@ -1,13 +1,11 @@
-import type { SourceLanguage, TranslationSettings } from "../shared/types";
+import { toShortLanguageCode, type LanguageTag } from "../shared/language";
+import type { TranslationSettings } from "../shared/types";
 
 const LOCAL_MT_TIMEOUT_MS = 20_000;
 
 /** LibreTranslate uses short codes; Simplified Chinese is `zh`. */
-export function toLibreTranslateLang(language: SourceLanguage | "zh-CN"): string {
-  if (language === "zh-CN") {
-    return "zh";
-  }
-  return language;
+export function toLibreTranslateLang(language: LanguageTag): string {
+  return toShortLanguageCode(language);
 }
 
 /**
@@ -54,10 +52,10 @@ export async function translateWithLibreTranslate(
       typeof (payload as { translatedText?: unknown }).translatedText === "string"
         ? (payload as { translatedText: string }).translatedText.trim()
         : "";
-    if (!translated || translated === source) {
-      return null;
-    }
-    return translated;
+    // Text that survives translation unchanged — a name, an acronym, a figure
+    // — is a result, not a failure. Callers that have nothing to gain from an
+    // identical string decide that for themselves.
+    return translated || null;
   } catch {
     return null;
   } finally {

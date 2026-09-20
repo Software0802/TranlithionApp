@@ -9,24 +9,52 @@ import {
   isExtensionMessage,
   type DraftTranslationResponse,
   type ExtensionMessage,
+  type MeetingTranscriptResponse,
+  type PageCommand,
   type PlainBatchTranslationResponse,
   type PlainTranslationResponse,
   type SettingsResponse,
   type TabStatusResponse,
   type TestTranslationResponse
 } from "../shared/messages";
+import { sampleSourceText } from "../shared/language";
+import {
+  isMeetingHost,
+  keepsSpokenRecord,
+  speakerEntityHints,
+  MEETING_CONTENT_SCRIPT_ID,
+  MEETING_HOST_PERMISSIONS
+} from "../shared/meeting";
+import {
+  appendTranscriptLine,
+  expiredTranscriptKeys,
+  isTranscriptSessionKey,
+  MEETING_TRANSCRIPT_FAILURE_KEY,
+  MEETING_TRANSCRIPT_PRUNED_AT_KEY,
+  readTranscriptFailures,
+  readTranscriptSession,
+  readTranscriptSessions,
+  retainedTranscriptFailures,
+  summarizeTranscripts,
+  transcriptPruneDue,
+  transcriptSessionKey,
+  type TranscriptFailure
+} from "../shared/meeting-transcript";
 import {
   SessionJobQueue,
   SupersededJobError,
   TranslationSessionStore,
   type PersistedTranslationSession
 } from "../shared/translation-session";
+import { applyTerminology, mergeTerminology } from "../shared/terminology";
 import type {
+  GlossaryEntry,
   RuntimeStatus,
   TabRuntimeStatus,
   SubtitleCue,
   TranslationFailure,
   TranslationResponse,
+  TranslationResult,
   TranslationSettings
 } from "../shared/types";
 import { translateDraft } from "./draft-translator";
@@ -38,6 +66,8 @@ import { translateWithAgent, TranslatorError } from "./translator";
 
 const SESSION_CONTEXT_STORAGE_KEY = "translation-session-context";
 const TAB_STATUS_STORAGE_KEY = "tab-runtime-status";
+/** Dynamic registration created by the popup's "启用全站" button. */
+const ALL_PAGES_CONTENT_SCRIPT_ID = "tranlithion-all-pages";
 const sessionStore = new TranslationSessionStore();
 const jobQueue = new SessionJobQueue();
 const tabStatuses = new Map<number, TabRuntimeStatus>();
@@ -50,6 +80,9 @@ const draftControllers = new Map<string, AbortController>();
 const hydratedSessionIds = new Set<string>();
 let contextStorageQueue: Promise<void> = Promise.resolve();
 let tabStatusStorageQueue: Promise<void> = Promise.resolve();
+let transcriptStorageQueue: Promise<void> = Promise.resolve();
+/** Meetings already told the user their transcript could not be stored. */
+const transcriptStorageFailures = new Set<string>();
 /** Hot-path cache: chrome.storage.local.get on every cue was adding tens of ms. */
 let settingsCache: TranslationSettings | null = null;
 let permissionCache:
@@ -57,14 +90,14 @@ let permissionCache:
   | null = null;
 
 chrome.runtime.onInstalled.addListener(() => {
-  void initializeSettings();
+  void initializeSettings().then(pruneStoredTranscripts);
 });
 
 chrome.runtime.onStartup.addListener(() => {
-  void initializeSettings();
+  void initializeSettings().then(pruneStoredTranscripts);
 });
 
-void initializeSettings();
+void initializeSettings().then(pruneStoredTranscripts);
 
 chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName === "local" && changes[SETTINGS_STORAGE_KEY]) {
@@ -103,10 +136,21 @@ async function handleMessage(
       return { settings } satisfies SettingsResponse;
     }
     case "SAVE_SETTINGS": {
-      const settings = mergeSettings(await getSettings(), message.patch);
+      const previous = await getSettings();
+      const settings = mergeSettings(previous, message.patch);
       settingsCache = settings;
       permissionCache = null;
       await chrome.storage.local.set({ [SETTINGS_STORAGE_KEY]: settings });
+      if (previous.meetingTranscript && !settings.meetingTranscript) {
+        await forgetMeetingRecords();
+      }
+      if (
+        previous.meetingTranscriptRetentionDays !== settings.meetingTranscriptRetentionDays
+      ) {
+        // Retention is a privacy control: a window the user just shortened
+        // applies on the next wake rather than after the sweep's interval.
+        await forgetTranscriptPruneMarker();
+      }
       return { ok: true, settings };
     }
     case "GET_TAB_STATUS": {
@@ -125,10 +169,20 @@ async function handleMessage(
       return translateCue(message.request, sender.tab?.id);
     }
     case "DRAFT_TRANSLATE": {
-      return draftTranslate(message.sessionId, message.text);
+      return draftTranslate(message.sessionId, message.text, message.asFinal === true);
+    }
+    case "RECORD_MEETING_LINE": {
+      return recordMeetingLine(message, sender.tab?.id);
+    }
+    case "GET_MEETING_TRANSCRIPTS": {
+      return meetingTranscriptSummary();
+    }
+    case "CLEAR_MEETING_TRANSCRIPTS": {
+      await clearStoredTranscripts();
+      return { ok: true };
     }
     case "TRANSLATE_PLAIN": {
-      return translatePlain(message.text);
+      return translatePlain(message.text, message.sessionId);
     }
     case "TRANSLATE_PLAIN_BATCH": {
       return translatePlainBatch(message.texts);
@@ -142,6 +196,7 @@ async function handleMessage(
       jobQueue.cancelLatest(message.sessionId);
       sessionStore.clear(message.sessionId);
       hydratedSessionIds.delete(message.sessionId);
+      transcriptStorageFailures.delete(message.sessionId);
       await removePersistedSession(message.sessionId);
       return { ok: true };
     }
@@ -198,8 +253,18 @@ async function translateCue(
   }
 
   await hydrate;
+  sessionStore.useLanguagePair(
+    request.sessionId,
+    settings.sourceLanguage,
+    settings.targetLanguage
+  );
+  if (request.cue.source === "meet-dom") {
+    sessionStore.markMeetingSession(request.sessionId);
+  }
 
-  const latestOnly = request.cue.source === "netflix-dom";
+  // Live captions that rewrite themselves: only the newest line is worth
+  // finishing, and repeats hit the text cache instead of the network.
+  const latestOnly = request.cue.source === "netflix-dom" || request.cue.source === "meet-dom";
   const cached =
     sessionStore.getCached(request.sessionId, request.cue.id) ??
     (latestOnly
@@ -209,7 +274,7 @@ async function translateCue(
   // text cache immediately keeps live captions in sync without a network round-trip.
   if (cached) {
     if (latestOnly) {
-      sessionStore.record(request.sessionId, request.cue, { ...cached, latencyMs: 0 });
+      await rememberTranslation(request.sessionId, request.cue, { ...cached, latencyMs: 0 });
     }
     return { ok: true, translation: { ...cached, latencyMs: 0 } };
   }
@@ -246,8 +311,9 @@ async function translateCue(
     if (signal?.aborted) {
       throw new TranslatorError("CANCELLED", "字幕已更新，已取消过期翻译。");
     }
-    sessionStore.record(request.sessionId, request.cue, result);
-    await persistSession(request.sessionId);
+    if (await rememberTranslation(request.sessionId, request.cue, result)) {
+      await persistSession(request.sessionId);
+    }
     return result;
   };
 
@@ -273,24 +339,96 @@ async function translateCue(
   }
 }
 
+/**
+ * Puts a finished translation into the session's memory under the consent the
+ * user gave for this call, and says whether it is worth persisting.
+ *
+ * A meeting the user has not asked to keep leaves only what it taught us: the
+ * terms stay for the rest of the session, the sentences and the names that
+ * said them are never written into the context that reaches storage.
+ */
+async function rememberTranslation(
+  sessionId: string,
+  cue: SubtitleCue,
+  result: TranslationResult
+): Promise<boolean> {
+  // Consent as it stands at the moment of writing, not as it stood when the
+  // request left: a translation can be in flight for seconds, and what counts
+  // is the answer the user has given by the time it lands.
+  const settings = await getSettings();
+  if (cue.source === "meet-dom") {
+    // Writing a spoken line is what makes a session a call — including when
+    // the write re-creates a session a withdrawal of consent has just
+    // deleted, which must still be a call the next withdrawal can reach.
+    sessionStore.markMeetingSession(sessionId);
+  }
+  if (!keepsSpokenRecord(settings, cue.source)) {
+    sessionStore.rememberText(sessionId, cue.text, result);
+    return false;
+  }
+  sessionStore.record(sessionId, cue, result);
+  return true;
+}
+
+/** Everything a caption channel should render consistently: settings plus what the call taught us. */
+function sessionTerminology(sessionId: string, settings: TranslationSettings): GlossaryEntry[] {
+  return mergeTerminology(settings.glossary, sessionStore.getEntityHints(sessionId));
+}
+
 async function draftTranslate(
   sessionId: string,
-  text: string
+  text: string,
+  asFinal: boolean
 ): Promise<DraftTranslationResponse> {
   const settings = await getSettings();
-  if (!settings.enabled || !settings.draftCaptions || settings.draftProvider === "browser") {
+  if (!settings.enabled || settings.draftProvider === "browser") {
+    return { ok: false };
+  }
+  // In meeting mode this channel *is* the caption, so the draft-captions
+  // preference must not silently switch it off.
+  if (!settings.draftCaptions && !asFinal) {
     return { ok: false };
   }
   if (await requiredDraftPermissionMissing(settings)) {
     return { ok: false };
+  }
+  sessionStore.useLanguagePair(sessionId, settings.sourceLanguage, settings.targetLanguage);
+  if (asFinal) {
+    // Only meeting mode asks this channel to be the caption itself.
+    sessionStore.markMeetingSession(sessionId);
+  }
+
+  // As the caption itself this channel carries a whole meeting, where the same
+  // sentence comes round again and again. What the session already learned is
+  // both faster and cheaper than asking the service a second time.
+  const remembered = asFinal ? sessionStore.getCachedByText(sessionId, text) : undefined;
+  if (remembered) {
+    return { ok: true, text: remembered.text };
   }
 
   draftControllers.get(sessionId)?.abort();
   const controller = new AbortController();
   draftControllers.set(sessionId, controller);
   try {
-    const translated = await translateDraft({ text, settings, signal: controller.signal });
-    return translated && !controller.signal.aborted ? { ok: true, text: translated } : { ok: false };
+    const translated = await translateDraft({
+      text,
+      settings,
+      signal: controller.signal,
+      asFinal,
+      terminology: sessionTerminology(sessionId, settings)
+    });
+    if (!translated || controller.signal.aborted) {
+      return { ok: false };
+    }
+    if (asFinal) {
+      sessionStore.rememberText(sessionId, text, {
+        text: translated,
+        provider: settings.provider,
+        latencyMs: 0,
+        entityHints: []
+      });
+    }
+    return { ok: true, text: translated };
   } finally {
     if (draftControllers.get(sessionId) === controller) {
       draftControllers.delete(sessionId);
@@ -298,7 +436,112 @@ async function draftTranslate(
   }
 }
 
-async function translatePlain(text: string): Promise<PlainTranslationResponse> {
+/**
+ * Records one settled meeting line: into session memory, so repeated terms and
+ * speaker names stay consistent and repeats hit the cache, and into the
+ * retention-limited local transcript when the user has it on (D7).
+ *
+ * The content script can reach this only for a meeting host, and nothing here
+ * hands it anything back beyond an acknowledgement.
+ */
+async function recordMeetingLine(
+  message: {
+    sessionId: string;
+    host: string;
+    title: string;
+    cue: SubtitleCue;
+    translation: string;
+  },
+  tabId?: number
+): Promise<{ ok: boolean }> {
+  const translation = message.translation.trim();
+  if (!isMeetingHost(message.host) || message.cue.source !== "meet-dom" || !translation) {
+    return { ok: false };
+  }
+  const settings = await getSettings();
+  await restorePersistedSession(message.sessionId);
+  sessionStore.useLanguagePair(
+    message.sessionId,
+    settings.sourceLanguage,
+    settings.targetLanguage
+  );
+  sessionStore.markMeetingSession(message.sessionId);
+
+  // Speaker names are exactly the proper nouns a meeting keeps repeating, so
+  // they join the session's term memory and reach every channel's rendering.
+  const entityHints = speakerEntityHints(message.cue.speaker, settings.glossary);
+
+  const recorded = await rememberTranslation(message.sessionId, message.cue, {
+    text: translation,
+    provider: settings.provider,
+    latencyMs: 0,
+    entityHints
+  });
+  if (recorded) {
+    await persistSession(message.sessionId);
+  }
+
+  // Read again rather than trusting the snapshot this line arrived with: the
+  // user may have unchecked the box while it was being translated.
+  const consent = await getSettings();
+  if (!consent.meetingTranscript) {
+    return { ok: true };
+  }
+
+  await queueTranscriptStorageUpdate(async () => {
+    // Only this meeting's own key is read and written, so one sentence never
+    // pays to serialize every meeting on record.
+    const key = transcriptSessionKey(message.sessionId);
+    const stored = await chrome.storage.local.get(key);
+    const current = readTranscriptSession(stored[key]);
+    const next = appendTranscriptLine(current, {
+      sessionId: message.sessionId,
+      host: message.host,
+      title: message.title,
+      atMs: Date.now(),
+      speaker: message.cue.speaker ?? null,
+      source: message.cue.text,
+      translation
+    });
+    if (!next || next === current) {
+      return;
+    }
+    try {
+      await chrome.storage.local.set({ [key]: next });
+    } catch (error) {
+      await reportTranscriptStorageFailure(message.sessionId, tabId, error);
+      return;
+    }
+    if (!current) {
+      // A meeting starts: this is the moment to enforce retention and the
+      // session cap, rather than on every line of it.
+      await dropExpiredTranscripts(consent.meetingTranscriptRetentionDays);
+    }
+  });
+  return { ok: true };
+}
+
+async function meetingTranscriptSummary(): Promise<MeetingTranscriptResponse> {
+  const settings = await getSettings();
+  return {
+    ok: true,
+    summary: summarizeTranscripts({
+      stored: await chrome.storage.local.get(null),
+      nowMs: Date.now(),
+      retentionDays: settings.meetingTranscriptRetentionDays
+    })
+  };
+}
+
+/**
+ * `sessionId` is present when this is a caption channel rather than a one-off
+ * page or selection translation: a meeting repeats itself, so the session's
+ * memory answers the second time a sentence is said.
+ */
+async function translatePlain(
+  text: string,
+  sessionId?: string
+): Promise<PlainTranslationResponse> {
   const settings = await getSettings();
   if (!settings.enabled) {
     return { ok: false, error: "翻译已暂停。" };
@@ -309,8 +552,29 @@ async function translatePlain(text: string): Promise<PlainTranslationResponse> {
   if (await localMtPermissionMissing(settings)) {
     return { ok: false, error: "尚未授权访问本机翻译服务地址。" };
   }
+  if (sessionId) {
+    sessionStore.useLanguagePair(sessionId, settings.sourceLanguage, settings.targetLanguage);
+    sessionStore.markMeetingSession(sessionId);
+  }
+  const remembered = sessionId ? sessionStore.getCachedByText(sessionId, text) : undefined;
+  if (remembered) {
+    return { ok: true, text: remembered.text };
+  }
   const translated = await translateWithLibreTranslate(text, settings);
-  return translated ? { ok: true, text: translated } : { ok: false, error: "本机翻译失败。请确认 LibreTranslate 已启动。" };
+  if (!translated) {
+    return { ok: false, error: "本机翻译失败。请确认 LibreTranslate 已启动。" };
+  }
+  if (!sessionId) {
+    return { ok: true, text: translated };
+  }
+  const caption = applyTerminology(translated, sessionTerminology(sessionId, settings));
+  sessionStore.rememberText(sessionId, text, {
+    text: caption,
+    provider: settings.provider,
+    latencyMs: 0,
+    entityHints: []
+  });
+  return { ok: true, text: caption };
 }
 
 async function translatePlainBatch(texts: string[]): Promise<PlainBatchTranslationResponse> {
@@ -342,9 +606,39 @@ async function localMtPermissionMissing(settings: TranslationSettings): Promise<
 }
 
 async function handlePageCommand(
-  command: "translate-page" | "restore-page" | "ensure-hosts",
+  command: PageCommand,
   tabId?: number
 ): Promise<{ ok: boolean; error?: string; message?: string }> {
+  if (command === "enable-meeting-hosts") {
+    // Only the meeting origins, never the all-sites grant: the user is
+    // authorizing one meeting platform and should see exactly that domain.
+    // The grant itself is requested by the options page, which has the user
+    // gesture; this only registers the script once the origin is really ours.
+    const origins = [...MEETING_HOST_PERMISSIONS];
+    if (!(await chrome.permissions.contains({ origins }))) {
+      return { ok: false, error: "未获得访问 meet.google.com 的授权。" };
+    }
+    const registered = await registeredContentScriptIds();
+    // The all-pages registration already covers Meet. Registering both would
+    // inject the content script twice and put two overlays on the call.
+    if (!registered.has(ALL_PAGES_CONTENT_SCRIPT_ID) && !registered.has(MEETING_CONTENT_SCRIPT_ID)) {
+      try {
+        await chrome.scripting.registerContentScripts([
+          {
+            id: MEETING_CONTENT_SCRIPT_ID,
+            matches: origins,
+            js: ["content/index.js"],
+            runAt: "document_idle",
+            persistAcrossSessions: true
+          }
+        ]);
+      } catch {
+        // Already registered from a previous grant.
+      }
+    }
+    return { ok: true, message: "Google Meet 会议字幕已启用，请刷新会议页面。" };
+  }
+
   if (command === "ensure-hosts") {
     const granted = await chrome.permissions.request({
       origins: ["https://*/*", "http://*/*", "http://127.0.0.1/*", "http://localhost/*"]
@@ -352,18 +646,30 @@ async function handlePageCommand(
     if (!granted) {
       return { ok: false, error: "未获得网站访问授权。" };
     }
-    try {
-      await chrome.scripting.registerContentScripts([
-        {
-          id: "tranlithion-all-pages",
-          matches: ["https://*/*", "http://*/*"],
-          js: ["content/index.js"],
-          runAt: "document_idle",
-          persistAcrossSessions: true
-        }
-      ]);
-    } catch {
-      // Already registered from a previous grant.
+    const registered = await registeredContentScriptIds();
+    if (registered.has(MEETING_CONTENT_SCRIPT_ID)) {
+      // Subsumed by the all-pages registration below; leaving it would inject
+      // the content script twice on Meet.
+      try {
+        await chrome.scripting.unregisterContentScripts({ ids: [MEETING_CONTENT_SCRIPT_ID] });
+      } catch {
+        // Nothing registered under that id after all.
+      }
+    }
+    if (!registered.has(ALL_PAGES_CONTENT_SCRIPT_ID)) {
+      try {
+        await chrome.scripting.registerContentScripts([
+          {
+            id: ALL_PAGES_CONTENT_SCRIPT_ID,
+            matches: ["https://*/*", "http://*/*"],
+            js: ["content/index.js"],
+            runAt: "document_idle",
+            persistAcrossSessions: true
+          }
+        ]);
+      } catch {
+        // Already registered from a previous grant.
+      }
     }
     return { ok: true, message: "全站权限已就绪，请刷新目标网页后再用。" };
   }
@@ -382,6 +688,15 @@ async function handlePageCommand(
     return { ok: true, message: result?.message };
   } catch {
     return { ok: false, error: "无法与当前页面通信。请刷新页面后重试，或先点击「启用全站」。" };
+  }
+}
+
+async function registeredContentScriptIds(): Promise<Set<string>> {
+  try {
+    const scripts = await chrome.scripting.getRegisteredContentScripts();
+    return new Set(scripts.map((script) => script.id));
+  } catch {
+    return new Set();
   }
 }
 
@@ -406,7 +721,7 @@ async function testTranslation(settingsCandidate: TranslationSettings): Promise<
         id: "connection-test",
         startMs: 0,
         endMs: 1_000,
-        text: "こんにちは",
+        text: sampleSourceText(settings.sourceLanguage),
         isFinal: true,
         source: "text-track"
       },
@@ -609,6 +924,160 @@ function queueContextStorageUpdate(update: () => Promise<void>): Promise<void> {
   const operation = contextStorageQueue.then(update, update);
   contextStorageQueue = operation.catch(() => undefined);
   return operation;
+}
+
+/** Meeting lines arrive faster than a storage round-trip; serialize the folds. */
+function queueTranscriptStorageUpdate(update: () => Promise<void>): Promise<void> {
+  const operation = transcriptStorageQueue.then(update, update);
+  transcriptStorageQueue = operation.catch(() => undefined);
+  return operation;
+}
+
+/**
+ * D7: transcripts expire even if the user never opens another meeting, so the
+ * retention window is also enforced when the worker wakes up.
+ */
+async function pruneStoredTranscripts(): Promise<void> {
+  const settings = await getSettings();
+  await queueTranscriptStorageUpdate(async () => {
+    const stored = await chrome.storage.local.get(MEETING_TRANSCRIPT_PRUNED_AT_KEY);
+    if (!transcriptPruneDue(stored[MEETING_TRANSCRIPT_PRUNED_AT_KEY], Date.now())) {
+      return;
+    }
+    await dropExpiredTranscripts(settings.meetingTranscriptRetentionDays);
+    await chrome.storage.local.set({ [MEETING_TRANSCRIPT_PRUNED_AT_KEY]: Date.now() });
+  });
+}
+
+/** Makes the next wake sweep whatever the last one left behind. */
+async function forgetTranscriptPruneMarker(): Promise<void> {
+  await queueTranscriptStorageUpdate(async () => {
+    await chrome.storage.local.remove(MEETING_TRANSCRIPT_PRUNED_AT_KEY);
+  });
+}
+
+/** Runs inside the transcript queue; never queue it again from within. */
+async function dropExpiredTranscripts(retentionDays: number): Promise<void> {
+  const stored = await chrome.storage.local.get(null);
+  const expired = expiredTranscriptKeys(
+    readTranscriptSessions(stored),
+    Date.now(),
+    retentionDays
+  );
+  if (expired.length > 0) {
+    await chrome.storage.local.remove(expired);
+  }
+  const failures = readTranscriptFailures(stored[MEETING_TRANSCRIPT_FAILURE_KEY]);
+  const kept = retainedTranscriptFailures(failures, Date.now(), retentionDays);
+  if (Object.keys(kept).length === Object.keys(failures).length) {
+    return;
+  }
+  // A note about a meeting goes when that meeting's record goes: the same
+  // window, so it never outlives what it describes and never leaves first.
+  if (Object.keys(kept).length === 0) {
+    await chrome.storage.local.remove(MEETING_TRANSCRIPT_FAILURE_KEY);
+    return;
+  }
+  await chrome.storage.local.set({ [MEETING_TRANSCRIPT_FAILURE_KEY]: kept });
+}
+
+async function clearStoredTranscripts(): Promise<void> {
+  await queueTranscriptStorageUpdate(async () => {
+    const keys = Object.keys(await chrome.storage.local.get(null)).filter(isTranscriptSessionKey);
+    if (keys.length > 0) {
+      await chrome.storage.local.remove(keys);
+    }
+    await chrome.storage.local.remove(MEETING_TRANSCRIPT_PRUNED_AT_KEY);
+  });
+  await forgetTranscriptFailures();
+  await forgetMeetingRecords();
+}
+
+/**
+ * Consent withdrawn: nothing said in a call is remembered anywhere any more,
+ * including the snapshot that carries it across a worker sleep, and including
+ * the names of who said it. A call still running forgets as much as one
+ * already over.
+ *
+ * Only calls. An episode being translated in another tab keeps its context
+ * and its caches: it was never the thing consent was given for.
+ */
+async function forgetMeetingRecords(): Promise<void> {
+  sessionStore.forgetMeetingSessions();
+  await queueContextStorageUpdate(async () => {
+    const stored = await chrome.storage.session.get(SESSION_CONTEXT_STORAGE_KEY);
+    const sessions = readPersistedSessions(stored[SESSION_CONTEXT_STORAGE_KEY]);
+    const kept = Object.fromEntries(
+      Object.entries(sessions).filter(([, session]) => session.meeting !== true)
+    );
+    if (Object.keys(kept).length === Object.keys(sessions).length) {
+      return;
+    }
+    await chrome.storage.session.set({ [SESSION_CONTEXT_STORAGE_KEY]: kept });
+  });
+}
+
+/**
+ * The profile's storage is shared and finite, and a transcript is the one
+ * thing here that grows without bound. A refused write is the user's
+ * business: translation keeps running, but the meeting is no longer being
+ * recorded, and saying so once in the popup's live status is not saying it —
+ * the next caption overwrites that line a second later. The failure is
+ * therefore kept until the records are cleared, so the settings page can
+ * still tell the user afterwards that the call stopped being recorded.
+ */
+async function reportTranscriptStorageFailure(
+  sessionId: string,
+  tabId: number | undefined,
+  error: unknown
+): Promise<void> {
+  if (transcriptStorageFailures.has(sessionId)) {
+    return;
+  }
+  transcriptStorageFailures.add(sessionId);
+  const reason = errorText(error);
+  await rememberTranscriptFailure(sessionId, reason);
+  if (tabId === undefined) {
+    return;
+  }
+  await setTabStatus(tabId, {
+    state: "error",
+    message: `会议记录未能写入本机存储（${reason}）：翻译继续，但这场会议不再被记录。可在设置页清除会议记录后重试。`,
+    source: "meet-dom",
+    updatedAt: Date.now()
+  });
+}
+
+/**
+ * Kept beside the transcripts in `chrome.storage.local`, not in the session
+ * area: the truncated record lives for the whole retention window, and a note
+ * about it that disappeared when the browser closed would leave the user with
+ * a half-recorded meeting and no way to find out.
+ */
+async function rememberTranscriptFailure(sessionId: string, reason: string): Promise<void> {
+  try {
+    const failures = await storedTranscriptFailures();
+    failures[sessionId] = { reason, atMs: Date.now() };
+    await chrome.storage.local.set({ [MEETING_TRANSCRIPT_FAILURE_KEY]: failures });
+  } catch {
+    // The same full storage that refused the line can refuse this note; the
+    // popup still says so for this meeting, and captions carry on.
+  }
+}
+
+async function storedTranscriptFailures(): Promise<Record<string, TranscriptFailure>> {
+  const stored = await chrome.storage.local.get(MEETING_TRANSCRIPT_FAILURE_KEY);
+  return readTranscriptFailures(stored[MEETING_TRANSCRIPT_FAILURE_KEY]);
+}
+
+async function forgetTranscriptFailures(): Promise<void> {
+  transcriptStorageFailures.clear();
+  await chrome.storage.local.remove(MEETING_TRANSCRIPT_FAILURE_KEY);
+}
+
+function errorText(error: unknown): string {
+  const message = error instanceof Error ? error.message : String(error ?? "");
+  return message.trim() || "存储空间可能已满";
 }
 
 function readPersistedSessions(value: unknown): Record<string, PersistedTranslationSession> {

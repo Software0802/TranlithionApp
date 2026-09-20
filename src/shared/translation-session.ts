@@ -1,3 +1,4 @@
+import { termKey } from "./terminology";
 import type { ContextLine, EntityHint, SubtitleCue, TranslationResult } from "./types";
 
 const MAX_CONTEXT_LINES = 8;
@@ -11,17 +12,56 @@ interface SessionMemory {
   entityHints: EntityHint[];
   cached: Map<string, TranslationResult>;
   cachedByText: Map<string, TranslationResult>;
+  /** The language pair everything remembered here was translated for. */
+  pair: string | null;
+  /** This session is a call, so withdrawing consent to a record retracts it. */
+  meeting: boolean;
   lastTouchedAt: number;
 }
 
 export interface PersistedTranslationSession {
   recent: ContextLine[];
   entityHints: EntityHint[];
+  pair?: string;
+  meeting?: boolean;
   lastTouchedAt: number;
 }
 
 export class TranslationSessionStore {
   private readonly sessions = new Map<string, SessionMemory>();
+
+  /**
+   * Points a session at the pair it is translating now.
+   *
+   * Everything a session remembers — the cached translations, the context the
+   * model reads back, the renderings it learned for a name — is written in one
+   * target language. When the user changes the pair mid-session that memory is
+   * not stale by age but simply in the wrong language, so it goes rather than
+   * coming back as a caption nobody asked for.
+   */
+  useLanguagePair(sessionId: string, sourceLanguage: string, targetLanguage: string): void {
+    const pair = `${sourceLanguage}>${targetLanguage}`;
+    const session = this.getSession(sessionId);
+    if (session.pair === pair) {
+      return;
+    }
+    if (session.pair !== null) {
+      session.recent = [];
+      session.entityHints = [];
+      session.cached.clear();
+      session.cachedByText.clear();
+    }
+    session.pair = pair;
+  }
+
+  /**
+   * Marks a session as a call. Only these are retracted when the user
+   * withdraws consent to a record of one — an episode being translated in
+   * another tab is not a meeting and keeps its context and its caches.
+   */
+  markMeetingSession(sessionId: string): void {
+    this.getSession(sessionId).meeting = true;
+  }
 
   getContext(sessionId: string): ContextLine[] {
     return [...this.getSession(sessionId).recent];
@@ -45,12 +85,22 @@ export class TranslationSessionStore {
 
   record(sessionId: string, cue: SubtitleCue, translation: TranslationResult): void {
     const session = this.getSession(sessionId);
-    session.recent.push({
+    const line: ContextLine = {
       cueId: cue.id,
       source: cue.text,
       translation: translation.text,
-      atMs: Date.now()
-    });
+      atMs: Date.now(),
+      ...(cue.speaker ? { speaker: cue.speaker } : {})
+    };
+    // One cue is one line of context. A meeting line is recorded again when it
+    // settles, and appending it twice would spend half the model's window
+    // repeating what it has already been told.
+    const existing = session.recent.findIndex((entry) => entry.cueId === cue.id);
+    if (existing >= 0) {
+      session.recent[existing] = line;
+    } else {
+      session.recent.push(line);
+    }
     session.recent.splice(0, Math.max(0, session.recent.length - MAX_CONTEXT_LINES));
 
     session.cached.set(cue.id, translation);
@@ -62,32 +112,23 @@ export class TranslationSessionStore {
       session.cached.delete(oldestKey);
     }
 
-    const textKey = cue.text.trim();
-    if (textKey) {
-      // Re-insert so repeated lines refresh LRU order in the Map iteration.
-      session.cachedByText.delete(textKey);
-      session.cachedByText.set(textKey, translation);
-      while (session.cachedByText.size > MAX_CACHED_BY_TEXT) {
-        const oldestKey = session.cachedByText.keys().next().value;
-        if (oldestKey === undefined) {
-          break;
-        }
-        session.cachedByText.delete(oldestKey);
-      }
-    }
+    this.storeByText(session, cue.text, translation);
+    this.storeEntityHints(session, translation.entityHints);
+    session.lastTouchedAt = Date.now();
+    this.prune();
+  }
 
-    for (const hint of translation.entityHints) {
-      const key = hint.source.toLocaleLowerCase();
-      const existingIndex = session.entityHints.findIndex(
-        (entry) => entry.source.toLocaleLowerCase() === key
-      );
-      if (existingIndex >= 0) {
-        session.entityHints.splice(existingIndex, 1, hint);
-      } else {
-        session.entityHints.push(hint);
-      }
-    }
-    session.entityHints.splice(0, Math.max(0, session.entityHints.length - MAX_ENTITY_HINTS));
+  /**
+   * Remembers a finished translation by its source text alone.
+   *
+   * The machine-translation channels have no cue to key on and never reach
+   * the model's context window, but a line repeated later in the same session
+   * should still skip the network rather than be paid for twice.
+   */
+  rememberText(sessionId: string, sourceText: string, translation: TranslationResult): void {
+    const session = this.getSession(sessionId);
+    this.storeByText(session, sourceText, translation);
+    this.storeEntityHints(session, translation.entityHints);
     session.lastTouchedAt = Date.now();
     this.prune();
   }
@@ -100,6 +141,8 @@ export class TranslationSessionStore {
     return {
       recent: session.recent.map((line) => ({ ...line })),
       entityHints: session.entityHints.map((hint) => ({ ...hint })),
+      ...(session.pair ? { pair: session.pair } : {}),
+      ...(session.meeting ? { meeting: true } : {}),
       lastTouchedAt: session.lastTouchedAt
     };
   }
@@ -115,6 +158,8 @@ export class TranslationSessionStore {
       entityHints: entityHints.map((hint) => ({ ...hint })),
       cached: new Map(),
       cachedByText: new Map(),
+      pair: typeof value.pair === "string" ? value.pair : null,
+      meeting: value.meeting === true,
       lastTouchedAt: Number.isFinite(value.lastTouchedAt) ? value.lastTouchedAt : Date.now()
     });
     this.prune();
@@ -122,6 +167,66 @@ export class TranslationSessionStore {
 
   clear(sessionId: string): void {
     this.sessions.delete(sessionId);
+  }
+
+  /**
+   * Forgets every call a worker is holding — the lines, the caches, and the
+   * names the call registered along the way. A speaker's display name is part
+   * of the record of who said what, not a term the user taught us, so it goes
+   * with the rest; what the user typed into the glossary lives in settings
+   * and is untouched.
+   *
+   * Sessions that are not calls are left exactly as they are: withdrawing
+   * consent to a meeting record must not cost an episode its context window
+   * mid-playback.
+   */
+  forgetMeetingSessions(): void {
+    for (const [sessionId, session] of this.sessions) {
+      if (session.meeting) {
+        this.sessions.delete(sessionId);
+      }
+    }
+  }
+
+  private storeByText(
+    session: SessionMemory,
+    sourceText: string,
+    translation: TranslationResult
+  ): void {
+    const textKey = sourceText.trim();
+    if (!textKey) {
+      return;
+    }
+    // Re-insert so repeated lines refresh LRU order in the Map iteration.
+    session.cachedByText.delete(textKey);
+    session.cachedByText.set(textKey, translation);
+    while (session.cachedByText.size > MAX_CACHED_BY_TEXT) {
+      const oldestKey = session.cachedByText.keys().next().value;
+      if (oldestKey === undefined) {
+        break;
+      }
+      session.cachedByText.delete(oldestKey);
+    }
+  }
+
+  private storeEntityHints(session: SessionMemory, hints: EntityHint[]): void {
+    for (const hint of hints) {
+      const key = termKey(hint.source);
+      const existingIndex = session.entityHints.findIndex(
+        (entry) => termKey(entry.source) === key
+      );
+      if (existingIndex >= 0) {
+        // A name registered as itself says nothing this session does not
+        // already know, so it never overwrites a rendering someone worked out.
+        if (hint.source === hint.target) {
+          continue;
+        }
+        session.entityHints.splice(existingIndex, 1, hint);
+      } else {
+        session.entityHints.push(hint);
+      }
+    }
+    session.entityHints.splice(0, Math.max(0, session.entityHints.length - MAX_ENTITY_HINTS));
   }
 
   private getSession(sessionId: string): SessionMemory {
@@ -135,6 +240,8 @@ export class TranslationSessionStore {
       entityHints: [],
       cached: new Map(),
       cachedByText: new Map(),
+      pair: null,
+      meeting: false,
       lastTouchedAt: Date.now()
     };
     this.sessions.set(sessionId, session);

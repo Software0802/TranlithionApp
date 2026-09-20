@@ -1,4 +1,7 @@
-import type { SourceLanguage, TranslationSettings } from "../shared/types";
+import { toDeepLSource, toDeepLTarget } from "../shared/language";
+import { MEETING_FINAL_CHANNEL_TIMEOUT_MS } from "../shared/meeting";
+import { applyTerminology } from "../shared/terminology";
+import type { GlossaryEntry, TranslationSettings } from "../shared/types";
 
 /**
  * Remote draft channel: a dedicated machine-translation endpoint that answers
@@ -23,17 +26,24 @@ export interface RemoteDraftInput {
   text: string;
   settings: TranslationSettings;
   signal?: AbortSignal;
-}
-
-/** DeepL spells Simplified Chinese `ZH-HANS` and expects upper-case codes. */
-function deepLSourceLanguage(language: SourceLanguage): string {
-  return language === "ja" ? "JA" : "EN";
+  /** The caller is using this channel as the final caption, not as a preview. */
+  asFinal?: boolean;
+  /**
+   * Fixed renderings for the caption this channel is about to become. They
+   * apply only to a final caption: a draft is replaced by the model's answer,
+   * which follows the glossary on its own, and rewriting it in between would
+   * make the two disagree in front of the viewer.
+   */
+  terminology?: GlossaryEntry[];
 }
 
 export async function translateDraft(input: RemoteDraftInput): Promise<string | null> {
   const { settings } = input;
   const text = input.text.trim();
-  if (!text || !settings.draftCaptions || settings.draftProvider === "browser") {
+  if (!text || settings.draftProvider === "browser") {
+    return null;
+  }
+  if (!settings.draftCaptions && !input.asFinal) {
     return null;
   }
   if (settings.draftProvider === "deepl" && !settings.draftApiKey) {
@@ -46,7 +56,10 @@ export async function translateDraft(input: RemoteDraftInput): Promise<string | 
     return null;
   }
   input.signal?.addEventListener("abort", abortForNewerCue, { once: true });
-  const timer = globalThis.setTimeout(() => controller.abort(), REMOTE_DRAFT_TIMEOUT_MS);
+  const timer = globalThis.setTimeout(
+    () => controller.abort(),
+    input.asFinal ? MEETING_FINAL_CHANNEL_TIMEOUT_MS : REMOTE_DRAFT_TIMEOUT_MS
+  );
 
   try {
     const response = await fetch(settings.draftEndpointUrl, {
@@ -63,9 +76,16 @@ export async function translateDraft(input: RemoteDraftInput): Promise<string | 
     if (!translated || controller.signal.aborted) {
       return null;
     }
-    // An echo of the source reads as a finished translation that silently
-    // failed, which is worse than leaving the caption to the main translator.
-    return translated === text ? null : translated;
+    if (!input.asFinal) {
+      // As a draft, an echo of the source reads as a finished translation that
+      // silently failed, which is worse than leaving the caption to the main
+      // translator.
+      return translated === text ? null : translated;
+    }
+    // As the caption itself there is nothing behind it: a name or a figure
+    // simply reads the same in both languages, and reporting that as no
+    // result would call a working channel dead.
+    return applyTerminology(translated, input.terminology ?? []);
   } catch {
     return null;
   } finally {
@@ -90,8 +110,8 @@ function draftRequestBody(settings: TranslationSettings, text: string): unknown 
   if (settings.draftProvider === "deepl") {
     return {
       text: [text],
-      source_lang: deepLSourceLanguage(settings.sourceLanguage),
-      target_lang: "ZH-HANS"
+      source_lang: toDeepLSource(settings.sourceLanguage),
+      target_lang: toDeepLTarget(settings.targetLanguage)
     };
   }
   return {
