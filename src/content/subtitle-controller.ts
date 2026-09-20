@@ -126,6 +126,8 @@ export class SubtitleController {
   private streamingPair: string | null = null;
   /** The last line that reached the overlay, newer than which nothing older paints. */
   private lastPaintedCue: SubtitleCue | null = null;
+  /** Lines the user has already read, so a late answer cannot replay one. */
+  private readonly paintedCueIds = new Set<string>();
   /** One budget per sentence, keyed by its cue. See `runFinalTranslation`. */
   private readonly meetingLineBudgets = new Map<string, MeetingLineBudget>();
 
@@ -900,6 +902,7 @@ export class SubtitleController {
       this.lastStreamText = text;
     }
     this.lastPaintedCue = cue;
+    this.paintedCueIds.add(cue.id);
     this.overlay.show({
       translation: text,
       original: cue.text,
@@ -924,14 +927,17 @@ export class SubtitleController {
    * translated — when the cue after it is already the active one, or when the
    * turn is over and no cue is open at all. Either way its translation is the
    * newest text anyone has, and the sticky overlay exists to hold exactly
-   * that. Once something newer has painted, the finished sentence has had its
-   * turn and never comes back over it.
+   * that. Once something newer has painted — or this sentence itself has
+   * already had its turn on screen — it never comes back over what follows.
    */
   private paintsAheadOfActiveCue(cue: SubtitleCue, stage: CaptionStage): boolean {
     if (cue.source !== "meet-dom" || stage !== "final") {
       return false;
     }
     if (!this.activeCue) {
+      if (this.paintedCueIds.has(cue.id)) {
+        return false;
+      }
       return !this.lastPaintedCue || this.lastPaintedCue.startMs <= cue.startMs;
     }
     return this.activeCueStage === "none";
@@ -942,9 +948,17 @@ export class SubtitleController {
    * meeting had already moved on to a sentence the user is reading now.
    * Silently dropping it would leave them with a transcript row for a line
    * they never saw and no idea why.
+   *
+   * Only that one cause is worth saying. A line held back because the user
+   * hid the overlay, or one they already read before its own translation
+   * came back around, was not lost to the next sentence, and claiming so
+   * would describe a meeting that did not happen.
    */
   private reportUnshownLine(cue: SubtitleCue): void {
     if (cue.source !== "meet-dom" || !this.meetingMode()) {
+      return;
+    }
+    if (this.overlayHidden() || !this.settings.enabled || this.paintedCueIds.has(cue.id)) {
       return;
     }
     this.report(

@@ -515,6 +515,53 @@ describe("meeting translation flow", () => {
     ).toBe(true);
   });
 
+  it("does not put a line the user already read back on screen", async () => {
+    const fixture = createFixture({ meetingFinalChannel: "llm" });
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Okay." }]);
+    await fixture.render([]);
+    await fixture.wait(2_000);
+
+    // Said again: painted from local memory, with the model call behind it
+    // only refreshing the background's context.
+    fixture.holdModel("Okay.");
+    await fixture.render([{ speaker: "Carol Diaz", text: "Okay." }]);
+
+    expect(fixture.caption()).toBe("[llm] Okay.");
+
+    await fixture.render([]);
+    await fixture.wait(3_000);
+
+    expect(fixture.caption()).toBeNull();
+
+    await fixture.releaseModel("Okay.");
+
+    // The line had its turn and its reading time; bringing it back a second
+    // later is a caption flashing back to something nobody is saying.
+    expect(fixture.caption()).toBeNull();
+    expect(fixture.statusMessages().some((message) => message.includes("没有再顶掉"))).toBe(
+      false
+    );
+  });
+
+  it("says nothing about a skipped line while the user has the overlay hidden", async () => {
+    const fixture = createFixture();
+    fixture.hold("Good morning.");
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Let's" }]);
+    await fixture.wait(TICK_MS);
+
+    // Screen share: the answer that arrives now is not shown because the user
+    // turned the overlay off, which is not the meeting having moved on.
+    fixture.setOverlayHidden(true);
+    await fixture.release("Good morning.");
+
+    expect(fixture.statusMessages().some((message) => message.includes("没有再顶掉"))).toBe(
+      false
+    );
+    expect(fixture.lastStatus()?.message).toBe("会议模式：译文已隐藏（共享屏幕用）");
+  });
+
   it("keeps a title with the sentence it belongs to", async () => {
     const fixture = createFixture();
 
