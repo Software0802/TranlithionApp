@@ -161,6 +161,7 @@ describe("meeting text destination disclosure", () => {
     const copy = meetingTextDestination({
       ...DEFAULT_SETTINGS,
       meetingFinalChannel: "llm",
+      draftCaptions: false,
       provider: "openai-compatible",
       apiBaseUrl: "https://api.deepseek.com/v1",
       model: "deepseek-v4-flash"
@@ -168,6 +169,43 @@ describe("meeting text destination disclosure", () => {
 
     expect(copy).toContain("api.deepseek.com");
     expect(copy).toContain("deepseek-v4-flash");
+  });
+
+  it("names the draft service too, which the chat model channel also sends to", () => {
+    // On this channel the draft runs beside the model, so the same sentence
+    // reaches two services. A user who picked 大模型主译 to keep the meeting
+    // with one provider has to be told about the second.
+    const copy = meetingTextDestination({
+      ...DEFAULT_SETTINGS,
+      meetingFinalChannel: "llm",
+      draftCaptions: true,
+      draftProvider: "deepl",
+      provider: "openai-compatible",
+      apiBaseUrl: "https://api.deepseek.com/v1",
+      model: "deepseek-v4-flash"
+    });
+
+    expect(copy).toContain("api.deepseek.com");
+    expect(copy).toContain("DeepL");
+    expect(copy).toContain("api-free.deepl.com");
+  });
+
+  it("names only the model when the draft stays on this machine or is off", () => {
+    const onDevice = meetingTextDestination({
+      ...DEFAULT_SETTINGS,
+      meetingFinalChannel: "llm",
+      draftCaptions: true,
+      draftProvider: "browser"
+    });
+    const noDraft = meetingTextDestination({
+      ...DEFAULT_SETTINGS,
+      meetingFinalChannel: "llm",
+      draftCaptions: false,
+      draftProvider: "deepl"
+    });
+
+    expect(onDevice).not.toContain("api-free.deepl.com");
+    expect(noDraft).not.toContain("api-free.deepl.com");
   });
 });
 

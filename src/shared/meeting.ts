@@ -70,6 +70,7 @@ export function meetingTextDestination(
   settings: Pick<
     TranslationSettings,
     | "meetingFinalChannel"
+    | "draftCaptions"
     | "draftProvider"
     | "draftEndpointUrl"
     | "localMtUrl"
@@ -82,17 +83,31 @@ export function meetingTextDestination(
   switch (settings.meetingFinalChannel) {
     case "local-mt":
       return `本机 LibreTranslate（${hostOf(settings.localMtUrl)}），字幕文本不离开这台电脑。`;
-    case "llm":
-      return `大模型翻译服务 ${describeMainProvider(settings)}，会议字幕文本会发送到该服务。`;
+    case "llm": {
+      const model = `大模型翻译服务 ${describeMainProvider(settings)}，会议字幕文本会发送到该服务。`;
+      if (!settings.draftCaptions || settings.draftProvider === "browser") {
+        return model;
+      }
+      // On this channel the draft runs alongside the model, so the same
+      // sentence reaches a second service. Naming only one of the two would
+      // tell the user their meeting goes somewhere it does not stop.
+      return `${model}草稿字幕会把同一句同时发送到 ${draftServiceName(settings)}（${hostOf(
+        settings.draftEndpointUrl
+      )}）。`;
+    }
     case "fast-mt":
     default:
       if (settings.draftProvider === "browser") {
         return "Chrome 内置本地翻译模型，字幕文本不离开这台电脑。";
       }
-      return `${
-        settings.draftProvider === "deepl" ? "DeepL" : "自定义机器翻译服务"
-      }（${hostOf(settings.draftEndpointUrl)}），会议字幕文本会发送到该服务。`;
+      return `${draftServiceName(settings)}（${hostOf(
+        settings.draftEndpointUrl
+      )}），会议字幕文本会发送到该服务。`;
   }
+}
+
+function draftServiceName(settings: Pick<TranslationSettings, "draftProvider">): string {
+  return settings.draftProvider === "deepl" ? "DeepL" : "自定义机器翻译服务";
 }
 
 /** Short label for the channel that produces the caption the user reads. */

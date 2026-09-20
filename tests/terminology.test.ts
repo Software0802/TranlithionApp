@@ -47,6 +47,13 @@ describe("fixed renderings on a machine translation", () => {
     expect(applyTerminology("悟空来了。", [term("悟空", "Goku", "name")])).toBe("Goku来了。");
   });
 
+  it("renders a term written with dollar signs exactly as the user wrote it", () => {
+    // `$&` and friends are replacement patterns to String.replace. A price or
+    // a variable name in a glossary must reach the caption as typed.
+    expect(applyTerminology("the cost field", [term("cost", "$$")])).toBe("the $$ field");
+    expect(applyTerminology("the cost field", [term("cost", "$&")])).toBe("the $& field");
+  });
+
   it("leaves the translation alone when there is nothing to fix", () => {
     expect(applyTerminology("早上好。", [])).toBe("早上好。");
     expect(applyTerminology("早上好。", [term("Figma", "Figma")])).toBe("早上好。");

@@ -313,6 +313,22 @@ describe("meeting translation flow", () => {
     ]);
   });
 
+  it("spends no request on the opening fragment of a turn", async () => {
+    const fixture = createFixture();
+
+    await fixture.render([{ speaker: "Alice Chen", text: "So" }]);
+
+    // The recognizer's first word or two is rewritten by the next read.
+    // Translating it would cost a request per sentence for text nobody
+    // finishes reading, on the channel chosen to keep a meeting cheap.
+    expect(fixture.draftRequests).toEqual([]);
+
+    await fixture.render([{ speaker: "Alice Chen", text: "So I think we should ship." }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    expect(fixture.draftRequests).toEqual(["So I think we should ship."]);
+  });
+
   it("never finishes a meeting line on the chat model when a fast channel is the final", async () => {
     const fixture = createFixture();
     await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Let's" }]);

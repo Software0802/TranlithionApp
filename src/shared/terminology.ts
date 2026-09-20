@@ -18,7 +18,10 @@ export function applyTerminology(text: string, terminology: GlossaryEntry[]): st
     if (!source || !target || source === target) {
       continue;
     }
-    result = result.replace(termPattern(source), target);
+    // A function replacer, so a rendering the user wrote with `$` in it — a
+    // price, a variable name — reaches the caption as they wrote it instead
+    // of being read as a replacement pattern.
+    result = result.replace(termPattern(source), () => target);
   }
   return result;
 }

@@ -64,7 +64,7 @@ const MEETING_REVISE_DEBOUNCE_MS = 400;
 /** First streamed paint needs at least this many characters to avoid flashing a lone glyph. */
 const EARLY_STREAM_MIN_CHARS = 2;
 
-/** How long to wait for a source to settle before retranslating it. */
+/** How long to wait for a source to settle before translating it. */
 export function reviseDebounceMs(source: SubtitleSource): number {
   return source === "meet-dom" ? MEETING_REVISE_DEBOUNCE_MS : NETFLIX_REVISE_DEBOUNCE_MS;
 }
@@ -347,6 +347,14 @@ export class SubtitleController {
         return;
       }
       this.report("translating", "正在翻译当前字幕", cue.source);
+      if (cue.source === "meet-dom") {
+        // A recognizer opens a turn with a word or two that the next read
+        // rewrites. Translating that costs a request per sentence for text
+        // nobody finishes reading, so the first fragment waits with the rest:
+        // it is translated once it stops growing, or when it settles.
+        this.scheduleSettledTranslation(cue);
+        return;
+      }
       this.startFinalTranslation(cue, this.draftAbort.signal);
       return;
     }
@@ -398,6 +406,11 @@ export class SubtitleController {
       return;
     }
 
+    this.scheduleSettledTranslation(cue);
+  }
+
+  /** Translates this line once the source has stopped rewriting it. */
+  private scheduleSettledTranslation(cue: SubtitleCue): void {
     this.pendingReviseCue = cue;
     if (this.reviseTimer !== null) {
       window.clearTimeout(this.reviseTimer);

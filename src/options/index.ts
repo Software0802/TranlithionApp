@@ -60,6 +60,7 @@ void loadTranscriptSummary();
 
 provider.addEventListener("change", renderProviderFields);
 draftProvider.addEventListener("change", renderProviderFields);
+draftCaptions.addEventListener("change", renderProviderFields);
 meetingFinalChannel.addEventListener("change", renderProviderFields);
 sourceLanguage.addEventListener("change", renderLanguagePair);
 targetLanguage.addEventListener("change", renderLanguagePair);
@@ -161,6 +162,7 @@ function renderLanguagePair(): void {
 function renderMeetingDestination(): void {
   meetingDestination.textContent = meetingTextDestination({
     meetingFinalChannel: meetingFinalChannel.value as TranslationSettings["meetingFinalChannel"],
+    draftCaptions: draftCaptions.checked,
     draftProvider: draftProvider.value as TranslationSettings["draftProvider"],
     draftEndpointUrl: draftEndpoint.value || DEFAULT_SETTINGS.draftEndpointUrl,
     localMtUrl: localMtUrl.value || DEFAULT_SETTINGS.localMtUrl,
