@@ -377,6 +377,30 @@ describe("meeting translation flow", () => {
     expect(fixture.nativeCaptionsVisible()).toBe(false);
   });
 
+  it("sends and records nothing more once the overlay is hidden mid-queue", async () => {
+    const fixture = createFixture();
+    // The first line's answer never comes back, so the sentences behind it sit
+    // in the meeting queue — exactly where the screen-share switch finds them.
+    fixture.hold("Good morning.");
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Let's" }]);
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Let's begin. So" }]);
+    await fixture.render([
+      { speaker: "Alice Chen", text: "Good morning. Let's begin. So it goes. And" }
+    ]);
+
+    expect(fixture.draftRequests).toEqual(["Good morning."]);
+
+    fixture.setOverlayHidden(true);
+    await fixture.release("Good morning.");
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    // 「隐藏译文（共享屏幕）」 promises that no meeting text is sent and none is
+    // written from that moment, whatever was queued before the click.
+    expect(fixture.draftRequests).toEqual(["Good morning."]);
+    expect(fixture.recorded).toEqual([]);
+  });
+
   it("keeps the line already written when the recognizer corrects it after the fact", async () => {
     const fixture = createFixture();
     // The channel holds this line, so its record waits in the queue while the

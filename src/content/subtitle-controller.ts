@@ -454,13 +454,24 @@ export class SubtitleController {
    * one — and in a meeting the older one is usually a sentence that has just
    * finished and still has to reach the screen and the transcript. Speech
    * arrives a sentence at a time, so queuing costs far less than losing a line.
+   *
+   * A queued job asks again whether it may run. Pausing or hiding the overlay
+   * for a screen share stops meeting text from leaving the page, and a line
+   * that was waiting its turn when the user hit the switch has not been sent
+   * yet, so it is dropped rather than translated a second later.
    */
   private runFinalTranslation(job: () => Promise<void>): void {
     if (!this.meetingMode()) {
       void job();
       return;
     }
-    this.meetingQueue = this.meetingQueue.then(job, job).catch(() => undefined);
+    const run = async () => {
+      if (!this.settings.enabled || this.overlayHidden()) {
+        return;
+      }
+      await job();
+    };
+    this.meetingQueue = this.meetingQueue.then(run, run).catch(() => undefined);
   }
 
   private cancelReviseDebounce(): void {
@@ -775,7 +786,8 @@ export class SubtitleController {
    * D7: hand the settled bilingual line to the background worker, which owns
    * both the retention-limited transcript and the session's term memory. Only
    * meeting captions are recorded, and only while the user has the transcript
-   * switched on.
+   * switched on — a line whose translation came back after the user paused or
+   * hid the overlay is not written, however long it waited for it.
    *
    * A settled cue goes out once. A sentence the speaker really repeats is a
    * second cue and is recorded again; the same cue reaching here twice is the
@@ -783,6 +795,9 @@ export class SubtitleController {
    */
   private recordMeetingLine(cue: SubtitleCue, translation: string): void {
     if (cue.source !== "meet-dom" || !this.meetingMode()) {
+      return;
+    }
+    if (!this.settings.enabled || this.overlayHidden()) {
       return;
     }
     if (this.recordedCueIds.has(cue.id)) {

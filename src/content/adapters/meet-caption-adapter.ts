@@ -332,7 +332,10 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
     }
 
     const full = latest.block.text;
-    const corrects = full.startsWith(this.emitted) ? false : this.dropWithdrawnSegments(full);
+    const corrects = !full.startsWith(this.emitted);
+    if (corrects) {
+      this.dropWithdrawnSegments(full);
+    }
     this.blockElement = latest.element;
     this.blockText = full;
     const remainder = full.slice(this.emitted.length);
@@ -367,18 +370,16 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
    *
    * The sentences the rewrite left untouched stay published, so they are
    * neither retranslated nor recorded twice. Everything after them is put back
-   * into the open cue, and the caller is told so it can revise that cue in
-   * place instead of ending it on wording the recognizer took back.
+   * into the open cue, which the caller then revises in place instead of
+   * ending it on wording the recognizer took back.
    */
-  private dropWithdrawnSegments(full: string): boolean {
+  private dropWithdrawnSegments(full: string): void {
     let keep = this.settledEnds.length;
     while (keep > 0 && !full.startsWith(this.blockText.slice(0, this.settledEnds[keep - 1]))) {
       keep -= 1;
     }
-    const withdrew = keep < this.settledEnds.length;
     this.settledEnds = this.settledEnds.slice(0, keep);
     this.emitted = keep > 0 ? this.blockText.slice(0, this.settledEnds[keep - 1]) : "";
-    return withdrew;
   }
 
   /**
