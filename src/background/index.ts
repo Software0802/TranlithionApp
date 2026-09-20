@@ -144,6 +144,13 @@ async function handleMessage(
       if (previous.meetingTranscript && !settings.meetingTranscript) {
         await forgetMeetingRecords();
       }
+      if (
+        previous.meetingTranscriptRetentionDays !== settings.meetingTranscriptRetentionDays
+      ) {
+        // Retention is a privacy control: a window the user just shortened
+        // applies on the next wake rather than after the sweep's interval.
+        await forgetTranscriptPruneMarker();
+      }
       return { ok: true, settings };
     }
     case "GET_TAB_STATUS": {
@@ -942,6 +949,13 @@ async function pruneStoredTranscripts(): Promise<void> {
   });
 }
 
+/** Makes the next wake sweep whatever the last one left behind. */
+async function forgetTranscriptPruneMarker(): Promise<void> {
+  await queueTranscriptStorageUpdate(async () => {
+    await chrome.storage.local.remove(MEETING_TRANSCRIPT_PRUNED_AT_KEY);
+  });
+}
+
 /** Runs inside the transcript queue; never queue it again from within. */
 async function dropExpiredTranscripts(retentionDays: number): Promise<void> {
   const stored = await chrome.storage.local.get(null);
@@ -973,6 +987,7 @@ async function clearStoredTranscripts(): Promise<void> {
     if (keys.length > 0) {
       await chrome.storage.local.remove(keys);
     }
+    await chrome.storage.local.remove(MEETING_TRANSCRIPT_PRUNED_AT_KEY);
   });
   await forgetTranscriptFailures();
   await forgetMeetingRecords();

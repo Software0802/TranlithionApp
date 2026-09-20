@@ -544,6 +544,64 @@ describe("meeting translation flow", () => {
     );
   });
 
+  it("shows the finished sentence after a turn that only streamed partials", async () => {
+    const fixture = createFixture({ meetingFinalChannel: "llm", draftCaptions: false });
+    fixture.holdModel("Good morning everyone.");
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning everyone." }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+    fixture.showPartial("早上好");
+
+    // Half a sentence, on screen only to fill the blank while the model
+    // writes the rest of it.
+    expect(fixture.caption()).toBe("早上好");
+
+    await fixture.render([]);
+    await fixture.wait(3_000);
+
+    expect(fixture.caption()).toBeNull();
+
+    await fixture.releaseModel("Good morning everyone.");
+
+    // The answer is in time, and a fragment the user read is not the line
+    // having had its turn: the complete sentence still goes up.
+    expect(fixture.caption()).toBe("[llm] Good morning everyone.");
+  });
+
+  it("does not claim a newer sentence is on screen when the screen is blank", async () => {
+    const fixture = createFixture({ meetingFinalChannel: "llm", draftCaptions: false });
+
+    // Said once, so the next time these words come up they paint from local
+    // memory without waiting for the channel.
+    await fixture.render([{ speaker: "Bob Tan", text: "Thanks." }]);
+    await fixture.render([]);
+    await fixture.wait(3_000);
+
+    fixture.holdModel("Good morning.");
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning." }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    // Carol takes over: the sentence Alice finished is still being
+    // translated, and the line that replaces it is the one on screen.
+    await fixture.render([{ speaker: "Carol Diaz", text: "Thanks." }]);
+
+    expect(fixture.caption()).toBe("[llm] Thanks.");
+
+    await fixture.render([]);
+    await fixture.wait(2_600);
+
+    expect(fixture.caption()).toBeNull();
+
+    await fixture.releaseModel("Good morning.");
+
+    // The meeting went quiet and nothing is on screen at all, so the popup
+    // must not blame a next sentence nobody can see.
+    expect(fixture.caption()).toBeNull();
+    expect(fixture.statusMessages().some((message) => message.includes("没有再顶掉"))).toBe(
+      false
+    );
+  });
+
   it("says nothing about a skipped line while the user has the overlay hidden", async () => {
     const fixture = createFixture();
     fixture.hold("Good morning.");

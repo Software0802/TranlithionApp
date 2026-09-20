@@ -299,18 +299,22 @@ export function readTranscriptFailures(value: unknown): Record<string, Transcrip
 /** Where the last full retention sweep is remembered. */
 export const MEETING_TRANSCRIPT_PRUNED_AT_KEY = "meeting-transcript-pruned-at";
 
+/** The shortest gap between two full sweeps of the store. */
+export const MEETING_TRANSCRIPT_SWEEP_INTERVAL_MS = 3_600_000;
+
 /**
  * Whether the retention sweep is due again.
  *
  * The sweep reads every stored meeting to compare timestamps, and an MV3
  * worker wakes for every popup, tab close and message — several megabytes
- * re-read for nothing. Expiry is counted in whole days, so sweeping once a
- * day removes exactly the same records as sweeping on every wake.
+ * re-read for nothing. An hour between sweeps costs a record at most that
+ * much time past the window the settings page promises, and the window the
+ * user just shortened is applied at once by forgetting the marker.
  */
 export function transcriptPruneDue(lastPrunedAt: unknown, nowMs: number): boolean {
   if (typeof lastPrunedAt !== "number" || !Number.isFinite(lastPrunedAt)) {
     return true;
   }
   const sinceMs = nowMs - lastPrunedAt;
-  return sinceMs < 0 || sinceMs >= DAY_MS;
+  return sinceMs < 0 || sinceMs >= MEETING_TRANSCRIPT_SWEEP_INTERVAL_MS;
 }

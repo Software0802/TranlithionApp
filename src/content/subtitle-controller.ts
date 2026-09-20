@@ -45,6 +45,8 @@ export type CaptionTarget =
 const MIN_TRANSLATION_VISIBLE_MS = 900;
 /** Cap local text→translation memory so a long session cannot grow forever. */
 const MAX_LOCAL_TEXT_CACHE = 200;
+/** The same for the meeting lines already shown; only the recent ones matter. */
+const MAX_PAINTED_CUE_IDS = 200;
 /** Skip near-duplicate streaming paints that would make the caption shimmer. */
 const STREAM_THROTTLE_MS = 40;
 const STREAM_MIN_CHAR_DELTA = 2;
@@ -126,7 +128,12 @@ export class SubtitleController {
   private streamingPair: string | null = null;
   /** The last line that reached the overlay, newer than which nothing older paints. */
   private lastPaintedCue: SubtitleCue | null = null;
-  /** Lines the user has already read, so a late answer cannot replay one. */
+  /**
+   * Meeting lines the user has already read, so a late answer cannot replay
+   * one. A streamed partial is not one of them: it is the blank being filled
+   * while the sentence is still being written, and the answer it is standing
+   * in for has not been seen yet.
+   */
   private readonly paintedCueIds = new Set<string>();
   /** One budget per sentence, keyed by its cue. See `runFinalTranslation`. */
   private readonly meetingLineBudgets = new Map<string, MeetingLineBudget>();
@@ -902,7 +909,9 @@ export class SubtitleController {
       this.lastStreamText = text;
     }
     this.lastPaintedCue = cue;
-    this.paintedCueIds.add(cue.id);
+    if (cue.source === "meet-dom" && stage !== "streaming") {
+      this.rememberPaintedCue(cue.id);
+    }
     this.overlay.show({
       translation: text,
       original: cue.text,
@@ -949,16 +958,20 @@ export class SubtitleController {
    * Silently dropping it would leave them with a transcript row for a line
    * they never saw and no idea why.
    *
-   * Only that one cause is worth saying. A line held back because the user
-   * hid the overlay, or one they already read before its own translation
-   * came back around, was not lost to the next sentence, and claiming so
-   * would describe a meeting that did not happen.
+   * Only that one cause is worth saying, and only once it is the cause that
+   * actually applies: a line held back because the user hid the overlay, one
+   * they already read before its own translation came back around, or one
+   * dropped while the screen is blank anyway was not lost to the next
+   * sentence, and claiming so would describe a meeting that did not happen.
    */
   private reportUnshownLine(cue: SubtitleCue): void {
     if (cue.source !== "meet-dom" || !this.meetingMode()) {
       return;
     }
     if (this.overlayHidden() || !this.settings.enabled || this.paintedCueIds.has(cue.id)) {
+      return;
+    }
+    if (!this.activeCue || !this.overlay.isShowing()) {
       return;
     }
     this.report(
@@ -1122,6 +1135,18 @@ export class SubtitleController {
         break;
       }
       this.localTextCache.delete(oldest);
+    }
+  }
+
+  private rememberPaintedCue(cueId: string): void {
+    this.paintedCueIds.delete(cueId);
+    this.paintedCueIds.add(cueId);
+    while (this.paintedCueIds.size > MAX_PAINTED_CUE_IDS) {
+      const oldest = this.paintedCueIds.values().next().value;
+      if (oldest === undefined) {
+        break;
+      }
+      this.paintedCueIds.delete(oldest);
     }
   }
 

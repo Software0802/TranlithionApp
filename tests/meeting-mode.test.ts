@@ -14,6 +14,7 @@ import {
   expiredTranscriptKeys,
   isTranscriptSessionKey,
   MEETING_TRANSCRIPT_FAILURE_KEY,
+  MEETING_TRANSCRIPT_SWEEP_INTERVAL_MS,
   retainedTranscriptFailures,
   summarizeTranscripts,
   transcriptPruneDue,
@@ -406,14 +407,14 @@ describe("local meeting transcript", () => {
 });
 
 describe("how often the retention sweep reads the whole store", () => {
-  it("sweeps once a day rather than on every worker wake", () => {
+  it("sweeps once an hour rather than on every worker wake", () => {
     const now = 100 * DAY_MS;
 
     // An MV3 worker wakes for every popup and message; re-reading every
-    // stored meeting each time buys nothing, because expiry is counted in
-    // whole days.
+    // stored meeting each time buys nothing, while an hour between sweeps
+    // keeps a record at most that long past the promised window.
     expect(transcriptPruneDue(now - 60_000, now)).toBe(false);
-    expect(transcriptPruneDue(now - DAY_MS, now)).toBe(true);
+    expect(transcriptPruneDue(now - MEETING_TRANSCRIPT_SWEEP_INTERVAL_MS, now)).toBe(true);
   });
 
   it("sweeps when it has never swept, or when the clock moved backwards", () => {
