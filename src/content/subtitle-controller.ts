@@ -1,7 +1,7 @@
 import type { ExtensionMessage } from "../shared/messages";
 import { safeRuntimeSendMessage } from "../shared/extension-context";
 import { languageLabel } from "../shared/language";
-import { isMeetingModeActive } from "../shared/meeting";
+import { isMeetingModeActive, meetingLineBudgetMs } from "../shared/meeting";
 import { isCueWithinPlaybackWindow } from "../shared/subtitle";
 import {
   shouldReplaceCaption,
@@ -443,7 +443,7 @@ export class SubtitleController {
     }
     // Fast draft + model final when no single channel is configured.
     void this.showDraftTranslation(cue, signal);
-    this.runFinalTranslation(() => this.translateActiveCue(cue));
+    this.runFinalTranslation((lineSignal) => this.translateActiveCue(cue, lineSignal));
   }
 
   /**
@@ -459,8 +459,13 @@ export class SubtitleController {
    * for a screen share stops meeting text from leaving the page, and a line
    * that was waiting its turn when the user hit the switch has not been sent
    * yet, so it is dropped rather than translated a second later.
+   *
+   * Each job also gets its channel's budget. One line may cost itself, never
+   * the whole conversation: when the budget runs out the queue moves on, the
+   * user is told, and the answer — if it ever comes — is no longer shown or
+   * recorded as if it were the line being spoken now.
    */
-  private runFinalTranslation(job: () => Promise<void>): void {
+  private runFinalTranslation(job: (signal?: AbortSignal) => Promise<void>): void {
     if (!this.meetingMode()) {
       void job();
       return;
@@ -469,9 +474,29 @@ export class SubtitleController {
       if (!this.settings.enabled || this.overlayHidden()) {
         return;
       }
-      await job();
+      const budgetMs = meetingLineBudgetMs(this.settings.meetingFinalChannel);
+      const line = new AbortController();
+      const budgetTimer = window.setTimeout(() => line.abort(), budgetMs);
+      try {
+        await Promise.race([
+          job(line.signal).catch(() => undefined),
+          whenAborted(line.signal)
+        ]);
+      } finally {
+        window.clearTimeout(budgetTimer);
+      }
+      if (line.signal.aborted) {
+        this.setMeetingChannelBroken(true);
+        this.report("error", this.meetingBudgetMessage(budgetMs), "meet-dom");
+      }
     };
     this.meetingQueue = this.meetingQueue.then(run, run).catch(() => undefined);
+  }
+
+  private meetingBudgetMessage(budgetMs: number): string {
+    const label =
+      this.settings.meetingFinalChannel === "llm" ? "大模型" : this.singleChannelLabel();
+    return `${label}：这一句 ${Math.round(budgetMs / 1000)} 秒内没有答复，已跳过，以免后面的句子跟着堵住。`;
   }
 
   private cancelReviseDebounce(): void {
@@ -628,10 +653,13 @@ export class SubtitleController {
         return;
       }
       if (!text) {
-        if (this.activeCue?.id !== cue.id) {
+        // A channel that cannot answer is a fact about the channel, not about
+        // the cue that happened to ask: the strip comes back and the user is
+        // told even when the line is long gone from the screen.
+        this.setMeetingChannelBroken(true);
+        if (this.activeCue?.id !== cue.id && !this.meetingMode()) {
           return;
         }
-        this.setMeetingChannelBroken(true);
         this.report("error", this.singleChannelFailureMessage(), cue.source);
         return;
       }
@@ -693,7 +721,7 @@ export class SubtitleController {
     if (this.singleChannel()) {
       return;
     }
-    this.runFinalTranslation(() => this.translateActiveCue(cue));
+    this.runFinalTranslation((signal) => this.translateActiveCue(cue, signal));
   }
 
   private async showDraftTranslation(cue: SubtitleCue, signal: AbortSignal): Promise<void> {
@@ -795,9 +823,12 @@ export class SubtitleController {
     }
     // Whatever is translating this sentence must survive the next cue-start.
     this.draftAbort = null;
-    this.runFinalTranslation(async () => {
+    this.runFinalTranslation(async (signal) => {
       if (!this.localTextCache.has(cue.text)) {
-        await this.translateSettledLine(cue);
+        await this.translateSettledLine(cue, signal);
+      }
+      if (signal?.aborted) {
+        return;
       }
       const translation = this.localTextCache.get(cue.text);
       if (translation) {
@@ -806,7 +837,7 @@ export class SubtitleController {
     });
   }
 
-  private async translateSettledLine(cue: SubtitleCue): Promise<void> {
+  private async translateSettledLine(cue: SubtitleCue, signal?: AbortSignal): Promise<void> {
     if (this.destroyed || !this.settings.enabled) {
       return;
     }
@@ -820,7 +851,7 @@ export class SubtitleController {
       // model is the silent fallback meeting mode promises not to make.
       return;
     }
-    await this.translateActiveCue(cue);
+    await this.translateActiveCue(cue, signal);
   }
 
   /**
@@ -945,7 +976,7 @@ export class SubtitleController {
     void this.draftTranslator?.prepare();
   }
 
-  private async translateActiveCue(cue: SubtitleCue): Promise<void> {
+  private async translateActiveCue(cue: SubtitleCue, signal?: AbortSignal): Promise<void> {
     try {
       const response = await this.requestTranslation(cue);
       if (this.destroyed) {
@@ -953,15 +984,28 @@ export class SubtitleController {
       }
       if (response.ok && response.translation) {
         this.rememberLocalTranslation(cue.text, response.translation.text);
+        this.setMeetingChannelBroken(false);
+      }
+      if (signal?.aborted) {
+        // Over the line's budget: the meeting moved on without it, and the
+        // queue has already said so. Showing or recording it now would date
+        // the transcript and the screen to a sentence nobody is still on.
+        return;
       }
       if (!isCueWithinPlaybackWindow(cue, this.clock.nowMs())) {
         return;
       }
       if (!response.ok || !response.translation) {
+        const message = response.error?.message ?? "翻译服务暂时不可用。";
+        // The meeting's only translator just failed, so Meet's own captions
+        // come back whether or not this line is still the one on screen.
+        this.setMeetingChannelBroken(true);
         if (this.activeCue?.id !== cue.id) {
+          if (this.meetingMode()) {
+            this.report("error", message, cue.source);
+          }
           return;
         }
-        const message = response.error?.message ?? "翻译服务暂时不可用。";
         // A local draft is a usable translation. Replacing it with an error would
         // throw away readable text the viewer is already following.
         if (this.activeCueStage === "draft" || this.activeCueStage === "streaming") {
@@ -1024,6 +1068,13 @@ export class SubtitleController {
   ): void {
     this.reportStatus({ state, message, source, latencyMs, updatedAt: Date.now() });
   }
+}
+
+/** Settles when the budget runs out, so the queue stops waiting on the line. */
+function whenAborted(signal: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
 }
 
 function isYouTubePage(): boolean {

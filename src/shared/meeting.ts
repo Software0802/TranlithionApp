@@ -23,9 +23,21 @@ export const MEETING_CONTENT_SCRIPT_ID = "tranlithion-meeting-hosts";
  * When a channel *is* the caption there is nothing slower waiting behind it,
  * so it is worth more than a draft's budget — but meeting jobs run one at a
  * time, so an answer that never comes has to cost this line rather than every
- * line after it. One rule for all three channels, stated once.
+ * line after it. One rule for all three machine-translation channels.
  */
 export const MEETING_FINAL_CHANNEL_TIMEOUT_MS = 4_000;
+
+/**
+ * The chat model reads context and writes a whole sentence, so holding it to a
+ * machine-translation hop's budget would drop lines it was about to answer.
+ * It still gets a budget: the queue is shared with everything said next.
+ */
+export const MEETING_LLM_CHANNEL_TIMEOUT_MS = 8_000;
+
+/** How long the configured channel may take before a meeting line is dropped. */
+export function meetingLineBudgetMs(channel: MeetingFinalChannel): number {
+  return channel === "llm" ? MEETING_LLM_CHANNEL_TIMEOUT_MS : MEETING_FINAL_CHANNEL_TIMEOUT_MS;
+}
 
 export function isMeetingHost(hostname: string): boolean {
   const normalized = hostname.toLocaleLowerCase();

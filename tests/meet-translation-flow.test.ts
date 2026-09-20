@@ -6,6 +6,7 @@ import {
   MeetCaptionAdapter
 } from "../src/content/adapters/meet-caption-adapter";
 import type { SubtitleAdapterEvent } from "../src/content/adapters/types";
+import { MEETING_LLM_CHANNEL_TIMEOUT_MS } from "../src/shared/meeting";
 import { SubtitleController } from "../src/content/subtitle-controller";
 import {
   appendTranscriptLine,
@@ -14,6 +15,7 @@ import {
 import { DEFAULT_SETTINGS, publicSettings } from "../src/shared/settings";
 import type {
   PublicTranslationSettings,
+  RuntimeStatus,
   SubtitleCue,
   TranslationResponse
 } from "../src/shared/types";
@@ -66,6 +68,8 @@ function createFixture(overrides: Partial<PublicTranslationSettings> = {}) {
   const draftRequests: string[] = [];
   const modelRequests: string[] = [];
   const recorded: RecordedLine[] = [];
+  /** Everything the popup was told, newest last. */
+  const statuses: RuntimeStatus[] = [];
   /** Source lines the channel refuses to translate. */
   const draftFailures: string[] = [];
   /** Source lines whose answer is held until the test releases it. */
@@ -178,13 +182,13 @@ function createFixture(overrides: Partial<PublicTranslationSettings> = {}) {
         if (message.type === "DRAFT_TRANSLATE") {
           const text = String(message.text);
           draftRequests.push(text);
-          if (draftFailures.includes(text)) {
-            return { ok: false };
-          }
           if (heldSources.has(text)) {
             return new Promise((resolve) => {
               heldAnswers.set(text, resolve);
             });
+          }
+          if (draftFailures.includes(text)) {
+            return { ok: false };
           }
           return { ok: true, text: `[zh] ${text}` };
         }
@@ -242,7 +246,9 @@ function createFixture(overrides: Partial<PublicTranslationSettings> = {}) {
         inFlightModel = { text: cue.text, resolve };
       });
     },
-    () => undefined
+    (status: RuntimeStatus) => {
+      statuses.push(status);
+    }
   );
   controller.start();
 
@@ -308,10 +314,16 @@ function createFixture(overrides: Partial<PublicTranslationSettings> = {}) {
     },
     async release(source: string) {
       heldSources.delete(source);
-      heldAnswers.get(source)?.({ ok: true, text: `[zh] ${source}` });
+      heldAnswers.get(source)?.(
+        draftFailures.includes(source) ? { ok: false } : { ok: true, text: `[zh] ${source}` }
+      );
       heldAnswers.delete(source);
       await vi.advanceTimersByTimeAsync(0);
     },
+    /** The last thing the popup was told. */
+    lastStatus: () => statuses[statuses.length - 1],
+    /** Every failure the popup was told about, in order. */
+    errors: () => statuses.filter((status) => status.state === "error").map((s) => s.message),
     async render(turns: Turn[]) {
       rebuild(turns);
       if (notifyMutation) {
@@ -501,6 +513,45 @@ describe("meeting translation flow", () => {
     // 「隐藏译文（共享屏幕）」 promises that no meeting text is sent and none is
     // written from that moment, whatever was queued before the click.
     expect(fixture.draftRequests).toEqual(["Good morning."]);
+    expect(fixture.recorded).toEqual([]);
+  });
+
+  it("says so and gives Meet's captions back when a slow channel fails", async () => {
+    const fixture = createFixture();
+    // A hung channel: it takes its time and then answers with nothing, by
+    // which point the line it was translating is no longer the one on screen.
+    fixture.hold("Good morning.");
+    fixture.hold("Let's");
+    fixture.draftFailures.push("Good morning.");
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Let's" }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS);
+
+    expect(fixture.nativeCaptionsVisible()).toBe(false);
+
+    await fixture.release("Good morning.");
+
+    expect(fixture.nativeCaptionsVisible()).toBe(true);
+    expect(fixture.lastStatus()?.state).toBe("error");
+  });
+
+  it("drops a meeting line the chat model does not answer inside its budget", async () => {
+    const fixture = createFixture({ meetingFinalChannel: "llm" });
+    fixture.holdModel("Good morning.");
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Let's" }]);
+    await fixture.wait(MEETING_LLM_CHANNEL_TIMEOUT_MS + TICK_MS);
+
+    // Over budget: the user is told, and the queue moved on rather than
+    // letting one line hold up everything said after it.
+    expect(fixture.errors().some((message) => message.includes("8 秒"))).toBe(true);
+    expect(fixture.modelRequests).toContain("Let's");
+
+    await fixture.releaseModel("Good morning.");
+
+    // A call is minutes past that sentence by now: it is neither shown nor
+    // written to the transcript as if it were the line being spoken.
+    expect(fixture.caption()).not.toBe("[llm] Good morning.");
     expect(fixture.recorded).toEqual([]);
   });
 
