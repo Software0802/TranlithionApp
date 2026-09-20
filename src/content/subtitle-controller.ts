@@ -69,6 +69,13 @@ export function reviseDebounceMs(source: SubtitleSource): number {
   return source === "meet-dom" ? MEETING_REVISE_DEBOUNCE_MS : NETFLIX_REVISE_DEBOUNCE_MS;
 }
 
+/** What one meeting sentence is allowed to spend, and what came of it. */
+interface MeetingLineBudget {
+  controller: AbortController;
+  deadlineAt: number;
+  answered: boolean;
+}
+
 /**
  * Sources whose captions replace each other in place. The overlay never blanks
  * between two of their cues: the previous translation stays until the next one
@@ -115,10 +122,7 @@ export class SubtitleController {
   /** Settled cues already handed to the transcript, so each is recorded once. */
   private readonly recordedCueIds = new Set<string>();
   /** One budget per sentence, keyed by its cue. See `runFinalTranslation`. */
-  private readonly meetingLineBudgets = new Map<
-    string,
-    { controller: AbortController; deadlineAt: number }
-  >();
+  private readonly meetingLineBudgets = new Map<string, MeetingLineBudget>();
 
   constructor(
     readonly target: CaptionTarget,
@@ -513,6 +517,9 @@ export class SubtitleController {
         await job().catch(() => undefined);
         return;
       }
+      if (budget.answered) {
+        return;
+      }
       const remainingMs = budget.deadlineAt - this.clock.nowMs();
       if (remainingMs <= 0) {
         this.expireMeetingLine(budget.controller, budgetMs, line);
@@ -530,22 +537,29 @@ export class SubtitleController {
       } finally {
         window.clearTimeout(budgetTimer);
       }
+      budget.answered = !budget.controller.signal.aborted;
     };
     this.meetingQueue = this.meetingQueue.then(run, run).catch(() => undefined);
   }
 
-  /** The one deadline this sentence gets, however often it reaches the queue. */
-  private meetingLineBudget(
-    line: SubtitleCue | undefined,
-    budgetMs: number
-  ): { controller: AbortController; deadlineAt: number } {
+  /**
+   * The one deadline this sentence gets, however often it reaches the queue,
+   * and what became of it.
+   *
+   * `answered` is what the channel said — a translation or a refusal the user
+   * was already told about. Either way the line's outcome is settled, so a
+   * later job for it neither asks again nor lets the deadline it no longer
+   * needs contradict the answer the user has.
+   */
+  private meetingLineBudget(line: SubtitleCue | undefined, budgetMs: number): MeetingLineBudget {
     const known = line ? this.meetingLineBudgets.get(line.id) : undefined;
     if (known) {
       return known;
     }
-    const budget = {
+    const budget: MeetingLineBudget = {
       controller: new AbortController(),
-      deadlineAt: this.clock.nowMs() + budgetMs
+      deadlineAt: this.clock.nowMs() + budgetMs,
+      answered: false
     };
     if (line) {
       this.meetingLineBudgets.set(line.id, budget);

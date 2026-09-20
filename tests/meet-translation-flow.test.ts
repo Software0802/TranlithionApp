@@ -619,6 +619,27 @@ describe("meeting translation flow", () => {
     expect(fixture.errors().some((message) => message.includes("已跳过"))).toBe(false);
   });
 
+  it("tells the user once about a line the channel refused straight away", async () => {
+    const fixture = createFixture();
+    fixture.draftFailures.push("Good morning.");
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning." }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    expect(fixture.errors()).toHaveLength(1);
+
+    // Alice holds the line on screen past its budget and only then stops, so
+    // the settled sentence reaches the queue after the deadline. Its outcome
+    // was decided in 200 ms: nothing here may claim it went unanswered.
+    await fixture.wait(MEETING_FINAL_CHANNEL_TIMEOUT_MS + TICK_MS);
+    await fixture.render([]);
+    await fixture.wait(3_000);
+
+    expect(fixture.errors()).toHaveLength(1);
+    expect(fixture.errors().some((message) => message.includes("已跳过"))).toBe(false);
+    expect(fixture.draftRequests).toEqual(["Good morning."]);
+  });
+
   it("gives one sentence one budget however often it reaches the queue", async () => {
     const fixture = createFixture();
     fixture.hold("Good morning.");
