@@ -214,7 +214,7 @@
             <label for="meeting-final-channel">会议译文通道</label>
             <select id="meeting-final-channel" name="meeting-final-channel">
               <option value="fast-mt">机器翻译通道（DeepL / 自定义，推荐）</option>
-              <option value="local-mt">本机 LibreTranslate（不出本机）</option>
+              <option value="local-mt">本机 LibreTranslate（回环地址时不出本机）</option>
               <option value="llm">大模型主译（更贵更慢，可选增强）</option>
             </select>
             <p class="hint">
@@ -271,6 +271,9 @@
             <h2 id="local-mt-heading">本机翻译（全页 / 选区）</h2>
             <p>
               网页全文与选中文字走本机 LibreTranslate；视频字幕仍用上方 DeepL / 主服务。
+              上面的会议模式也可以把它选作会议译文通道：文本是否留在这台电脑，取决于下面填的地址
+              是不是回环地址（<code>localhost</code> / <code>127.x</code> / <code>::1</code>），
+              以「会议文本的去向」那一行为准。
               启动说明见仓库 <code>docs/local-libretranslate.md</code>。
             </p>
           </div>
