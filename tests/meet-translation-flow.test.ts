@@ -2,8 +2,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   MEET_CAPTION_SETTLE_DELAY_MS,
   MEET_NATIVE_HIDE_STYLE_ID,
-  MEET_REGION_POLL_INTERVAL_MS
+  MEET_REGION_POLL_INTERVAL_MS,
+  MeetCaptionAdapter
 } from "../src/content/adapters/meet-caption-adapter";
+import type { SubtitleAdapterEvent } from "../src/content/adapters/types";
 import { SubtitleController } from "../src/content/subtitle-controller";
 import {
   appendTranscriptLine,
@@ -40,8 +42,6 @@ interface RecordedLine {
   source: string;
   translation: string;
   speaker?: string;
-  cueId: string;
-  retractedCueIds?: string[];
 }
 
 interface FakeNode {
@@ -162,14 +162,29 @@ function createFixture() {
           recorded.push({
             source: cue.text,
             translation: String(message.translation),
-            speaker: cue.speaker,
-            cueId: cue.id,
-            retractedCueIds: message.retractedCueIds as string[] | undefined
+            speaker: cue.speaker
           });
         }
         return undefined;
       }
     }
+  });
+
+  /** The controller's own handler for adapter events, and the ends it saw. */
+  let deliver: ((event: SubtitleAdapterEvent) => void) | null = null;
+  const cueEnds: SubtitleAdapterEvent[] = [];
+  const startAdapter = MeetCaptionAdapter.prototype.start;
+  vi.spyOn(MeetCaptionAdapter.prototype, "start").mockImplementation(function (
+    this: MeetCaptionAdapter,
+    onEvent: (event: SubtitleAdapterEvent) => void
+  ) {
+    deliver = onEvent;
+    startAdapter.call(this, (event) => {
+      if (event.type === "cue-end") {
+        cueEnds.push(event);
+      }
+      onEvent(event);
+    });
   });
 
   const settings: PublicTranslationSettings = {
@@ -239,6 +254,11 @@ function createFixture() {
     hold(source: string) {
       heldSources.add(source);
     },
+    /** Hands the controller the cue-end it just saw a second time. */
+    async redeliverLastCueEnd() {
+      deliver?.(cueEnds[cueEnds.length - 1]);
+      await vi.advanceTimersByTimeAsync(0);
+    },
     async release(source: string) {
       heldSources.delete(source);
       heldAnswers.get(source)?.({ ok: true, text: `[zh] ${source}` });
@@ -275,6 +295,7 @@ describe("meeting translation flow", () => {
   afterEach(() => {
     vi.useRealTimers();
     vi.unstubAllGlobals();
+    vi.restoreAllMocks();
   });
 
   it("translates and records a sentence the next one replaces in the same read", async () => {
@@ -356,10 +377,10 @@ describe("meeting translation flow", () => {
     expect(fixture.nativeCaptionsVisible()).toBe(false);
   });
 
-  it("carries a retraction to the correction even when it lands mid-translation", async () => {
+  it("keeps the line already written when the recognizer corrects it after the fact", async () => {
     const fixture = createFixture();
     // The channel holds this line, so its record waits in the queue while the
-    // recognizer takes the same sentence back.
+    // recognizer rewrites the same sentence.
     fixture.hold("Hi everyone.");
 
     await fixture.render([{ speaker: "Alice Chen", text: "Hi everyone." }]);
@@ -368,65 +389,39 @@ describe("meeting translation flow", () => {
     await fixture.release("Hi everyone.");
     await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
 
-    // Folding what was recorded through the real store is the outcome that
-    // matters: the withdrawn wording must not survive in the D7 transcript.
-    expect(storedSources(fixture.recorded)).toEqual(["Hey everyone."]);
+    // A line that reached the record stays in it: the transcript holds the
+    // wording that was heard and the correction beside it, and never reaches
+    // back to delete or rewrite what is already written.
+    expect(storedSources(fixture.recorded)).toEqual(["Hi everyone.", "Hey everyone."]);
   });
 
-  it("keeps a recorded line when a never-recorded sentence is taken back", async () => {
+  it("records a sentence the speaker really says twice as two lines", async () => {
     const fixture = createFixture();
     await fixture.render([{ speaker: "Alice Chen", text: "Okay." }]);
-    await fixture.render([
-      { speaker: "Alice Chen", text: "Okay." },
-      { speaker: "Bob Tan", text: "Okay." }
-    ]);
-    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
-
-    // Bob's turn opened on a sentence boundary, so that cue is still open and
-    // has never been recorded. The recognizer now corrects it — a take-back
-    // of something the transcript never held, which must not reach back and
-    // delete Alice's line just because it reads the same.
-    await fixture.render([
-      { speaker: "Alice Chen", text: "Okay." },
-      { speaker: "Bob Tan", text: "Okey." }
-    ]);
     await fixture.render([]);
-    await fixture.wait(2_400);
+    await fixture.wait(2_000);
 
-    expect(storedSources(fixture.recorded)).toEqual(["Okay.", "Okey."]);
+    // Said again, in a new turn. Two sentences were spoken, so the record has
+    // two lines — identical wording is not a sign of a repeat to be folded.
+    await fixture.render([{ speaker: "Alice Chen", text: "Okay." }]);
+    await fixture.render([]);
+    await fixture.wait(2_000);
+
+    expect(storedSources(fixture.recorded)).toEqual(["Okay.", "Okay."]);
   });
 
-  it("keeps a recorded line a take-back from the hidden window would have deleted", async () => {
+  it("records a settled cue once when its end arrives twice", async () => {
     const fixture = createFixture();
-    await fixture.render([{ speaker: "Alice Chen", text: "Okay." }]);
-    await fixture.render([
-      { speaker: "Alice Chen", text: "Okay." },
-      { speaker: "Bob Tan", text: "Okay." }
-    ]);
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning everyone." }]);
     await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
-
-    // Screen share: nothing is shown and nothing is recorded from here.
-    fixture.setOverlayHidden(true);
-    await fixture.render([
-      { speaker: "Alice Chen", text: "Okay." },
-      { speaker: "Bob Tan", text: "Okay, so about the budget." }
-    ]);
-    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
-
-    fixture.setOverlayHidden(false);
-    await fixture.render([
-      { speaker: "Alice Chen", text: "Okay." },
-      { speaker: "Bob Tan", text: "Okay, so about the budget." },
-      { speaker: "Carol Diaz", text: "Thanks." }
-    ]);
     await fixture.render([]);
-    await fixture.wait(2_400);
+    await fixture.wait(1_800);
 
-    // Bob's withdrawn "Okay." was never recorded — it was taken back while
-    // the overlay was hidden. Carrying that take-back out of the hidden
-    // window would delete the only "Okay." in the transcript, which is
-    // Alice's, and she really did say it.
-    expect(storedSources(fixture.recorded)).toEqual(["Okay.", "Thanks."]);
+    // The same end again, while the line is still the one on screen. One cue
+    // settled, so it is written once however often it is handed over.
+    await fixture.redeliverLastCueEnd();
+
+    expect(storedSources(fixture.recorded)).toEqual(["Good morning everyone."]);
   });
 });
 
@@ -441,9 +436,7 @@ function storedSources(recorded: RecordedLine[]): string[] | undefined {
         atMs: 1_000 + index,
         speaker: line.speaker ?? null,
         source: line.source,
-        translation: line.translation,
-        cueId: line.cueId,
-        retractedCueIds: line.retractedCueIds
+        translation: line.translation
       }),
     null
   );

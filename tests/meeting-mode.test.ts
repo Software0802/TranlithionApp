@@ -31,7 +31,6 @@ function lineInput(overrides: Partial<Parameters<typeof appendTranscriptLine>[1]
     speaker: "Alice Chen",
     source: "Good morning.",
     translation: "早上好。",
-    cueId: "meet-dom:1000:open:aaa",
     ...overrides
   };
 }
@@ -234,8 +233,7 @@ describe("local meeting transcript", () => {
         atMs: 1_000,
         speaker: "Alice Chen",
         source: "Good morning.",
-        translation: "早上好。",
-        cueId: "meet-dom:1000:open:aaa"
+        translation: "早上好。"
       }
     ]);
     expect(meeting?.title).toBe("Weekly sync");
@@ -249,13 +247,33 @@ describe("local meeting transcript", () => {
     expect(isTranscriptSessionKey("translation-settings")).toBe(false);
   });
 
-  it("does not record the same line twice when a revision settles unchanged", () => {
-    const once = appendTranscriptLine(null, lineInput());
-    const twice = appendTranscriptLine(once, lineInput({ atMs: 1_400 }));
+  it("records a repeated sentence twice rather than folding it into one line", () => {
+    // People repeat themselves, and "Okay." said twice was said twice. Only
+    // the caller knows whether two lines are two cues, so the store never
+    // second-guesses that from the wording.
+    const once = appendTranscriptLine(null, lineInput({ source: "Okay.", translation: "好的。" }));
+    const twice = appendTranscriptLine(
+      once,
+      lineInput({ source: "Okay.", translation: "好的。", atMs: 1_400 })
+    );
 
-    expect(twice?.lines).toHaveLength(1);
-    // Unchanged: the caller skips the storage write entirely.
-    expect(twice).toBe(once);
+    expect(twice?.lines.map((line) => line.source)).toEqual(["Okay.", "Okay."]);
+  });
+
+  it("keeps a line already written when a later one corrects its wording", () => {
+    // The recognizer rewrites sentences it has already shown. What reached the
+    // record was heard; the correction lands beside it, and nothing stored is
+    // deleted or rewritten after the fact.
+    const heard = appendTranscriptLine(null, lineInput({ source: "Hi everyone." }));
+    const corrected = appendTranscriptLine(
+      heard,
+      lineInput({ source: "Hey everyone.", atMs: 1_400 })
+    );
+
+    expect(corrected?.lines.map((line) => line.source)).toEqual([
+      "Hi everyone.",
+      "Hey everyone."
+    ]);
   });
 
   it("records the same words again when a different person says them", () => {
@@ -265,107 +283,6 @@ describe("local meeting transcript", () => {
     );
 
     expect(meeting?.lines).toHaveLength(2);
-  });
-
-  it("replaces a line the recognizer took back rather than keeping both", () => {
-    const withdrawn = appendTranscriptLine(
-      null,
-      lineInput({ source: "Hi everyone.", cueId: "cue-a" })
-    );
-    const corrected = appendTranscriptLine(
-      withdrawn,
-      lineInput({
-        source: "Hey everyone.",
-        atMs: 1_400,
-        cueId: "cue-b",
-        retractedCueIds: ["cue-a"]
-      })
-    );
-
-    expect(corrected?.lines.map((line) => line.source)).toEqual(["Hey everyone."]);
-  });
-
-  it("takes back the line the withdrawn cue produced, not one that reads alike", () => {
-    // Two people saying "Okay." in the same meeting is two things said, and a
-    // recognizer take-back names a cue, not a sentence.
-    const alice = appendTranscriptLine(
-      null,
-      lineInput({ source: "Okay.", translation: "好的。", cueId: "alice-1" })
-    );
-    const bob = appendTranscriptLine(
-      alice,
-      lineInput({
-        source: "Okay.",
-        translation: "好的。",
-        speaker: "Bob Tan",
-        atMs: 1_400,
-        cueId: "bob-1"
-      })
-    );
-    const corrected = appendTranscriptLine(
-      bob,
-      lineInput({
-        source: "Okay, so about the budget.",
-        translation: "好，说说预算。",
-        speaker: "Bob Tan",
-        atMs: 1_800,
-        cueId: "bob-2",
-        retractedCueIds: ["bob-1"]
-      })
-    );
-
-    expect(corrected?.lines.map((line) => [line.speaker, line.source])).toEqual([
-      ["Alice Chen", "Okay."],
-      ["Bob Tan", "Okay, so about the budget."]
-    ]);
-  });
-
-  it("takes back nothing when the withdrawn cue was never recorded", () => {
-    // A sentence the recognizer rewrote before its cue ever settled reached
-    // the screen but never the transcript. It has no line to supersede, and
-    // an earlier line that happens to read the same is not it.
-    const alice = appendTranscriptLine(
-      null,
-      lineInput({ source: "Okay.", translation: "好的。", cueId: "alice-1" })
-    );
-    const corrected = appendTranscriptLine(
-      alice,
-      lineInput({
-        source: "Okey.",
-        translation: "好的。",
-        speaker: "Bob Tan",
-        atMs: 1_400,
-        cueId: "bob-2",
-        retractedCueIds: ["bob-1-never-recorded"]
-      })
-    );
-
-    expect(corrected?.lines.map((line) => [line.speaker, line.source])).toEqual([
-      ["Alice Chen", "Okay."],
-      ["Bob Tan", "Okey."]
-    ]);
-  });
-
-  it("takes back a line that is no longer the last one", () => {
-    const first = appendTranscriptLine(null, lineInput({ source: "Hi all.", cueId: "cue-1" }));
-    const second = appendTranscriptLine(
-      first,
-      lineInput({ source: "Let's begin.", atMs: 1_400, cueId: "cue-2" })
-    );
-    const third = appendTranscriptLine(
-      second,
-      lineInput({
-        source: "Hey all.",
-        atMs: 1_800,
-        cueId: "cue-3",
-        retractedCueIds: ["cue-1"]
-      })
-    );
-
-    expect(third?.lines.map((line) => line.source)).toEqual([
-      "Let's begin.",
-      "Hey all."
-    ]);
   });
 
   it("ignores a line with nothing on one side of it", () => {

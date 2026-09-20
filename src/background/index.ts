@@ -345,8 +345,8 @@ async function rememberTranslation(
   const settings = await getSettings();
   if (cue.source === "meet-dom") {
     // Writing a spoken line is what makes a session a call — including when
-    // the write re-creates a session a retraction has just deleted, which
-    // must still be a call the next retraction can reach.
+    // the write re-creates a session a withdrawal of consent has just
+    // deleted, which must still be a call the next withdrawal can reach.
     sessionStore.markMeetingSession(sessionId);
   }
   if (!keepsSpokenRecord(settings, cue.source)) {
@@ -438,7 +438,6 @@ async function recordMeetingLine(
     title: string;
     cue: SubtitleCue;
     translation: string;
-    retractedCueIds?: string[];
   },
   tabId?: number
 ): Promise<{ ok: boolean }> {
@@ -491,9 +490,7 @@ async function recordMeetingLine(
       atMs: Date.now(),
       speaker: message.cue.speaker ?? null,
       source: message.cue.text,
-      translation,
-      cueId: message.cue.id,
-      retractedCueIds: message.retractedCueIds
+      translation
     });
     if (!next || next === current) {
       return;
@@ -525,7 +522,6 @@ async function meetingTranscriptSummary(): Promise<MeetingTranscriptResponse> {
     summary: {
       sessions: sessions.length,
       lines: sessions.reduce((total, session) => total + session.lines.length, 0),
-      updatedAtMs: sessions[0]?.updatedAtMs ?? null,
       retentionDays: settings.meetingTranscriptRetentionDays
     }
   };

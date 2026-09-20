@@ -181,10 +181,8 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
   private blockText = "";
   /** Prefix of this turn already published as a finished segment. */
   private emitted = "";
-  /** Each finished segment published from this block, oldest first. */
-  private settledSegments: { end: number; text: string; cueId: string | null }[] = [];
-  /** Cues the recognizer withdrew, not yet reported. */
-  private retracted: string[] = [];
+  /** End offset of each finished segment published from this block, oldest first. */
+  private settledEnds: number[] = [];
   /** The published segment ended a sentence, so new words open a new cue. */
   private segmentClosed = false;
   /** Clock reading when the region last had text in it. */
@@ -237,8 +235,7 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
     this.blockElement = null;
     this.blockText = "";
     this.emitted = "";
-    this.settledSegments = [];
-    this.retracted = [];
+    this.settledEnds = [];
     this.segmentClosed = false;
     this.callback = null;
   }
@@ -335,7 +332,7 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
     }
 
     const full = latest.block.text;
-    const withdrawn = full.startsWith(this.emitted) ? [] : this.dropWithdrawnSegments(full);
+    const corrects = full.startsWith(this.emitted) ? false : this.dropWithdrawnSegments(full);
     this.blockElement = latest.element;
     this.blockText = full;
     const remainder = full.slice(this.emitted.length);
@@ -344,7 +341,6 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
       return;
     }
 
-    const corrects = withdrawn.length > 0;
     const leading = remainder.length - pending.length;
     const cut = settledSegmentEnd(pending);
     if (cut <= 0) {
@@ -354,10 +350,8 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
 
     const settled = pending.slice(0, cut).trim();
     this.emitted = full.slice(0, this.emitted.length + leading + cut);
-    const segment = { end: this.emitted.length, text: settled, cueId: null as string | null };
-    this.settledSegments.push(segment);
+    this.settledEnds.push(this.emitted.length);
     this.publish(settled, corrects);
-    segment.cueId = this.currentCue?.id ?? null;
     // The sentence is complete, so whatever the speaker says next is a new
     // line rather than a revision of this one.
     this.segmentClosed = true;
@@ -372,26 +366,19 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
    * already shown.
    *
    * The sentences the rewrite left untouched stay published, so they are
-   * neither retranslated nor recorded twice. Everything after them was
-   * withdrawn: the cues it went out as are reported so the correction can
-   * name exactly the lines it supersedes.
+   * neither retranslated nor recorded twice. Everything after them is put back
+   * into the open cue, and the caller is told so it can revise that cue in
+   * place instead of ending it on wording the recognizer took back.
    */
-  private dropWithdrawnSegments(full: string): string[] {
-    let keep = this.settledSegments.length;
-    while (
-      keep > 0 &&
-      !full.startsWith(this.blockText.slice(0, this.settledSegments[keep - 1].end))
-    ) {
+  private dropWithdrawnSegments(full: string): boolean {
+    let keep = this.settledEnds.length;
+    while (keep > 0 && !full.startsWith(this.blockText.slice(0, this.settledEnds[keep - 1]))) {
       keep -= 1;
     }
-    const withdrawn = this.settledSegments
-      .slice(keep)
-      .map((segment) => segment.cueId)
-      .filter((cueId): cueId is string => cueId !== null);
-    this.settledSegments = this.settledSegments.slice(0, keep);
-    this.emitted = keep > 0 ? this.blockText.slice(0, this.settledSegments[keep - 1].end) : "";
-    this.retracted.push(...withdrawn);
-    return withdrawn;
+    const withdrew = keep < this.settledEnds.length;
+    this.settledEnds = this.settledEnds.slice(0, keep);
+    this.emitted = keep > 0 ? this.blockText.slice(0, this.settledEnds[keep - 1]) : "";
+    return withdrew;
   }
 
   /**
@@ -468,8 +455,7 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
         type: "cue-revise",
         source: this.source,
         cue: revised,
-        previousCueId,
-        ...this.takeRetracted()
+        previousCueId
       });
       return;
     }
@@ -480,17 +466,7 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
     }
     this.segmentClosed = false;
     this.currentCue = cue;
-    this.emit({ type: "cue-start", source: this.source, cue, ...this.takeRetracted() });
-  }
-
-  /** Withdrawn cues to report with the correction that replaces them. */
-  private takeRetracted(): { retractedCueIds?: string[] } {
-    if (this.retracted.length === 0) {
-      return {};
-    }
-    const retractedCueIds = this.retracted;
-    this.retracted = [];
-    return { retractedCueIds };
+    this.emit({ type: "cue-start", source: this.source, cue });
   }
 
   private createCue(text: string, startMs: number): SubtitleCue | null {
@@ -510,7 +486,7 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
     this.blockElement = null;
     this.blockText = "";
     this.emitted = "";
-    this.settledSegments = [];
+    this.settledEnds = [];
     this.segmentClosed = false;
   }
 

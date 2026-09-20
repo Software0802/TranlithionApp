@@ -49,8 +49,6 @@ export type ExtensionMessage =
       title: string;
       cue: SubtitleCue;
       translation: string;
-      /** Cues the recognizer withdrew; this line is their correction. */
-      retractedCueIds?: string[];
     }
   | { type: "GET_MEETING_TRANSCRIPTS" }
   | { type: "CLEAR_MEETING_TRANSCRIPTS" }
@@ -59,8 +57,6 @@ export type ExtensionMessage =
 export interface MeetingTranscriptSummary {
   sessions: number;
   lines: number;
-  /** Epoch ms of the newest recorded line, or null when nothing is stored. */
-  updatedAtMs: number | null;
   retentionDays: number;
 }
 

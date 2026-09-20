@@ -112,8 +112,8 @@ export class SubtitleController {
   private readonly settleAbort = new AbortController();
   /** The meeting's only channel answered with nothing. */
   private meetingChannelBroken = false;
-  /** Cues the recognizer withdrew since the last line reached the transcript. */
-  private retractedCueIds: string[] = [];
+  /** Settled cues already handed to the transcript, so each is recorded once. */
+  private readonly recordedCueIds = new Set<string>();
 
   constructor(
     readonly target: CaptionTarget,
@@ -180,12 +180,6 @@ export class SubtitleController {
     ) {
       // Cached text is keyed by source text alone, so it is wrong for the new pair.
       this.localTextCache.clear();
-    }
-    if (!settings.enabled || this.overlayHidden()) {
-      // From here nothing is recorded, so a take-back still waiting for a
-      // line to carry it would land on whatever is recorded after the user
-      // comes back.
-      this.retractedCueIds = [];
     }
     if (!settings.enabled) {
       this.overlay.hide();
@@ -265,35 +259,14 @@ export class SubtitleController {
       return;
     }
     if (event.type === "cue-start") {
-      this.noteRetraction(event.retractedCueIds);
       this.handleCueStart(event.cue);
       return;
     }
     if (event.type === "cue-revise") {
-      this.noteRetraction(event.retractedCueIds);
       this.handleCueRevise(event.cue, event.previousCueId);
       return;
     }
     this.handleCueEnd(event.source, event.cueId);
-  }
-
-  /**
-   * Wording the recognizer took back. Whatever settles next carries it to the
-   * transcript, which drops the withdrawn line if it had already stored one.
-   *
-   * Nothing settles while translation is paused or the overlay is hidden for
-   * a screen share, so a take-back noted then has no line of its own to
-   * supersede — it would travel to whatever is recorded after the user comes
-   * back and delete a line that really was spoken.
-   */
-  private noteRetraction(retractedCueIds: string[] | undefined): void {
-    if (!this.settings.enabled || this.overlayHidden()) {
-      this.retractedCueIds = [];
-      return;
-    }
-    if (retractedCueIds?.length) {
-      this.retractedCueIds.push(...retractedCueIds);
-    }
   }
 
   private handleAvailabilityChange(event: Extract<SubtitleAdapterEvent, { type: "availability" }>): void {
@@ -770,18 +743,13 @@ export class SubtitleController {
     }
     // Whatever is translating this sentence must survive the next cue-start.
     this.draftAbort = null;
-    // Taken now, not when the record runs: the record waits behind this
-    // line's translation, and a retraction arriving in that window belongs to
-    // the correction that follows, never to the line being settled.
-    const retractedCueIds = this.retractedCueIds;
-    this.retractedCueIds = [];
     this.runFinalTranslation(async () => {
       if (!this.localTextCache.has(cue.text)) {
         await this.translateSettledLine(cue);
       }
       const translation = this.localTextCache.get(cue.text);
       if (translation) {
-        this.recordMeetingLine(cue, translation, retractedCueIds);
+        this.recordMeetingLine(cue, translation);
       }
     });
   }
@@ -808,23 +776,26 @@ export class SubtitleController {
    * both the retention-limited transcript and the session's term memory. Only
    * meeting captions are recorded, and only while the user has the transcript
    * switched on.
+   *
+   * A settled cue goes out once. A sentence the speaker really repeats is a
+   * second cue and is recorded again; the same cue reaching here twice is the
+   * same thing said once.
    */
-  private recordMeetingLine(
-    cue: SubtitleCue,
-    translation: string,
-    retractedCueIds: string[]
-  ): void {
+  private recordMeetingLine(cue: SubtitleCue, translation: string): void {
     if (cue.source !== "meet-dom" || !this.meetingMode()) {
       return;
     }
+    if (this.recordedCueIds.has(cue.id)) {
+      return;
+    }
+    this.recordedCueIds.add(cue.id);
     void safeRuntimeSendMessage({
       type: "RECORD_MEETING_LINE",
       sessionId: this.sessionId,
       host: location.hostname,
       title: document.title,
       cue,
-      translation,
-      ...(retractedCueIds.length > 0 ? { retractedCueIds } : {})
+      translation
     } satisfies ExtensionMessage);
   }
 

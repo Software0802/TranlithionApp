@@ -67,9 +67,6 @@ function createFixture() {
   );
 
   const events: string[] = [];
-  const retractions: string[][] = [];
-  /** The cue each published text went out as, so a test can name it back. */
-  const cueIds = new Map<string, string>();
   const availability: boolean[] = [];
   const adapter = new MeetCaptionAdapter(clock);
   adapter.start((event: SubtitleAdapterEvent) => {
@@ -82,12 +79,6 @@ function createFixture() {
       events.push(`revise:${event.cue.speaker ?? "-"}|${event.cue.text}`);
     } else if (event.type === "cue-end") {
       events.push("end");
-    }
-    if (event.type === "cue-start" || event.type === "cue-revise") {
-      cueIds.set(event.cue.text, event.cue.id);
-    }
-    if (event.type !== "availability" && event.type !== "cue-end" && event.retractedCueIds) {
-      retractions.push(event.retractedCueIds);
     }
   });
 
@@ -120,8 +111,6 @@ function createFixture() {
   return {
     adapter,
     events,
-    retractions,
-    cueIdOf: (text: string) => cueIds.get(text),
     availability,
     region,
     /** A strip whose rows none of the adapter's selectors can read. */
@@ -313,8 +302,7 @@ describe("Meet cue lifecycle", () => {
 
     // Same block, corrected after it had already been punctuated. Ending the
     // open cue here would hand "Hi everyone." to the translator and the
-    // transcript as if it had been spoken, so the line is replaced and the
-    // withdrawn wording is reported with its correction.
+    // transcript as if it had been spoken, so the line is replaced in place.
     await fixture.render([{ speaker: "Alice Chen", text: "Hey everyone. Let's" }]);
 
     expect(fixture.events).toEqual([
@@ -322,7 +310,6 @@ describe("Meet cue lifecycle", () => {
       "end",
       "start:Alice Chen|Let's"
     ]);
-    expect(fixture.retractions).toEqual([[fixture.cueIdOf("Hi everyone.")]]);
   });
 
   it("keeps the sentences a correction did not touch", async () => {
@@ -330,14 +317,12 @@ describe("Meet cue lifecycle", () => {
     await fixture.render([{ speaker: "Alice Chen", text: "One." }]);
     await fixture.render([{ speaker: "Alice Chen", text: "One. Two." }]);
     fixture.events.length = 0;
-    fixture.retractions.length = 0;
 
     // Only the last sentence was rewritten. The one before it stays published:
     // re-publishing it would translate and record the same words twice.
     await fixture.render([{ speaker: "Alice Chen", text: "One. Two, and three." }]);
 
     expect(fixture.events).toEqual(["revise:Alice Chen|Two, and three."]);
-    expect(fixture.retractions).toEqual([[fixture.cueIdOf("Two.")]]);
   });
 
   it("hides Meet's own strip only once it has read a caption out of it", async () => {

@@ -27,8 +27,6 @@ export interface MeetingTranscriptLine {
   speaker: string | null;
   source: string;
   translation: string;
-  /** The cue this line came from; what a later correction names to take it back. */
-  cueId?: string;
 }
 
 export interface MeetingTranscriptSession {
@@ -50,17 +48,6 @@ export interface MeetingTranscriptInput {
   speaker?: string | null;
   source: string;
   translation: string;
-  cueId: string;
-  /**
-   * Cues the recognizer withdrew. A live caption rewrites sentences it has
-   * already finished, and the transcript is a record of what was said, not of
-   * every attempt at hearing it, so a stored line the correction supersedes is
-   * dropped rather than kept beside it.
-   *
-   * These are cue ids, never wording: two people saying "Okay." in one meeting
-   * said two things, and taking one back must not delete the other.
-   */
-  retractedCueIds?: string[];
 }
 
 export function transcriptSessionKey(sessionId: string): string {
@@ -78,6 +65,11 @@ export function isTranscriptSessionKey(key: string): boolean {
  * to write, so the caller can skip the storage round-trip. Never mutates: an
  * accidental in-place edit of the read value would silently diverge from what
  * is persisted.
+ *
+ * A stored line is never taken back or rewritten, and identical wording is not
+ * treated as a repeat of the line above it: a meeting says "Okay." many times,
+ * and each of them was said. Recording a settled cue exactly once is the
+ * caller's job, not something guessed at from the text.
  */
 export function appendTranscriptLine(
   session: MeetingTranscriptSession | null,
@@ -93,23 +85,9 @@ export function appendTranscriptLine(
     atMs: input.atMs,
     speaker: input.speaker?.trim() || null,
     source,
-    translation,
-    cueId: input.cueId
+    translation
   };
-  const kept = withoutRetracted(session?.lines ?? [], input.retractedCueIds);
-  // The same line can be re-recorded when a revision settles to identical
-  // text; recording it twice would double every repeated phrase in the export.
-  const previous = kept[kept.length - 1];
-  const duplicate =
-    previous !== undefined &&
-    previous.source === line.source &&
-    previous.translation === line.translation &&
-    previous.speaker === line.speaker;
-  if (duplicate && session && kept === session.lines) {
-    return session;
-  }
-
-  const lines = duplicate ? kept : [...kept, line];
+  const lines = [...(session?.lines ?? []), line];
   return {
     sessionId: input.sessionId,
     host: session?.host ?? input.host,
@@ -167,21 +145,6 @@ export function readTranscriptSessions(
     .filter((session): session is MeetingTranscriptSession => session !== null);
 }
 
-function withoutRetracted(
-  lines: MeetingTranscriptLine[],
-  retractedCueIds: string[] | undefined
-): MeetingTranscriptLine[] {
-  if (!retractedCueIds?.length) {
-    return lines;
-  }
-  // A withdrawn cue can only ever take back the line that cue itself produced.
-  // A cue that was never recorded — a sentence the recognizer rewrote before
-  // it ever settled — names nothing here and takes nothing with it.
-  const withdrawn = new Set(retractedCueIds);
-  const kept = lines.filter((line) => line.cueId === undefined || !withdrawn.has(line.cueId));
-  return kept.length === lines.length ? lines : kept;
-}
-
 function isTranscriptSession(value: unknown): value is MeetingTranscriptSession {
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     return false;
@@ -207,7 +170,6 @@ function isTranscriptLine(value: unknown): value is MeetingTranscriptLine {
     Number.isFinite(line.atMs) &&
     (line.speaker === null || typeof line.speaker === "string") &&
     typeof line.source === "string" &&
-    typeof line.translation === "string" &&
-    (line.cueId === undefined || typeof line.cueId === "string")
+    typeof line.translation === "string"
   );
 }
