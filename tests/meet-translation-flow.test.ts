@@ -558,6 +558,40 @@ describe("meeting translation flow", () => {
     expect(fixture.recorded).toEqual([]);
   });
 
+  it("gives one sentence one budget however often it reaches the queue", async () => {
+    const fixture = createFixture();
+    fixture.hold("Good morning.");
+
+    // Asked for once when it stops growing, and again when its cue ends and
+    // it has to be recorded — one sentence, one deadline.
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning." }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+    await fixture.render([]);
+    await fixture.wait(MEETING_FINAL_CHANNEL_TIMEOUT_MS + TICK_MS);
+
+    expect(fixture.draftRequests).toEqual(["Good morning."]);
+    expect(fixture.errors()).toHaveLength(1);
+
+    await fixture.release("Good morning.");
+
+    expect(fixture.recorded).toEqual([]);
+  });
+
+  it("keeps a painted draft when the model runs over budget", async () => {
+    const fixture = createFixture({ meetingFinalChannel: "llm" });
+    fixture.holdModel("Good morning everyone.");
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning everyone." }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + MEETING_LLM_CHANNEL_TIMEOUT_MS + TICK_MS);
+
+    // The draft is a real translation and the user is reading it: the model
+    // giving up behind it is not a line they lost, so nothing contradicts
+    // what is on screen and Meet's own strip stays out of the way.
+    expect(fixture.caption()).toBe("[zh] Good morning everyone.");
+    expect(fixture.nativeCaptionsVisible()).toBe(false);
+    expect(fixture.errors()).toEqual([]);
+  });
+
   it("counts the wait in the queue against a line's budget", async () => {
     const fixture = createFixture();
     fixture.hold("Good morning.");

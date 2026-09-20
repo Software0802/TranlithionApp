@@ -114,6 +114,11 @@ export class SubtitleController {
   private meetingChannelBroken = false;
   /** Settled cues already handed to the transcript, so each is recorded once. */
   private readonly recordedCueIds = new Set<string>();
+  /** One budget per sentence, keyed by its cue. See `runFinalTranslation`. */
+  private readonly meetingLineBudgets = new Map<
+    string,
+    { controller: AbortController; deadlineAt: number }
+  >();
 
   constructor(
     readonly target: CaptionTarget,
@@ -438,14 +443,16 @@ export class SubtitleController {
     const single = this.singleChannel();
     if (single) {
       // One network hop only: the fast channel is the caption the user reads.
-      this.runFinalTranslation((lineSignal) =>
-        this.translateWithSingleChannel(cue, single, untilEither(signal, lineSignal))
+      this.runFinalTranslation(
+        (lineSignal) =>
+          this.translateWithSingleChannel(cue, single, untilEither(signal, lineSignal)),
+        cue
       );
       return;
     }
     // Fast draft + model final when no single channel is configured.
     void this.showDraftTranslation(cue, signal);
-    this.runFinalTranslation((lineSignal) => this.translateActiveCue(cue, lineSignal));
+    this.runFinalTranslation((lineSignal) => this.translateActiveCue(cue, lineSignal), cue);
   }
 
   /**
@@ -462,11 +469,12 @@ export class SubtitleController {
    * that was waiting its turn when the user hit the switch has not been sent
    * yet, so it is dropped rather than translated a second later.
    *
-   * Each job also gets its channel's budget, counted from the moment it joins
-   * the queue: waiting its turn ages a line exactly as much as a slow channel
-   * does. One line may cost itself, never the whole conversation — when the
-   * budget runs out the queue moves on, the user is told, and the answer, if
-   * it ever comes, is no longer shown or recorded as the line being spoken.
+   * The budget belongs to the sentence, not to the job. A sentence reaches
+   * the queue twice — once when it stops growing and again when its cue ends
+   * and it has to be recorded — and it gets one deadline, set when it first
+   * joined the queue, so waiting its turn ages it exactly as much as a slow
+   * channel does. One line may cost itself, never the whole conversation, and
+   * a line already given up on is not asked for a second time.
    *
    * A job that owns no caption — a context refresh behind a line already on
    * screen — is abandoned in silence: nothing was skipped that the user can
@@ -474,40 +482,87 @@ export class SubtitleController {
    */
   private runFinalTranslation(
     job: (signal?: AbortSignal) => Promise<void>,
-    produces: "caption" | "context" = "caption"
+    line?: SubtitleCue
   ): void {
     if (!this.meetingMode()) {
       void job();
       return;
     }
     const budgetMs = meetingLineBudgetMs(this.settings.meetingFinalChannel);
-    const line = new AbortController();
-    const budgetTimer = window.setTimeout(() => {
-      line.abort();
-      if (produces !== "caption" || this.destroyed) {
-        return;
-      }
-      if (!this.settings.enabled || this.overlayHidden()) {
-        return;
-      }
-      this.setMeetingChannelBroken(true);
-      this.report("error", this.meetingBudgetMessage(budgetMs), "meet-dom");
-    }, budgetMs);
+    const budget = this.meetingLineBudget(line, budgetMs);
     const run = async () => {
-      if (line.signal.aborted || !this.settings.enabled || this.overlayHidden()) {
-        window.clearTimeout(budgetTimer);
+      if (budget.controller.signal.aborted || !this.settings.enabled || this.overlayHidden()) {
         return;
       }
+      const remainingMs = budget.deadlineAt - this.clock.nowMs();
+      if (remainingMs <= 0) {
+        this.expireMeetingLine(budget.controller, budgetMs, line);
+        return;
+      }
+      const budgetTimer = window.setTimeout(
+        () => this.expireMeetingLine(budget.controller, budgetMs, line),
+        remainingMs
+      );
       try {
         await Promise.race([
-          job(line.signal).catch(() => undefined),
-          whenAborted(line.signal)
+          job(budget.controller.signal).catch(() => undefined),
+          whenAborted(budget.controller.signal)
         ]);
       } finally {
         window.clearTimeout(budgetTimer);
       }
     };
     this.meetingQueue = this.meetingQueue.then(run, run).catch(() => undefined);
+  }
+
+  /** The one deadline this sentence gets, however often it reaches the queue. */
+  private meetingLineBudget(
+    line: SubtitleCue | undefined,
+    budgetMs: number
+  ): { controller: AbortController; deadlineAt: number } {
+    const known = line ? this.meetingLineBudgets.get(line.id) : undefined;
+    if (known) {
+      return known;
+    }
+    const budget = {
+      controller: new AbortController(),
+      deadlineAt: this.clock.nowMs() + budgetMs
+    };
+    if (line) {
+      this.meetingLineBudgets.set(line.id, budget);
+    }
+    return budget;
+  }
+
+  /**
+   * Gives up on a line that ran out of budget, and says so once.
+   *
+   * Only once, and only when the user has nothing to read for it: a line the
+   * channel answered in time still owes the transcript its row, and a line
+   * already showing a draft is on screen and readable — putting Meet's own
+   * strip back over it and calling it skipped would contradict what the user
+   * is looking at.
+   */
+  private expireMeetingLine(
+    controller: AbortController,
+    budgetMs: number,
+    line?: SubtitleCue
+  ): void {
+    if (controller.signal.aborted || this.destroyed) {
+      return;
+    }
+    if (line && this.localTextCache.has(line.text)) {
+      return;
+    }
+    controller.abort();
+    if (!line || !this.settings.enabled || this.overlayHidden()) {
+      return;
+    }
+    if (this.activeCue?.id === line.id && this.activeCueStage !== "none") {
+      return;
+    }
+    this.setMeetingChannelBroken(true);
+    this.report("error", this.meetingBudgetMessage(budgetMs), "meet-dom");
   }
 
   private meetingBudgetMessage(budgetMs: number): string {
@@ -742,7 +797,7 @@ export class SubtitleController {
     if (this.singleChannel()) {
       return;
     }
-    this.runFinalTranslation((signal) => this.translateActiveCue(cue, signal), "context");
+    this.runFinalTranslation((signal) => this.translateActiveCue(cue, signal));
   }
 
   private async showDraftTranslation(cue: SubtitleCue, signal: AbortSignal): Promise<void> {
@@ -855,7 +910,7 @@ export class SubtitleController {
       if (translation) {
         this.recordMeetingLine(cue, translation);
       }
-    });
+    }, cue);
   }
 
   private async translateSettledLine(cue: SubtitleCue, signal?: AbortSignal): Promise<void> {
