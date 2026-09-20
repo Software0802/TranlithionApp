@@ -136,7 +136,7 @@ async function handleMessage(
       permissionCache = null;
       await chrome.storage.local.set({ [SETTINGS_STORAGE_KEY]: settings });
       if (previous.meetingTranscript && !settings.meetingTranscript) {
-        await forgetSpokenRecords();
+        await forgetMeetingRecords();
       }
       return { ok: true, settings };
     }
@@ -245,6 +245,9 @@ async function translateCue(
     settings.sourceLanguage,
     settings.targetLanguage
   );
+  if (request.cue.source === "meet-dom") {
+    sessionStore.markMeetingSession(request.sessionId);
+  }
 
   // Live captions that rewrite themselves: only the newest line is worth
   // finishing, and repeats hit the text cache instead of the network.
@@ -368,6 +371,10 @@ async function draftTranslate(
     return { ok: false };
   }
   sessionStore.useLanguagePair(sessionId, settings.sourceLanguage, settings.targetLanguage);
+  if (asFinal) {
+    // Only meeting mode asks this channel to be the caption itself.
+    sessionStore.markMeetingSession(sessionId);
+  }
 
   // As the caption itself this channel carries a whole meeting, where the same
   // sentence comes round again and again. What the session already learned is
@@ -437,6 +444,7 @@ async function recordMeetingLine(
     settings.sourceLanguage,
     settings.targetLanguage
   );
+  sessionStore.markMeetingSession(message.sessionId);
 
   // Speaker names are exactly the proper nouns a meeting keeps repeating, so
   // they join the session's term memory and reach every channel's rendering.
@@ -531,6 +539,7 @@ async function translatePlain(
   }
   if (sessionId) {
     sessionStore.useLanguagePair(sessionId, settings.sourceLanguage, settings.targetLanguage);
+    sessionStore.markMeetingSession(sessionId);
   }
   const remembered = sessionId ? sessionStore.getCachedByText(sessionId, text) : undefined;
   if (remembered) {
@@ -940,20 +949,30 @@ async function clearStoredTranscripts(): Promise<void> {
       await chrome.storage.local.remove(keys);
     }
   });
-  await forgetSpokenRecords();
+  await forgetMeetingRecords();
 }
 
 /**
- * Consent withdrawn: what was said stops being remembered anywhere, including
- * the snapshot that carries a session across a worker sleep. The terms the
- * calls taught stay for as long as the worker lives; the sentences and the
- * names that said them are gone, in a call still running as much as in one
+ * Consent withdrawn: nothing said in a call is remembered anywhere any more,
+ * including the snapshot that carries it across a worker sleep, and including
+ * the names of who said it. A call still running forgets as much as one
  * already over.
+ *
+ * Only calls. An episode being translated in another tab keeps its context
+ * and its caches: it was never the thing consent was given for.
  */
-async function forgetSpokenRecords(): Promise<void> {
-  sessionStore.forgetSpokenLines();
+async function forgetMeetingRecords(): Promise<void> {
+  sessionStore.forgetMeetingSessions();
   await queueContextStorageUpdate(async () => {
-    await chrome.storage.session.remove(SESSION_CONTEXT_STORAGE_KEY);
+    const stored = await chrome.storage.session.get(SESSION_CONTEXT_STORAGE_KEY);
+    const sessions = readPersistedSessions(stored[SESSION_CONTEXT_STORAGE_KEY]);
+    const kept = Object.fromEntries(
+      Object.entries(sessions).filter(([, session]) => session.meeting !== true)
+    );
+    if (Object.keys(kept).length === Object.keys(sessions).length) {
+      return;
+    }
+    await chrome.storage.session.set({ [SESSION_CONTEXT_STORAGE_KEY]: kept });
   });
 }
 

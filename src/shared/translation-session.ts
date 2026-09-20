@@ -13,6 +13,8 @@ interface SessionMemory {
   cachedByText: Map<string, TranslationResult>;
   /** The language pair everything remembered here was translated for. */
   pair: string | null;
+  /** This session is a call, so withdrawing consent to a record retracts it. */
+  meeting: boolean;
   lastTouchedAt: number;
 }
 
@@ -20,6 +22,7 @@ export interface PersistedTranslationSession {
   recent: ContextLine[];
   entityHints: EntityHint[];
   pair?: string;
+  meeting?: boolean;
   lastTouchedAt: number;
 }
 
@@ -48,6 +51,15 @@ export class TranslationSessionStore {
       session.cachedByText.clear();
     }
     session.pair = pair;
+  }
+
+  /**
+   * Marks a session as a call. Only these are retracted when the user
+   * withdraws consent to a record of one — an episode being translated in
+   * another tab is not a meeting and keeps its context and its caches.
+   */
+  markMeetingSession(sessionId: string): void {
+    this.getSession(sessionId).meeting = true;
   }
 
   getContext(sessionId: string): ContextLine[] {
@@ -144,6 +156,7 @@ export class TranslationSessionStore {
       recent: session.recent.map((line) => ({ ...line })),
       entityHints: session.entityHints.map((hint) => ({ ...hint })),
       ...(session.pair ? { pair: session.pair } : {}),
+      ...(session.meeting ? { meeting: true } : {}),
       lastTouchedAt: session.lastTouchedAt
     };
   }
@@ -160,6 +173,7 @@ export class TranslationSessionStore {
       cached: new Map(),
       cachedByText: new Map(),
       pair: typeof value.pair === "string" ? value.pair : null,
+      meeting: value.meeting === true,
       lastTouchedAt: Number.isFinite(value.lastTouchedAt) ? value.lastTouchedAt : Date.now()
     });
     this.prune();
@@ -170,18 +184,21 @@ export class TranslationSessionStore {
   }
 
   /**
-   * Drops every sentence any session is holding — the context, the per-cue
-   * results and the repeat memory — and keeps only the terms they taught.
+   * Forgets every call a worker is holding — the lines, the caches, and the
+   * names the call registered along the way. A speaker's display name is part
+   * of the record of who said what, not a term the user taught us, so it goes
+   * with the rest; what the user typed into the glossary lives in settings
+   * and is untouched.
    *
-   * A user who withdraws consent to a record of a call loses the record, not
-   * their glossary, and loses it in the call still running rather than only
-   * in the next one.
+   * Sessions that are not calls are left exactly as they are: withdrawing
+   * consent to a meeting record must not cost an episode its context window
+   * mid-playback.
    */
-  forgetSpokenLines(): void {
-    for (const session of this.sessions.values()) {
-      session.recent = [];
-      session.cached.clear();
-      session.cachedByText.clear();
+  forgetMeetingSessions(): void {
+    for (const [sessionId, session] of this.sessions) {
+      if (session.meeting) {
+        this.sessions.delete(sessionId);
+      }
     }
   }
 
@@ -233,6 +250,7 @@ export class TranslationSessionStore {
       cached: new Map(),
       cachedByText: new Map(),
       pair: null,
+      meeting: false,
       lastTouchedAt: Date.now()
     };
     this.sessions.set(sessionId, session);

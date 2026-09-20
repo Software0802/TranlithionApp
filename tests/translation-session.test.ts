@@ -89,23 +89,49 @@ describe("translation session memory", () => {
     expect(woken.getContext("session")).toHaveLength(1);
   });
 
-  it("drops every sentence but keeps the terms when consent is withdrawn", () => {
+  it("forgets a call completely when consent is withdrawn", () => {
     // Unchecking the transcript mid-call, or clearing the records, has to
-    // take back what is already remembered — including the snapshot that
-    // would otherwise outlive the call.
+    // take back what is already remembered — the lines, the caches, and the
+    // name of whoever said them, which is part of the record of the call and
+    // not a term the user taught us.
     const store = new TranslationSessionStore();
-    store.useLanguagePair("session", "ja", "zh-CN");
-    store.record("session", cue("cue-1", "こんにちは"), result("你好。", "悟空"));
+    store.useLanguagePair("call", "ja", "zh-CN");
+    store.markMeetingSession("call");
+    store.record("call", cue("cue-1", "こんにちは"), result("你好。", "Alice Chen"));
 
-    store.forgetSpokenLines();
+    store.forgetMeetingSessions();
 
-    expect(store.getContext("session")).toEqual([]);
-    expect(store.snapshot("session")?.recent).toEqual([]);
-    expect(store.getCached("session", "cue-1")).toBeUndefined();
-    expect(store.getCachedByText("session", "こんにちは")).toBeUndefined();
-    expect(store.getEntityHints("session")).toEqual([
+    expect(store.getContext("call")).toEqual([]);
+    expect(store.getCached("call", "cue-1")).toBeUndefined();
+    expect(store.getCachedByText("call", "こんにちは")).toBeUndefined();
+    expect(store.getEntityHints("call")).toEqual([]);
+  });
+
+  it("leaves an episode playing in another tab exactly as it was", () => {
+    const store = new TranslationSessionStore();
+    store.useLanguagePair("film", "ja", "zh-CN");
+    store.record("film", cue("cue-1", "こんにちは"), result("你好。", "悟空"));
+
+    store.forgetMeetingSessions();
+
+    expect(store.getContext("film")).toHaveLength(1);
+    expect(store.getCachedByText("film", "こんにちは")?.text).toBe("你好。");
+    expect(store.getEntityHints("film")).toEqual([
       { source: "悟空", target: "悟空", kind: "name" }
     ]);
+  });
+
+  it("still knows a restored session was a call after the worker slept", () => {
+    const store = new TranslationSessionStore();
+    store.useLanguagePair("call", "ja", "zh-CN");
+    store.markMeetingSession("call");
+    store.record("call", cue("cue-1", "こんにちは"), result("你好。"));
+
+    const woken = new TranslationSessionStore();
+    woken.restore("call", store.snapshot("call"));
+    woken.forgetMeetingSessions();
+
+    expect(woken.getContext("call")).toEqual([]);
   });
 
   it("answers a repeat from a channel that has no cue to key on", () => {

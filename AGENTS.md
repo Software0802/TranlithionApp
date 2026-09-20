@@ -41,7 +41,7 @@ Manifest V3 Chrome 扩展：在 YouTube / Netflix / Google Meet 等页已显示�
 - 设置页「保存并测试」与「授权并启用 meet.google.com」会申请可选 host 权限：UI 须让用户看清目标域名。Meet 始终是 optional host，未授权前不注册内容脚本。
 - 会议模式与会议本机记录**默认关闭**（`DEFAULT_SETTINGS.meetingMode` / `meetingTranscript` 为 false）：读会议字幕、写本机记录都必须由用户亲自勾选，已有的全站 host 授权不得代替这个同意。
 - 会议本机记录（`chrome.storage.local`，一场会议一个 `meeting-transcript:<sessionId>` 键）保留 7 天并自动过期；单行写入不得改写整库。写入失败要如实告知用户，不能静默丢弃。设置页必须写清会议文本发往哪个服务、存多久、如何清除。不得在文档或 UI 中声称「完全不留痕」。
-- 未勾选本机记录时，会话记忆**只在内存里留术语/重复句**：不得把原话或发言人姓名写进任何 `chrome.storage`（含 `storage.session` 的会话上下文）。这条对大模型通道同样成立，判定见 `keepsSpokenRecord`。取消勾选或清除会议记录时要**当场作废**已记下的原话（`forgetSpokenLines` + 删 `storage.session` 上下文）。会议三个机器翻译通道都先读会话记忆再发请求；它们不收术语表，由通道自己用 `applyTerminology`（严格大小写、仅 `asFinal`）把用户译名替换回译文——影视页草稿不得被改写。
+- 未勾选本机记录时，会话记忆**只在内存里留术语/重复句**：不得把原话或发言人姓名写进任何 `chrome.storage`（含 `storage.session` 的会话上下文）。这条对大模型通道同样成立，判定见 `keepsSpokenRecord`。取消勾选或清除会议记录时要**当场作废**这场会话记下的原话与发言人姓名（`forgetMeetingSessions` + 从 `storage.session` 上下文里剔除会议会话）；**只动会议会话**，别把影视标签页的上下文/缓存一起清掉（会话来源标在 `PersistedTranslationSession.meeting`）。取消勾选不删已写入的本机记录——那要按「立即清除全部会议记录」或等保留期到。会议三个机器翻译通道都先读会话记忆再发请求；它们不收术语表，由通道自己用 `applyTerminology`（严格大小写、仅 `asFinal`）把用户译名替换回译文——影视页草稿不得被改写。
 - 会话记忆按语言对隔离（`TranslationSessionStore.useLanguagePair`）：中途改语言对必须整块作废，旧目标语的缓存/上下文/译名不得当成新语言的结果。
 - 文档与提交中禁止真实 Key；示例用占位符。
 
