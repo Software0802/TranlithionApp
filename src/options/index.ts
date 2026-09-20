@@ -5,6 +5,7 @@ import {
   sampleSourceText
 } from "../shared/language";
 import { MEETING_HOST_PERMISSIONS, meetingTextDestination } from "../shared/meeting";
+import { describeTranscriptSummary } from "../shared/meeting-transcript";
 import type {
   ExtensionMessage,
   MeetingTranscriptResponse,
@@ -381,15 +382,14 @@ async function loadTranscriptSummary(): Promise<void> {
       type: "GET_MEETING_TRANSCRIPTS"
     } satisfies ExtensionMessage)) as MeetingTranscriptResponse;
     const summary = response.summary;
-    if (!summary || summary.sessions === 0) {
+    if (!summary) {
       transcriptSummary.dataset.state = "success";
       transcriptSummary.textContent = "本机当前没有保存任何会议记录。";
       return;
     }
-    transcriptSummary.dataset.state = "success";
-    transcriptSummary.textContent =
-      `本机保存了 ${summary.sessions} 场会议、共 ${summary.lines} 行；` +
-      `超过 ${summary.retentionDays} 天的记录会自动删除。`;
+    const described = describeTranscriptSummary(summary);
+    transcriptSummary.dataset.state = described.state;
+    transcriptSummary.textContent = described.text;
   } catch {
     transcriptSummary.dataset.state = "error";
     transcriptSummary.textContent = "无法读取会议记录状态。";

@@ -13,6 +13,8 @@
  * each of them would spend megabytes of serialization on one sentence.
  */
 
+import type { MeetingTranscriptSummary } from "./messages";
+
 /** One meeting per key: `meeting-transcript:<sessionId>`. */
 export const MEETING_TRANSCRIPT_KEY_PREFIX = "meeting-transcript:";
 
@@ -172,4 +174,56 @@ function isTranscriptLine(value: unknown): value is MeetingTranscriptLine {
     typeof line.source === "string" &&
     typeof line.translation === "string"
   );
+}
+
+/** A meeting the browser refused to write, and why it refused. */
+export interface TranscriptFailure {
+  reason: string;
+  atMs: number;
+}
+
+/** What is stored, and what stopped being stored. */
+export function summarizeTranscripts(input: {
+  sessions: MeetingTranscriptSession[];
+  failures: TranscriptFailure[];
+  retentionDays: number;
+}): MeetingTranscriptSummary {
+  const newest = input.failures.reduce<TranscriptFailure | null>(
+    (latest, failure) => (!latest || failure.atMs > latest.atMs ? failure : latest),
+    null
+  );
+  return {
+    sessions: input.sessions.length,
+    lines: input.sessions.reduce((total, session) => total + session.lines.length, 0),
+    retentionDays: input.retentionDays,
+    stopped: newest ? { meetings: input.failures.length, reason: newest.reason } : null
+  };
+}
+
+/**
+ * The settings page's one line about the local records.
+ *
+ * A meeting that stopped being recorded is said here rather than only in the
+ * live status the next caption overwrites, and it is said even when nothing
+ * was stored at all — a first write that never landed is exactly the case the
+ * user would otherwise never hear about.
+ */
+export function describeTranscriptSummary(
+  summary: MeetingTranscriptSummary
+): { state: "success" | "error"; text: string } {
+  const stored =
+    summary.sessions === 0
+      ? "本机当前没有保存任何会议记录。"
+      : `本机保存了 ${summary.sessions} 场会议、共 ${summary.lines} 行；` +
+        `超过 ${summary.retentionDays} 天的记录会自动删除。`;
+  if (!summary.stopped) {
+    return { state: "success", text: stored };
+  }
+  return {
+    state: "error",
+    text:
+      `${stored}有 ${summary.stopped.meetings} 场会议中途写入失败` +
+      `（${summary.stopped.reason}），从那一刻起没有再被记录。` +
+      "清除会议记录可以腾出空间并重新开始记录。"
+  };
 }

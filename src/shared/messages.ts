@@ -58,6 +58,12 @@ export interface MeetingTranscriptSummary {
   sessions: number;
   lines: number;
   retentionDays: number;
+  /**
+   * Meetings whose recording stopped because the browser refused a write.
+   * The live status line says so once and is gone with the next caption, so
+   * this is how the user can still find out afterwards.
+   */
+  stopped: { meetings: number; reason: string } | null;
 }
 
 export interface MeetingTranscriptResponse {

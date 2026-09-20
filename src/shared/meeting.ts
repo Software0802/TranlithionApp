@@ -120,7 +120,14 @@ export function meetingTextDestination(
 ): string {
   switch (settings.meetingFinalChannel) {
     case "local-mt":
-      return `本机 LibreTranslate（${hostOf(settings.localMtUrl)}），字幕文本不离开这台电脑。`;
+      // Only a loopback address is this computer. The same setting happily
+      // takes a LAN box or a VPS, and saying the text stays here would be a
+      // privacy promise the address itself contradicts.
+      return isLoopbackUrl(settings.localMtUrl)
+        ? `本机 LibreTranslate（${hostOf(settings.localMtUrl)}），字幕文本不离开这台电脑。`
+        : `LibreTranslate（${hostOf(
+            settings.localMtUrl
+          )}），该地址不在这台电脑上，会议字幕文本会发送到那台服务器。`;
     case "llm": {
       const model = `大模型翻译服务 ${describeMainProvider(settings)}，会议字幕文本会发送到该服务。`;
       if (!settings.draftCaptions || settings.draftProvider === "browser") {
@@ -171,6 +178,16 @@ function describeMainProvider(
     return hostOf(settings.webSocketUrl);
   }
   return `${hostOf(settings.apiBaseUrl)} 的 ${settings.model}`;
+}
+
+/** Whether this address is served by the user's own machine. */
+export function isLoopbackUrl(url: string): boolean {
+  try {
+    const hostname = new URL(url).hostname.replace(/^\[|\]$/g, "").toLocaleLowerCase();
+    return hostname === "localhost" || hostname === "::1" || /^127\./.test(hostname);
+  } catch {
+    return false;
+  }
 }
 
 function hostOf(url: string): string {

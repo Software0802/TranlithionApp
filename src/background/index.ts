@@ -32,7 +32,9 @@ import {
   readTranscriptSession,
   readTranscriptSessions,
   retainedTranscriptSessions,
-  transcriptSessionKey
+  summarizeTranscripts,
+  transcriptSessionKey,
+  type TranscriptFailure
 } from "../shared/meeting-transcript";
 import {
   SessionJobQueue,
@@ -60,6 +62,8 @@ import { translateWithAgent, TranslatorError } from "./translator";
 
 const SESSION_CONTEXT_STORAGE_KEY = "translation-session-context";
 const TAB_STATUS_STORAGE_KEY = "tab-runtime-status";
+/** Meetings whose recording stopped, kept where a later caption cannot erase it. */
+const TRANSCRIPT_FAILURE_STORAGE_KEY = "meeting-transcript-failures";
 /** Dynamic registration created by the popup's "启用全站" button. */
 const ALL_PAGES_CONTENT_SCRIPT_ID = "tranlithion-all-pages";
 const sessionStore = new TranslationSessionStore();
@@ -517,11 +521,11 @@ async function meetingTranscriptSummary(): Promise<MeetingTranscriptResponse> {
   );
   return {
     ok: true,
-    summary: {
-      sessions: sessions.length,
-      lines: sessions.reduce((total, session) => total + session.lines.length, 0),
+    summary: summarizeTranscripts({
+      sessions,
+      failures: Object.values(await readTranscriptFailures()),
       retentionDays: settings.meetingTranscriptRetentionDays
-    }
+    })
   };
 }
 
@@ -956,6 +960,7 @@ async function clearStoredTranscripts(): Promise<void> {
       await chrome.storage.local.remove(keys);
     }
   });
+  await forgetTranscriptFailures();
   await forgetMeetingRecords();
 }
 
@@ -985,25 +990,61 @@ async function forgetMeetingRecords(): Promise<void> {
 
 /**
  * The profile's storage is shared and finite, and a transcript is the one
- * thing here that grows without bound. A refused write is the user's business:
- * translation keeps running, but the meeting is no longer being recorded and
- * the popup says so once per meeting rather than on every line.
+ * thing here that grows without bound. A refused write is the user's
+ * business: translation keeps running, but the meeting is no longer being
+ * recorded, and saying so once in the popup's live status is not saying it —
+ * the next caption overwrites that line a second later. The failure is
+ * therefore kept until the records are cleared, so the settings page can
+ * still tell the user afterwards that the call stopped being recorded.
  */
 async function reportTranscriptStorageFailure(
   sessionId: string,
   tabId: number | undefined,
   error: unknown
 ): Promise<void> {
-  if (tabId === undefined || transcriptStorageFailures.has(sessionId)) {
+  if (transcriptStorageFailures.has(sessionId)) {
     return;
   }
   transcriptStorageFailures.add(sessionId);
+  const reason = errorText(error);
+  await rememberTranscriptFailure(sessionId, reason);
+  if (tabId === undefined) {
+    return;
+  }
   await setTabStatus(tabId, {
     state: "error",
-    message: `会议记录未能写入本机存储（${errorText(error)}）：翻译继续，但这场会议不再被记录。可在设置页清除会议记录后重试。`,
+    message: `会议记录未能写入本机存储（${reason}）：翻译继续，但这场会议不再被记录。可在设置页清除会议记录后重试。`,
     source: "meet-dom",
     updatedAt: Date.now()
   });
+}
+
+async function rememberTranscriptFailure(sessionId: string, reason: string): Promise<void> {
+  const failures = await readTranscriptFailures();
+  failures[sessionId] = { reason, atMs: Date.now() };
+  await chrome.storage.session.set({ [TRANSCRIPT_FAILURE_STORAGE_KEY]: failures });
+}
+
+async function readTranscriptFailures(): Promise<Record<string, TranscriptFailure>> {
+  const stored = await chrome.storage.session.get(TRANSCRIPT_FAILURE_STORAGE_KEY);
+  const value = stored[TRANSCRIPT_FAILURE_STORAGE_KEY];
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(value).filter(
+      (entry): entry is [string, TranscriptFailure] =>
+        typeof entry[1] === "object" &&
+        entry[1] !== null &&
+        typeof (entry[1] as TranscriptFailure).reason === "string" &&
+        Number.isFinite((entry[1] as TranscriptFailure).atMs)
+    )
+  );
+}
+
+async function forgetTranscriptFailures(): Promise<void> {
+  transcriptStorageFailures.clear();
+  await chrome.storage.session.remove(TRANSCRIPT_FAILURE_STORAGE_KEY);
 }
 
 function errorText(error: unknown): string {

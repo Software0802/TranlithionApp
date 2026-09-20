@@ -743,8 +743,9 @@ export class SubtitleController {
       if (!this.settings.enabled) {
         return;
       }
+      const pair = this.languagePair();
       const text = await channel.translate(cue.text, signal);
-      if (this.destroyed) {
+      if (this.destroyed || pair !== this.languagePair()) {
         return;
       }
       if (text) {
@@ -839,8 +840,9 @@ export class SubtitleController {
       if (!translator || !this.settings.enabled) {
         return;
       }
+      const pair = this.languagePair();
       const draft = await translator.translate(cue.text, signal);
-      if (!draft || signal.aborted) {
+      if (!draft || signal.aborted || pair !== this.languagePair()) {
         return;
       }
       this.applyCaption(cue, "draft", draft);
@@ -1042,6 +1044,16 @@ export class SubtitleController {
     this.syncNativeCaptionVisibility();
   }
 
+  /**
+   * The pair a request was sent under. An answer that comes back after the
+   * user switched languages is written in the language they switched away
+   * from: it is not shown, not recorded and not remembered, because keeping
+   * it would caption the rest of the session in the wrong language.
+   */
+  private languagePair(): string {
+    return `${this.settings.sourceLanguage}>${this.settings.targetLanguage}`;
+  }
+
   private rememberLocalTranslation(sourceText: string, translation: string): void {
     const key = sourceText.trim();
     const value = translation.trim();
@@ -1095,8 +1107,9 @@ export class SubtitleController {
 
   private async translateActiveCue(cue: SubtitleCue, signal?: AbortSignal): Promise<void> {
     try {
+      const pair = this.languagePair();
       const response = await this.requestTranslation(cue);
-      if (this.destroyed) {
+      if (this.destroyed || pair !== this.languagePair()) {
         return;
       }
       if (response.ok && response.translation) {

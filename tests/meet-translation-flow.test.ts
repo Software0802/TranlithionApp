@@ -293,6 +293,10 @@ function createFixture(overrides: Partial<PublicTranslationSettings> = {}) {
     setOverlayHidden(hidden: boolean) {
       controller.updateSettings({ ...settings, meetingOverlayHidden: hidden });
     },
+    /** The options page's target-language picker, mid-meeting. */
+    setTargetLanguage(targetLanguage: PublicTranslationSettings["targetLanguage"]) {
+      controller.updateSettings({ ...settings, targetLanguage });
+    },
     /** Holds this line's translation until `release`, as a slow channel would. */
     hold(source: string) {
       heldSources.add(source);
@@ -398,6 +402,29 @@ describe("meeting translation flow", () => {
     await fixture.releaseModel("Good morning.");
 
     expect(fixture.caption()).toBe("[zh] Thanks");
+  });
+
+  it("drops an answer that comes back after the target language changed", async () => {
+    const fixture = createFixture();
+    fixture.hold("Good morning.");
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Let's" }]);
+    await fixture.wait(TICK_MS);
+
+    fixture.setTargetLanguage("en");
+    await fixture.release("Good morning.");
+
+    // The answer is written in the language the user just switched away from.
+    expect(fixture.caption()).not.toBe("[zh] Good morning.");
+    expect(fixture.recorded).toEqual([]);
+
+    await fixture.render([]);
+    await fixture.wait(3_000);
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Thanks" }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    // Nor is it kept for the next time the same sentence is said.
+    expect(fixture.draftRequests.filter((text) => text === "Good morning.")).toHaveLength(2);
   });
 
   it("keeps a title with the sentence it belongs to", async () => {

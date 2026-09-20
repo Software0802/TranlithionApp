@@ -10,8 +10,10 @@ import {
 } from "../src/shared/meeting";
 import {
   appendTranscriptLine,
+  describeTranscriptSummary,
   expiredTranscriptKeys,
   isTranscriptSessionKey,
+  summarizeTranscripts,
   MAX_TRANSCRIPT_SESSIONS,
   readTranscriptSession,
   readTranscriptSessions,
@@ -156,6 +158,42 @@ describe("meeting text destination disclosure", () => {
     expect(local).toContain("127.0.0.1:5000");
     expect(local).toContain("不离开这台电脑");
     expect(onDevice).toContain("不离开这台电脑");
+  });
+
+  it("does not call a LibreTranslate on another machine local", () => {
+    // The same setting takes a LAN box or a VPS. Printing its address while
+    // promising the text stays here would be a promise the address denies.
+    const lan = meetingTextDestination({
+      ...DEFAULT_SETTINGS,
+      meetingFinalChannel: "local-mt",
+      localMtUrl: "http://192.168.1.50:5000/translate"
+    });
+    const remote = meetingTextDestination({
+      ...DEFAULT_SETTINGS,
+      meetingFinalChannel: "local-mt",
+      localMtUrl: "https://libre.example.com/translate"
+    });
+
+    expect(lan).toContain("192.168.1.50:5000");
+    expect(lan).not.toContain("不离开这台电脑");
+    expect(remote).toContain("libre.example.com");
+    expect(remote).not.toContain("不离开这台电脑");
+  });
+
+  it("keeps the local claim for every way of writing the loopback address", () => {
+    for (const url of [
+      "http://localhost:5000/translate",
+      "http://127.0.0.1:5000/translate",
+      "http://[::1]:5000/translate"
+    ]) {
+      expect(
+        meetingTextDestination({
+          ...DEFAULT_SETTINGS,
+          meetingFinalChannel: "local-mt",
+          localMtUrl: url
+        })
+      ).toContain("不离开这台电脑");
+    }
   });
 
   it("names the model endpoint when the chat model is the translator", () => {
@@ -360,6 +398,56 @@ describe("local meeting transcript", () => {
         [transcriptSessionKey("broken")]: { sessionId: 7 }
       })
     ).toEqual([meeting]);
+  });
+});
+
+describe("telling the user a meeting stopped being recorded", () => {
+  it("says nothing about failures when every write landed", () => {
+    const summary = summarizeTranscripts({
+      sessions: [session("meeting-1", 1_000)],
+      failures: [],
+      retentionDays: 7
+    });
+
+    expect(summary.stopped).toBeNull();
+    expect(describeTranscriptSummary(summary)).toMatchObject({ state: "success" });
+  });
+
+  it("keeps a refused write visible in the settings page, with the newest reason", () => {
+    // The live status line is overwritten by the next caption a second
+    // later; this is where the user can still find out afterwards.
+    const summary = summarizeTranscripts({
+      sessions: [session("meeting-1", 1_000)],
+      failures: [
+        { reason: "存储空间可能已满", atMs: 1_000 },
+        { reason: "QUOTA_BYTES quota exceeded", atMs: 2_000 }
+      ],
+      retentionDays: 7
+    });
+
+    expect(summary.stopped).toEqual({ meetings: 2, reason: "QUOTA_BYTES quota exceeded" });
+
+    const described = describeTranscriptSummary(summary);
+    expect(described.state).toBe("error");
+    expect(described.text).toContain("2 场会议中途写入失败");
+    expect(described.text).toContain("QUOTA_BYTES quota exceeded");
+    expect(described.text).toContain("没有再被记录");
+  });
+
+  it("reports the stopped meeting even when nothing was ever stored", () => {
+    // The very first write of the call was refused, so there is no session to
+    // count — and that is exactly the case the user must still hear about.
+    const described = describeTranscriptSummary(
+      summarizeTranscripts({
+        sessions: [],
+        failures: [{ reason: "存储空间可能已满", atMs: 1_000 }],
+        retentionDays: 7
+      })
+    );
+
+    expect(described.state).toBe("error");
+    expect(described.text).toContain("没有保存任何会议记录");
+    expect(described.text).toContain("1 场会议中途写入失败");
   });
 });
 
