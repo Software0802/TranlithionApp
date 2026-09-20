@@ -21,11 +21,15 @@ export class TextTrackAdapter implements SubtitleAdapter {
   ) {}
 
   /**
-   * The user picked a different source language. The track chosen for the
-   * previous one is the wrong track now, so it is dropped here rather than
-   * kept until something else happens to rebuild the page's controller — and
-   * if this video carries no track in the new language, the adapter says so
-   * instead of translating the old one as if it were it.
+   * The user picked a different source language, so the track is chosen
+   * again for it rather than left as whatever matched the language they
+   * left. When a track matches the new language the reader moves to it and
+   * the line it was reading ends; when none matches, the page's one readable
+   * track is still read, exactly as it would be on a fresh load — the
+   * setting alone never makes readable subtitles unavailable.
+   *
+   * Landing on the same track is therefore the ordinary case, and it must
+   * not disturb the line on screen: the viewer is still reading it.
    */
   setSourceLanguage(sourceLanguage: SourceLanguage): void {
     if (sourceLanguage === this.sourceLanguage) {
@@ -33,6 +37,9 @@ export class TextTrackAdapter implements SubtitleAdapter {
     }
     this.sourceLanguage = sourceLanguage;
     if (!this.callback) {
+      return;
+    }
+    if ((chooseSubtitleTrack(this.video.textTracks, sourceLanguage) ?? null) === this.track) {
       return;
     }
     this.endActiveCue();

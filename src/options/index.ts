@@ -9,6 +9,7 @@ import { describeTranscriptSummary } from "../shared/meeting-transcript";
 import type {
   ExtensionMessage,
   MeetingTranscriptResponse,
+  MeetingTranscriptSummary,
   SaveSettingsResponse,
   SettingsResponse,
   TestTranslationResponse
@@ -376,23 +377,17 @@ async function grantMeetingHosts(): Promise<void> {
   }
 }
 
-async function storedTranscriptText(): Promise<string> {
-  try {
-    const response = (await chrome.runtime.sendMessage({
-      type: "GET_MEETING_TRANSCRIPTS"
-    } satisfies ExtensionMessage)) as MeetingTranscriptResponse;
-    return response.summary ? describeTranscriptSummary(response.summary).text : "";
-  } catch {
-    return "";
-  }
+/** The one round-trip that asks the worker what is stored right now. */
+async function fetchTranscriptSummary(): Promise<MeetingTranscriptSummary | null> {
+  const response = (await chrome.runtime.sendMessage({
+    type: "GET_MEETING_TRANSCRIPTS"
+  } satisfies ExtensionMessage)) as MeetingTranscriptResponse;
+  return response.summary ?? null;
 }
 
 async function loadTranscriptSummary(): Promise<void> {
   try {
-    const response = (await chrome.runtime.sendMessage({
-      type: "GET_MEETING_TRANSCRIPTS"
-    } satisfies ExtensionMessage)) as MeetingTranscriptResponse;
-    const summary = response.summary;
+    const summary = await fetchTranscriptSummary();
     if (!summary) {
       transcriptSummary.dataset.state = "success";
       transcriptSummary.textContent = "本机当前没有保存任何会议记录。";
@@ -417,10 +412,11 @@ async function wipeTranscripts(): Promise<void> {
       type: "CLEAR_MEETING_TRANSCRIPTS"
     } satisfies ExtensionMessage)) as { ok?: boolean; error?: string } | undefined;
     if (response?.ok !== true) {
-      const stored = await storedTranscriptText();
+      const summary = await fetchTranscriptSummary().catch(() => null);
       transcriptSummary.dataset.state = "error";
       transcriptSummary.textContent =
-        `清除失败（${response?.error ?? "请重试"}）：会议记录仍在本机。${stored}`;
+        `清除失败（${response?.error ?? "请重试"}）：会议记录仍在本机。` +
+        (summary ? describeTranscriptSummary(summary).text : "");
       return;
     }
     transcriptSummary.dataset.state = "success";
