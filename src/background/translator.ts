@@ -1,5 +1,6 @@
 import { languageEnglishName, type LanguageTag } from "../shared/language";
 import { normalizeGlossary } from "../shared/settings";
+import { mergeTerminology } from "../shared/terminology";
 import type {
   ContextLine,
   EntityHint,
@@ -92,7 +93,7 @@ async function translateWithOpenAiCompatibleApi(
     );
   }
 
-  const terminology = [...settings.glossary, ...input.rememberedTerms];
+  const terminology = mergeTerminology(settings.glossary, input.rememberedTerms);
   const controller = new AbortController();
   const cancelForNewerCue = () => controller.abort();
   if (input.signal?.aborted) {
@@ -206,7 +207,7 @@ async function translateWithWebSocket(
     targetLanguage: input.settings.targetLanguage,
     cue: input.cue,
     context: input.recentContext,
-    terminology: [...input.settings.glossary, ...input.rememberedTerms]
+    terminology: mergeTerminology(input.settings.glossary, input.rememberedTerms)
   };
 
   return new Promise((resolve, reject) => {

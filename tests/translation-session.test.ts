@@ -39,6 +39,24 @@ describe("translation session memory", () => {
     expect(store.getCached("session", "cue-9")?.text).toBe("译文-9");
   });
 
+  it("keeps a learned rendering when the same name is registered as itself", () => {
+    // The model worked out how Alice's name reads; the next settled line
+    // registers her Meet display name as itself. Letting that overwrite the
+    // rendering would lose it for the rest of the call.
+    const store = new TranslationSessionStore();
+    store.record("session", cue("cue-1", "Alice speaks."), {
+      text: "爱丽说话。",
+      provider: "mock",
+      latencyMs: 1,
+      entityHints: [{ source: "Alice Chen", target: "陈爱丽", kind: "name" }]
+    });
+    store.record("session", cue("cue-2", "Alice again."), result("爱丽又说。", "Alice Chen"));
+
+    expect(store.getEntityHints("session")).toEqual([
+      { source: "Alice Chen", target: "陈爱丽", kind: "name" }
+    ]);
+  });
+
   it("keeps one context line per cue when the same line is recorded twice", () => {
     // A meeting line is recorded once by the translation and again when it
     // settles. Appending it twice would spend half the model's window

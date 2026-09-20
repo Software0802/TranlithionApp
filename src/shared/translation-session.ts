@@ -1,3 +1,4 @@
+import { termKey } from "./terminology";
 import type { ContextLine, EntityHint, SubtitleCue, TranslationResult } from "./types";
 
 const MAX_CONTEXT_LINES = 8;
@@ -210,11 +211,16 @@ export class TranslationSessionStore {
 
   private storeEntityHints(session: SessionMemory, hints: EntityHint[]): void {
     for (const hint of hints) {
-      const key = hint.source.toLocaleLowerCase();
+      const key = termKey(hint.source);
       const existingIndex = session.entityHints.findIndex(
-        (entry) => entry.source.toLocaleLowerCase() === key
+        (entry) => termKey(entry.source) === key
       );
       if (existingIndex >= 0) {
+        // A name registered as itself says nothing this session does not
+        // already know, so it never overwrites a rendering someone worked out.
+        if (hint.source === hint.target) {
+          continue;
+        }
         session.entityHints.splice(existingIndex, 1, hint);
       } else {
         session.entityHints.push(hint);

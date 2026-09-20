@@ -1,5 +1,36 @@
 import type { GlossaryEntry } from "./types";
 
+/** How the glossary decides two entries are about the same term. */
+export function termKey(source: string): string {
+  return source.trim().toLocaleLowerCase();
+}
+
+/**
+ * The renderings one request may carry: what the user pinned in settings,
+ * then what the session learned about terms the user did not list.
+ *
+ * One rendering per term, and the user's wins. A meeting registers a
+ * speaker's display name so the model keeps it stable, and a user who wrote
+ * `@Alice Chen = 陈爱丽` would otherwise be handing the model both renderings
+ * at once — two instructions for one name, which is no instruction at all.
+ */
+export function mergeTerminology(
+  glossary: GlossaryEntry[],
+  learned: GlossaryEntry[]
+): GlossaryEntry[] {
+  const merged = [...glossary];
+  const claimed = new Set(glossary.map((entry) => termKey(entry.source)));
+  for (const entry of learned) {
+    const key = termKey(entry.source);
+    if (claimed.has(key)) {
+      continue;
+    }
+    claimed.add(key);
+    merged.push(entry);
+  }
+  return merged;
+}
+
 /**
  * Forces the user's fixed renderings onto a machine translation.
  *

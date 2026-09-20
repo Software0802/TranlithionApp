@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyTerminology } from "../src/shared/terminology";
+import { applyTerminology, mergeTerminology } from "../src/shared/terminology";
 import type { GlossaryEntry } from "../src/shared/types";
 
 const term = (source: string, target: string, kind: GlossaryEntry["kind"] = "term") => ({
@@ -58,5 +58,40 @@ describe("fixed renderings on a machine translation", () => {
     expect(applyTerminology("早上好。", [])).toBe("早上好。");
     expect(applyTerminology("早上好。", [term("Figma", "Figma")])).toBe("早上好。");
     expect(applyTerminology("早上好。", [term("  ", "空")])).toBe("早上好。");
+  });
+});
+
+describe("what one request may be told about a term", () => {
+  it("keeps the user's rendering when the call registers the same name", () => {
+    // The meeting registers Alice's display name as itself so the model keeps
+    // it stable. The user already said how it reads, and telling the model
+    // both would be telling it nothing.
+    const merged = mergeTerminology(
+      [term("Alice Chen", "陈爱丽", "name")],
+      [term("Alice Chen", "Alice Chen", "name")]
+    );
+
+    expect(merged).toEqual([term("Alice Chen", "陈爱丽", "name")]);
+  });
+
+  it("matches the user's term however it was capitalised or spaced", () => {
+    const merged = mergeTerminology(
+      [term("Figma", "Figma 设计稿")],
+      [term("  figma  ", "figma")]
+    );
+
+    expect(merged).toEqual([term("Figma", "Figma 设计稿")]);
+  });
+
+  it("keeps a name the user never listed", () => {
+    const merged = mergeTerminology(
+      [term("Alice Chen", "陈爱丽", "name")],
+      [term("Bob Tan", "Bob Tan", "name")]
+    );
+
+    expect(merged).toEqual([
+      term("Alice Chen", "陈爱丽", "name"),
+      term("Bob Tan", "Bob Tan", "name")
+    ]);
   });
 });

@@ -1,4 +1,11 @@
-import type { MeetingFinalChannel, SubtitleSource, TranslationSettings } from "./types";
+import { termKey } from "./terminology";
+import type {
+  EntityHint,
+  GlossaryEntry,
+  MeetingFinalChannel,
+  SubtitleSource,
+  TranslationSettings
+} from "./types";
 
 /**
  * Meeting mode: the same caption pipeline pointed at a meeting page's own
@@ -59,6 +66,25 @@ export function keepsSpokenRecord(
   source: SubtitleSource
 ): boolean {
   return source !== "meet-dom" || settings.meetingTranscript;
+}
+
+/**
+ * The speaker names this call should keep rendering the same way.
+ *
+ * A display name is registered as itself so the model does not invent a new
+ * spelling of it halfway through the meeting — but only when the user has not
+ * already said how that name reads. Their glossary is the authority, and a
+ * name they pinned needs no help staying stable.
+ */
+export function speakerEntityHints(
+  speaker: string | undefined,
+  glossary: GlossaryEntry[]
+): EntityHint[] {
+  const name = speaker?.trim() ?? "";
+  if (!name || glossary.some((entry) => termKey(entry.source) === termKey(name))) {
+    return [];
+  }
+  return [{ source: name, target: name, kind: "name" }];
 }
 
 /**

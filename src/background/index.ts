@@ -21,6 +21,7 @@ import { sampleSourceText } from "../shared/language";
 import {
   isMeetingHost,
   keepsSpokenRecord,
+  speakerEntityHints,
   MEETING_CONTENT_SCRIPT_ID,
   MEETING_HOST_PERMISSIONS
 } from "../shared/meeting";
@@ -39,9 +40,8 @@ import {
   TranslationSessionStore,
   type PersistedTranslationSession
 } from "../shared/translation-session";
-import { applyTerminology } from "../shared/terminology";
+import { applyTerminology, mergeTerminology } from "../shared/terminology";
 import type {
-  EntityHint,
   GlossaryEntry,
   RuntimeStatus,
   TabRuntimeStatus,
@@ -359,7 +359,7 @@ async function rememberTranslation(
 
 /** Everything a caption channel should render consistently: settings plus what the call taught us. */
 function sessionTerminology(sessionId: string, settings: TranslationSettings): GlossaryEntry[] {
-  return [...settings.glossary, ...sessionStore.getEntityHints(sessionId)];
+  return mergeTerminology(settings.glossary, sessionStore.getEntityHints(sessionId));
 }
 
 async function draftTranslate(
@@ -456,9 +456,7 @@ async function recordMeetingLine(
 
   // Speaker names are exactly the proper nouns a meeting keeps repeating, so
   // they join the session's term memory and reach every channel's rendering.
-  const entityHints: EntityHint[] = message.cue.speaker
-    ? [{ source: message.cue.speaker, target: message.cue.speaker, kind: "name" }]
-    : [];
+  const entityHints = speakerEntityHints(message.cue.speaker, settings.glossary);
 
   const recorded = await rememberTranslation(message.sessionId, message.cue, {
     text: translation,

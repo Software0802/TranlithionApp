@@ -4,6 +4,7 @@ import {
   isMeetingHost,
   isMeetingModeActive,
   keepsSpokenRecord,
+  speakerEntityHints,
   MEETING_HOST_PERMISSIONS,
   meetingTextDestination
 } from "../src/shared/meeting";
@@ -221,6 +222,30 @@ describe("meeting caption timing rules", () => {
     expect(isStickySource("netflix-dom")).toBe(true);
     expect(isStickySource("text-track")).toBe(false);
     expect(isStickySource("youtube-dom")).toBe(false);
+  });
+});
+
+describe("speaker names the call registers", () => {
+  it("leaves a speaker the user already gave a rendering for", () => {
+    // 「@Alice Chen = 陈爱丽」 in the settings glossary: registering the name
+    // as itself as well would hand the model two renderings for one person.
+    expect(
+      speakerEntityHints("Alice Chen", [
+        { source: "Alice Chen", target: "陈爱丽", kind: "name" }
+      ])
+    ).toEqual([]);
+    expect(
+      speakerEntityHints("Alice Chen", [
+        { source: " alice chen ", target: "陈爱丽", kind: "name" }
+      ])
+    ).toEqual([]);
+  });
+
+  it("registers a speaker the user never listed so the name stays stable", () => {
+    expect(
+      speakerEntityHints("Bob Tan", [{ source: "Alice Chen", target: "陈爱丽", kind: "name" }])
+    ).toEqual([{ source: "Bob Tan", target: "Bob Tan", kind: "name" }]);
+    expect(speakerEntityHints(undefined, [])).toEqual([]);
   });
 });
 
