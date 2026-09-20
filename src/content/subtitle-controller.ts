@@ -93,6 +93,7 @@ export class SubtitleController {
   private readonly clock: ClockSource;
   private readonly overlay: SubtitleOverlay;
   private readonly adapters: SubtitleAdapter[];
+  private readonly textTrackAdapter: TextTrackAdapter | null;
   private readonly youtubeAdapter: YouTubeCaptionAdapter | null;
   private readonly netflixAdapter: NetflixCaptionAdapter | null;
   private readonly meetAdapter: MeetCaptionAdapter | null;
@@ -146,8 +147,10 @@ export class SubtitleController {
     // Netflix and Meet must not share the page with TextTrack: a hidden track
     // can steal activeSource and hide the sticky overlay mid-cue.
     const allowTextTrack = Boolean(video) && !this.netflixAdapter && !this.meetAdapter;
+    this.textTrackAdapter =
+      allowTextTrack && video ? new TextTrackAdapter(video, settings.sourceLanguage) : null;
     this.adapters = [
-      ...(allowTextTrack && video ? [new TextTrackAdapter(video, settings.sourceLanguage)] : []),
+      ...(this.textTrackAdapter ? [this.textTrackAdapter] : []),
       ...(this.youtubeAdapter ? [this.youtubeAdapter] : []),
       ...(this.netflixAdapter ? [this.netflixAdapter] : []),
       ...(this.meetAdapter ? [this.meetAdapter] : [])
@@ -191,6 +194,12 @@ export class SubtitleController {
     ) {
       // Cached text is keyed by source text alone, so it is wrong for the new pair.
       this.localTextCache.clear();
+    }
+    if (settings.sourceLanguage !== previous.sourceLanguage) {
+      // The track was picked for the language the user just left; reading on
+      // from it would hand one language's subtitles to a translator asked
+      // for another's.
+      this.textTrackAdapter?.setSourceLanguage(settings.sourceLanguage);
     }
     if (!settings.enabled) {
       this.overlay.hide();

@@ -465,8 +465,7 @@ describe("meeting translation flow", () => {
   it("keeps a title with the sentence it belongs to", async () => {
     const fixture = createFixture();
 
-    // The recognizer streams the honorific on its own before the name lands.
-    await fixture.render([{ speaker: "Alice Chen", text: "Mr." }]);
+    // The recognizer streams the title with the name it belongs to.
     await fixture.render([{ speaker: "Alice Chen", text: "Mr. Chen will" }]);
     await fixture.render([{ speaker: "Alice Chen", text: "Mr. Chen will present. Then" }]);
 

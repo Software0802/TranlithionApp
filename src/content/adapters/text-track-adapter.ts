@@ -17,8 +17,29 @@ export class TextTrackAdapter implements SubtitleAdapter {
 
   constructor(
     private readonly video: HTMLVideoElement,
-    private readonly sourceLanguage: SourceLanguage
+    private sourceLanguage: SourceLanguage
   ) {}
+
+  /**
+   * The user picked a different source language. The track chosen for the
+   * previous one is the wrong track now, so it is dropped here rather than
+   * kept until something else happens to rebuild the page's controller — and
+   * if this video carries no track in the new language, the adapter says so
+   * instead of translating the old one as if it were it.
+   */
+  setSourceLanguage(sourceLanguage: SourceLanguage): void {
+    if (sourceLanguage === this.sourceLanguage) {
+      return;
+    }
+    this.sourceLanguage = sourceLanguage;
+    if (!this.callback) {
+      return;
+    }
+    this.endActiveCue();
+    this.detachTrack();
+    this.emit({ type: "availability", source: this.source, available: false });
+    this.refresh();
+  }
 
   start(onEvent: (event: SubtitleAdapterEvent) => void): void {
     this.callback = onEvent;
@@ -68,19 +89,25 @@ export class TextTrackAdapter implements SubtitleAdapter {
     if (nextCue?.id === this.activeCue?.id) {
       return;
     }
-    if (this.activeCue) {
-      this.emit({
-        type: "cue-end",
-        source: this.source,
-        cueId: this.activeCue.id,
-        atMs: Math.round(this.video.currentTime * 1_000)
-      });
-    }
+    this.endActiveCue();
     this.activeCue = nextCue;
     if (nextCue) {
       this.emit({ type: "cue-start", source: this.source, cue: nextCue });
     }
   };
+
+  private endActiveCue(): void {
+    if (!this.activeCue) {
+      return;
+    }
+    this.emit({
+      type: "cue-end",
+      source: this.source,
+      cueId: this.activeCue.id,
+      atMs: Math.round(this.video.currentTime * 1_000)
+    });
+    this.activeCue = null;
+  }
 
   private readActiveCue(): SubtitleCue | null {
     if (!this.track?.activeCues?.length) {

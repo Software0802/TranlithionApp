@@ -83,10 +83,21 @@ export function chooseSubtitleTrack(
   }
 
   const languageMatchers = trackLanguageMatchers(sourceLanguage);
-  return candidates.find((track) => {
-    const hint = `${track.language} ${track.label}`.toLocaleLowerCase();
-    return languageMatchers.some((matcher) => hint.includes(matcher));
-  }) ?? candidates[0];
+  const matching = candidates.find((track) =>
+    languageMatchers.some((matcher) => trackHint(track).includes(matcher))
+  );
+  if (matching) {
+    return matching;
+  }
+  // A track that says nothing about its language is a site that forgot to
+  // label it, and reading it is the best guess available. A track that says
+  // it is another language is not: translating it as the source language the
+  // user chose would caption one language as if it were another.
+  return candidates.find((track) => !trackHint(track));
+}
+
+function trackHint(track: TextTrack): string {
+  return `${track.language} ${track.label}`.trim().toLocaleLowerCase();
 }
 
 export function isCueWithinPlaybackWindow(cue: SubtitleCue, currentMs: number): boolean {

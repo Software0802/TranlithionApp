@@ -18,6 +18,9 @@ import type { MeetingTranscriptSummary } from "./messages";
 /** One meeting per key: `meeting-transcript:<sessionId>`. */
 export const MEETING_TRANSCRIPT_KEY_PREFIX = "meeting-transcript:";
 
+/** Where the notes about meetings that stopped being recorded are kept. */
+export const MEETING_TRANSCRIPT_FAILURE_KEY = "meeting-transcript-failures";
+
 /** Caps so a long day of meetings cannot fill the profile's storage quota. */
 export const MAX_TRANSCRIPT_SESSIONS = 20;
 export const MAX_TRANSCRIPT_LINES = 2_000;
@@ -186,21 +189,40 @@ export interface TranscriptFailure {
   atMs: number;
 }
 
-/** What is stored, and what stopped being stored. */
+/**
+ * What is stored, and what stopped being stored, read straight out of a
+ * `chrome.storage.local` snapshot.
+ *
+ * Both halves age out together here rather than at two call sites: a note
+ * reported beside meetings it has outlived would tell the user a record was
+ * cut short when that record is long gone.
+ */
 export function summarizeTranscripts(input: {
-  sessions: MeetingTranscriptSession[];
-  failures: TranscriptFailure[];
+  stored: Record<string, unknown>;
+  nowMs: number;
   retentionDays: number;
 }): MeetingTranscriptSummary {
-  const newest = input.failures.reduce<TranscriptFailure | null>(
+  const sessions = retainedTranscriptSessions(
+    readTranscriptSessions(input.stored),
+    input.nowMs,
+    input.retentionDays
+  );
+  const failures = Object.values(
+    retainedTranscriptFailures(
+      readTranscriptFailures(input.stored[MEETING_TRANSCRIPT_FAILURE_KEY]),
+      input.nowMs,
+      input.retentionDays
+    )
+  );
+  const newest = failures.reduce<TranscriptFailure | null>(
     (latest, failure) => (!latest || failure.atMs > latest.atMs ? failure : latest),
     null
   );
   return {
-    sessions: input.sessions.length,
-    lines: input.sessions.reduce((total, session) => total + session.lines.length, 0),
+    sessions: sessions.length,
+    lines: sessions.reduce((total, session) => total + session.lines.length, 0),
     retentionDays: input.retentionDays,
-    stopped: newest ? { meetings: input.failures.length, reason: newest.reason } : null
+    stopped: newest ? { meetings: failures.length, reason: newest.reason } : null
   };
 }
 

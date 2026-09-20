@@ -293,17 +293,29 @@ describe("settled segment splitting", () => {
     expect(settledSegmentEnd("we shipped 2.1 last")).toBe(0);
   });
 
-  it("does not cut after a title", () => {
-    // "Mr." is not a sentence. Cutting there would translate and record the
-    // honorific on its own and leave the name it belongs to without it.
-    expect(settledSegmentEnd("Mr.")).toBe(0);
+  it("does not cut after a title the name follows", () => {
+    // A title comes with its name in the same breath. Cutting between them
+    // would translate and record the honorific on its own and leave the name
+    // it belongs to without it.
     expect(settledSegmentEnd("Mr. Chen will")).toBe(0);
+    const whole = "Mr. Chen will present.";
+    expect(whole.slice(0, settledSegmentEnd(whole))).toBe(whole);
 
     const finished = "Mr. Chen will present. Then";
     expect(finished.slice(0, settledSegmentEnd(finished))).toBe("Mr. Chen will present.");
   });
 
-  it("does not cut after initials or an initialism", () => {
+  it("settles a short utterance that is the whole of what was said", () => {
+    // "No." is a complete answer, and one of the commonest things anyone says
+    // in a meeting. Holding it open would leave it untranslated until the
+    // speaker happened to say something else.
+    expect(settledSegmentEnd("No.")).toBe(3);
+    expect(settledSegmentEnd("Hi.")).toBe(3);
+    expect(settledSegmentEnd("Let us ask Jo.")).toBe(14);
+    expect(settledSegmentEnd("Okay.")).toBe(5);
+  });
+
+  it("does not cut after initials or an initialism the sentence carries on past", () => {
     expect(settledSegmentEnd("the U.S. government")).toBe(0);
     expect(settledSegmentEnd("J. R. Smith said")).toBe(0);
 

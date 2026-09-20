@@ -13,7 +13,7 @@ import {
   describeTranscriptSummary,
   expiredTranscriptKeys,
   isTranscriptSessionKey,
-  readTranscriptFailures,
+  MEETING_TRANSCRIPT_FAILURE_KEY,
   retainedTranscriptFailures,
   summarizeTranscripts,
   MAX_TRANSCRIPT_SESSIONS,
@@ -404,10 +404,26 @@ describe("local meeting transcript", () => {
 });
 
 describe("telling the user a meeting stopped being recorded", () => {
+  const NOW = 100 * DAY_MS;
+
+  function storedWith(
+    sessions: MeetingTranscriptSession[],
+    failures: Record<string, { reason: string; atMs: number }>
+  ): Record<string, unknown> {
+    return {
+      ...Object.fromEntries(
+        sessions.map((one) => [transcriptSessionKey(one.sessionId), one])
+      ),
+      ...(Object.keys(failures).length > 0
+        ? { [MEETING_TRANSCRIPT_FAILURE_KEY]: failures }
+        : {})
+    };
+  }
+
   it("says nothing about failures when every write landed", () => {
     const summary = summarizeTranscripts({
-      sessions: [session("meeting-1", 1_000)],
-      failures: [],
+      stored: storedWith([session("meeting-1", NOW - DAY_MS)], {}),
+      nowMs: NOW,
       retentionDays: 7
     });
 
@@ -419,11 +435,11 @@ describe("telling the user a meeting stopped being recorded", () => {
     // The live status line is overwritten by the next caption a second
     // later; this is where the user can still find out afterwards.
     const summary = summarizeTranscripts({
-      sessions: [session("meeting-1", 1_000)],
-      failures: [
-        { reason: "存储空间可能已满", atMs: 1_000 },
-        { reason: "QUOTA_BYTES quota exceeded", atMs: 2_000 }
-      ],
+      stored: storedWith([session("meeting-1", NOW - DAY_MS)], {
+        "meeting-1": { reason: "存储空间可能已满", atMs: NOW - 2 * DAY_MS },
+        "meeting-2": { reason: "QUOTA_BYTES quota exceeded", atMs: NOW - DAY_MS }
+      }),
+      nowMs: NOW,
       retentionDays: 7
     });
 
@@ -437,43 +453,49 @@ describe("telling the user a meeting stopped being recorded", () => {
   });
 
   it("keeps the note as long as the truncated record it describes", () => {
-    const now = 100 * DAY_MS;
     // What `chrome.storage.local` holds after the write was refused, read
     // back the way the worker reads it on a later launch.
-    const stored: Record<string, unknown> = {
-      [transcriptSessionKey("meeting-1")]: session("meeting-1", now - 2 * DAY_MS),
-      "meeting-transcript-failures": {
-        "meeting-1": { reason: "存储空间可能已满", atMs: now - 2 * DAY_MS }
-      }
-    };
+    const summary = summarizeTranscripts({
+      stored: storedWith([session("meeting-1", NOW - 2 * DAY_MS)], {
+        "meeting-1": { reason: "存储空间可能已满", atMs: NOW - 2 * DAY_MS }
+      }),
+      nowMs: NOW,
+      retentionDays: 7
+    });
 
-    const failures = readTranscriptFailures(stored["meeting-transcript-failures"]);
-    const kept = retainedTranscriptFailures(failures, now, 7);
-
-    expect(Object.keys(kept)).toEqual(["meeting-1"]);
-    expect(
-      summarizeTranscripts({
-        sessions: readTranscriptSessions(stored),
-        failures: Object.values(kept),
-        retentionDays: 7
-      }).stopped
-    ).toEqual({ meetings: 1, reason: "存储空间可能已满" });
+    expect(summary.sessions).toBe(1);
+    expect(summary.stopped).toEqual({ meetings: 1, reason: "存储空间可能已满" });
   });
 
   it("drops the note at the same moment the record it describes expires", () => {
-    const now = 100 * DAY_MS;
-    const spoken = now - 8 * DAY_MS;
-    const stored: Record<string, unknown> = {
-      [transcriptSessionKey("meeting-1")]: session("meeting-1", spoken)
-    };
-    const failures = { "meeting-1": { reason: "存储空间可能已满", atMs: spoken } };
+    const spoken = NOW - 8 * DAY_MS;
+    const stored = storedWith([session("meeting-1", spoken)], {
+      "meeting-1": { reason: "存储空间可能已满", atMs: spoken }
+    });
 
-    // The record goes at the retention window; so does the note about it —
-    // neither outlives the other.
-    expect(expiredTranscriptKeys(readTranscriptSessions(stored), now, 7)).toEqual([
+    // The record is past the window, so the summary counts neither it nor
+    // the note about it: a note never outlives what it describes.
+    expect(expiredTranscriptKeys(readTranscriptSessions(stored), NOW, 7)).toEqual([
       transcriptSessionKey("meeting-1")
     ]);
-    expect(retainedTranscriptFailures(failures, now, 7)).toEqual({});
+    expect(summarizeTranscripts({ stored, nowMs: NOW, retentionDays: 7 })).toMatchObject({
+      sessions: 0,
+      stopped: null
+    });
+  });
+
+  it("drops the note as soon as a shorter retention window is chosen", () => {
+    // Switching 保留时长 to one day expires both halves at once, with no
+    // worker restart in between.
+    const stored = storedWith([session("meeting-1", NOW - 3 * DAY_MS)], {
+      "meeting-1": { reason: "存储空间可能已满", atMs: NOW - 3 * DAY_MS }
+    });
+
+    expect(summarizeTranscripts({ stored, nowMs: NOW, retentionDays: 7 }).stopped).not.toBeNull();
+    expect(summarizeTranscripts({ stored, nowMs: NOW, retentionDays: 1 })).toMatchObject({
+      sessions: 0,
+      stopped: null
+    });
   });
 
   it("reports the stopped meeting even when nothing was ever stored", () => {
@@ -481,8 +503,10 @@ describe("telling the user a meeting stopped being recorded", () => {
     // count — and that is exactly the case the user must still hear about.
     const described = describeTranscriptSummary(
       summarizeTranscripts({
-        sessions: [],
-        failures: [{ reason: "存储空间可能已满", atMs: 1_000 }],
+        stored: storedWith([], {
+          "meeting-1": { reason: "存储空间可能已满", atMs: NOW - DAY_MS }
+        }),
+        nowMs: NOW,
         retentionDays: 7
       })
     );

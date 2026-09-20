@@ -117,10 +117,12 @@ export function settledSegmentEnd(text: string): number {
   const terminators = /[。！？]+|[.!?]+(?=\s|$)/g;
   let cut = 0;
   for (let match = terminators.exec(text); match; match = terminators.exec(text)) {
-    if (ABBREVIATED_WORD_END.test(text.slice(0, match.index))) {
+    const end = match.index + match[0].length;
+    const followedByMore = text.slice(end).trim().length > 0;
+    if (followedByMore && ABBREVIATED_WORD_END.test(text.slice(0, match.index))) {
       continue;
     }
-    cut = match.index + match[0].length;
+    cut = end;
   }
   if (cut > 0) {
     return cut;
@@ -145,6 +147,11 @@ export function settledSegmentEnd(text: string): number {
  * run of single capitals joined by stops ("U.S"). Everything else ends the
  * sentence it finishes — 「Fine.」 and 「I said no.」 still settle — except the
  * three Latin abbreviations that break the rule, named here and nowhere else.
+ *
+ * It only holds a sentence open when more of the read follows it: a title
+ * comes with the name in the same breath, while 「No.」 and 「Hi.」 arrive as
+ * the whole thing anyone said, and waiting on those would leave a finished
+ * utterance untranslated.
  */
 const ABBREVIATED_WORD_END = /(?:^|\s)(?:\p{Lu}\p{Ll}?|(?:\p{Lu}\.)+\p{Lu}|e\.g|i\.e|etc)$/u;
 

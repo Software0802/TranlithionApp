@@ -516,16 +516,11 @@ async function recordMeetingLine(
 
 async function meetingTranscriptSummary(): Promise<MeetingTranscriptResponse> {
   const settings = await getSettings();
-  const sessions = retainedTranscriptSessions(
-    readTranscriptSessions(await chrome.storage.local.get(null)),
-    Date.now(),
-    settings.meetingTranscriptRetentionDays
-  );
   return {
     ok: true,
     summary: summarizeTranscripts({
-      sessions,
-      failures: Object.values(await storedTranscriptFailures()),
+      stored: await chrome.storage.local.get(null),
+      nowMs: Date.now(),
       retentionDays: settings.meetingTranscriptRetentionDays
     })
   };
