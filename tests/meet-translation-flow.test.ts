@@ -558,6 +558,25 @@ describe("meeting translation flow", () => {
     expect(fixture.recorded).toEqual([]);
   });
 
+  it("records a sentence answered in time even when its cue ends much later", async () => {
+    const fixture = createFixture();
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning." }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    expect(fixture.caption()).toBe("[zh] Good morning.");
+
+    // Alice leaves the finished sentence on screen and only then carries on,
+    // so its cue ends long after the budget for translating it ran out. The
+    // budget bounds waiting on the channel, not how long a speaker pauses.
+    await fixture.wait(MEETING_FINAL_CHANNEL_TIMEOUT_MS + 2_000);
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Thanks" }]);
+    await fixture.wait(TICK_MS);
+
+    expect(fixture.recorded).toMatchObject([
+      { source: "Good morning.", translation: "[zh] Good morning." }
+    ]);
+  });
+
   it("gives one sentence one budget however often it reaches the queue", async () => {
     const fixture = createFixture();
     fixture.hold("Good morning.");

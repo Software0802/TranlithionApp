@@ -202,6 +202,7 @@ export class SubtitleController {
       return;
     }
     this.destroyed = true;
+    this.meetingLineBudgets.clear();
     this.cancelTeardown();
     this.cancelReviseDebounce();
     this.draftAbort?.abort();
@@ -476,6 +477,10 @@ export class SubtitleController {
    * channel does. One line may cost itself, never the whole conversation, and
    * a line already given up on is not asked for a second time.
    *
+   * What the budget bounds is waiting on a channel, not how long a cue stays
+   * open: a speaker can hold a finished sentence on screen for a minute, and
+   * the translation that came back in time still owes the transcript its row.
+   *
    * A job that owns no caption — a context refresh behind a line already on
    * screen — is abandoned in silence: nothing was skipped that the user can
    * see, so saying otherwise would be a lie told over a good translation.
@@ -491,7 +496,14 @@ export class SubtitleController {
     const budgetMs = meetingLineBudgetMs(this.settings.meetingFinalChannel);
     const budget = this.meetingLineBudget(line, budgetMs);
     const run = async () => {
-      if (budget.controller.signal.aborted || !this.settings.enabled || this.overlayHidden()) {
+      if (this.destroyed || !this.settings.enabled || this.overlayHidden()) {
+        return;
+      }
+      if (budget.controller.signal.aborted) {
+        return;
+      }
+      if (line && this.localTextCache.has(line.text)) {
+        await job().catch(() => undefined);
         return;
       }
       const remainingMs = budget.deadlineAt - this.clock.nowMs();
@@ -894,23 +906,27 @@ export class SubtitleController {
     if (!cue || cue.source !== "meet-dom" || !this.meetingMode()) {
       return;
     }
-    if (!this.settings.enabled || this.overlayHidden()) {
-      return;
+    if (this.settings.enabled && !this.overlayHidden()) {
+      // Whatever is translating this sentence must survive the next cue-start.
+      this.draftAbort = null;
+      this.runFinalTranslation(async (signal) => {
+        if (!this.localTextCache.has(cue.text)) {
+          await this.translateSettledLine(cue, signal);
+        }
+        if (signal?.aborted) {
+          return;
+        }
+        const translation = this.localTextCache.get(cue.text);
+        if (translation) {
+          this.recordMeetingLine(cue, translation);
+        }
+      }, cue);
     }
-    // Whatever is translating this sentence must survive the next cue-start.
-    this.draftAbort = null;
-    this.runFinalTranslation(async (signal) => {
-      if (!this.localTextCache.has(cue.text)) {
-        await this.translateSettledLine(cue, signal);
-      }
-      if (signal?.aborted) {
-        return;
-      }
-      const translation = this.localTextCache.get(cue.text);
-      if (translation) {
-        this.recordMeetingLine(cue, translation);
-      }
-    }, cue);
+    // The cue is over, so that was the last job it can ask for — and the job
+    // already holds its budget. Dropping the entry keeps a long call from
+    // collecting one per sentence, and keeps a cue id the recognizer happens
+    // to recreate from inheriting a deadline that has nothing to do with it.
+    this.meetingLineBudgets.delete(cue.id);
   }
 
   private async translateSettledLine(cue: SubtitleCue, signal?: AbortSignal): Promise<void> {
@@ -946,7 +962,7 @@ export class SubtitleController {
    * same thing said once.
    */
   private recordMeetingLine(cue: SubtitleCue, translation: string): void {
-    if (cue.source !== "meet-dom" || !this.meetingMode()) {
+    if (this.destroyed || cue.source !== "meet-dom" || !this.meetingMode()) {
       return;
     }
     if (!this.settings.enabled || this.overlayHidden()) {
