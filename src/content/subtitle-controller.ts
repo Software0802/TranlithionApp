@@ -438,7 +438,9 @@ export class SubtitleController {
     const single = this.singleChannel();
     if (single) {
       // One network hop only: the fast channel is the caption the user reads.
-      this.runFinalTranslation(() => this.translateWithSingleChannel(cue, single, signal));
+      this.runFinalTranslation((lineSignal) =>
+        this.translateWithSingleChannel(cue, single, untilEither(signal, lineSignal))
+      );
       return;
     }
     // Fast draft + model final when no single channel is configured.
@@ -460,23 +462,42 @@ export class SubtitleController {
    * that was waiting its turn when the user hit the switch has not been sent
    * yet, so it is dropped rather than translated a second later.
    *
-   * Each job also gets its channel's budget. One line may cost itself, never
-   * the whole conversation: when the budget runs out the queue moves on, the
-   * user is told, and the answer — if it ever comes — is no longer shown or
-   * recorded as if it were the line being spoken now.
+   * Each job also gets its channel's budget, counted from the moment it joins
+   * the queue: waiting its turn ages a line exactly as much as a slow channel
+   * does. One line may cost itself, never the whole conversation — when the
+   * budget runs out the queue moves on, the user is told, and the answer, if
+   * it ever comes, is no longer shown or recorded as the line being spoken.
+   *
+   * A job that owns no caption — a context refresh behind a line already on
+   * screen — is abandoned in silence: nothing was skipped that the user can
+   * see, so saying otherwise would be a lie told over a good translation.
    */
-  private runFinalTranslation(job: (signal?: AbortSignal) => Promise<void>): void {
+  private runFinalTranslation(
+    job: (signal?: AbortSignal) => Promise<void>,
+    produces: "caption" | "context" = "caption"
+  ): void {
     if (!this.meetingMode()) {
       void job();
       return;
     }
-    const run = async () => {
+    const budgetMs = meetingLineBudgetMs(this.settings.meetingFinalChannel);
+    const line = new AbortController();
+    const budgetTimer = window.setTimeout(() => {
+      line.abort();
+      if (produces !== "caption" || this.destroyed) {
+        return;
+      }
       if (!this.settings.enabled || this.overlayHidden()) {
         return;
       }
-      const budgetMs = meetingLineBudgetMs(this.settings.meetingFinalChannel);
-      const line = new AbortController();
-      const budgetTimer = window.setTimeout(() => line.abort(), budgetMs);
+      this.setMeetingChannelBroken(true);
+      this.report("error", this.meetingBudgetMessage(budgetMs), "meet-dom");
+    }, budgetMs);
+    const run = async () => {
+      if (line.signal.aborted || !this.settings.enabled || this.overlayHidden()) {
+        window.clearTimeout(budgetTimer);
+        return;
+      }
       try {
         await Promise.race([
           job(line.signal).catch(() => undefined),
@@ -484,10 +505,6 @@ export class SubtitleController {
         ]);
       } finally {
         window.clearTimeout(budgetTimer);
-      }
-      if (line.signal.aborted) {
-        this.setMeetingChannelBroken(true);
-        this.report("error", this.meetingBudgetMessage(budgetMs), "meet-dom");
       }
     };
     this.meetingQueue = this.meetingQueue.then(run, run).catch(() => undefined);
@@ -647,10 +664,14 @@ export class SubtitleController {
         // next line has already replaced on screen still owes the transcript
         // its translation.
         this.rememberLocalTranslation(cue.text, text);
-        this.setMeetingChannelBroken(false);
       }
       if (signal.aborted) {
+        // Superseded, or answered after this line ran out of budget: the user
+        // has already been told it was skipped, so it changes nothing now.
         return;
+      }
+      if (text) {
+        this.setMeetingChannelBroken(false);
       }
       if (!text) {
         // A channel that cannot answer is a fact about the channel, not about
@@ -721,7 +742,7 @@ export class SubtitleController {
     if (this.singleChannel()) {
       return;
     }
-    this.runFinalTranslation((signal) => this.translateActiveCue(cue, signal));
+    this.runFinalTranslation((signal) => this.translateActiveCue(cue, signal), "context");
   }
 
   private async showDraftTranslation(cue: SubtitleCue, signal: AbortSignal): Promise<void> {
@@ -843,7 +864,11 @@ export class SubtitleController {
     }
     const single = this.singleChannel();
     if (single) {
-      await this.translateWithSingleChannel(cue, single, this.settleAbort.signal);
+      await this.translateWithSingleChannel(
+        cue,
+        single,
+        untilEither(this.settleAbort.signal, signal)
+      );
       return;
     }
     if (this.settings.meetingFinalChannel !== "llm") {
@@ -984,7 +1009,6 @@ export class SubtitleController {
       }
       if (response.ok && response.translation) {
         this.rememberLocalTranslation(cue.text, response.translation.text);
-        this.setMeetingChannelBroken(false);
       }
       if (signal?.aborted) {
         // Over the line's budget: the meeting moved on without it, and the
@@ -994,6 +1018,9 @@ export class SubtitleController {
       }
       if (!isCueWithinPlaybackWindow(cue, this.clock.nowMs())) {
         return;
+      }
+      if (response.ok && response.translation) {
+        this.setMeetingChannelBroken(false);
       }
       if (!response.ok || !response.translation) {
         const message = response.error?.message ?? "翻译服务暂时不可用。";
@@ -1068,6 +1095,11 @@ export class SubtitleController {
   ): void {
     this.reportStatus({ state, message, source, latencyMs, updatedAt: Date.now() });
   }
+}
+
+/** Stops the request when the cue is superseded or the line runs out of budget. */
+function untilEither(signal: AbortSignal, lineSignal?: AbortSignal): AbortSignal {
+  return lineSignal ? AbortSignal.any([signal, lineSignal]) : signal;
 }
 
 /** Settles when the budget runs out, so the queue stops waiting on the line. */

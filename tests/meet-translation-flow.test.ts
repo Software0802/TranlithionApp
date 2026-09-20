@@ -6,7 +6,10 @@ import {
   MeetCaptionAdapter
 } from "../src/content/adapters/meet-caption-adapter";
 import type { SubtitleAdapterEvent } from "../src/content/adapters/types";
-import { MEETING_LLM_CHANNEL_TIMEOUT_MS } from "../src/shared/meeting";
+import {
+  MEETING_FINAL_CHANNEL_TIMEOUT_MS,
+  MEETING_LLM_CHANNEL_TIMEOUT_MS
+} from "../src/shared/meeting";
 import { SubtitleController } from "../src/content/subtitle-controller";
 import {
   appendTranscriptLine,
@@ -533,6 +536,67 @@ describe("meeting translation flow", () => {
 
     expect(fixture.nativeCaptionsVisible()).toBe(true);
     expect(fixture.lastStatus()?.state).toBe("error");
+  });
+
+  it("drops an over-budget line on the machine-translation channel", async () => {
+    const fixture = createFixture();
+    // Nothing newer paints either, so the only thing that could put the
+    // skipped line on screen is the skipped line itself.
+    fixture.hold("Good morning.");
+    fixture.hold("Let's");
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Let's" }]);
+    await fixture.wait(MEETING_FINAL_CHANNEL_TIMEOUT_MS + TICK_MS);
+
+    expect(fixture.errors().some((message) => message.includes("4 秒"))).toBe(true);
+
+    await fixture.release("Good morning.");
+
+    // What the popup said, what is on screen and what the transcript holds
+    // have to agree: the line was skipped, so it appears in none of them.
+    expect(fixture.caption()).toBeNull();
+    expect(fixture.recorded).toEqual([]);
+  });
+
+  it("counts the wait in the queue against a line's budget", async () => {
+    const fixture = createFixture();
+    fixture.hold("Good morning.");
+    fixture.hold("Let's begin.");
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Let's" }]);
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Let's begin. So" }]);
+    await fixture.wait(MEETING_FINAL_CHANNEL_TIMEOUT_MS + TICK_MS);
+
+    // The second sentence spent its budget waiting behind the first, so it is
+    // as stale as if the channel had never answered it: the answer that
+    // arrives now belongs to a meeting that has moved on.
+    await fixture.release("Let's begin.");
+
+    expect(fixture.caption()).not.toBe("[zh] Let's begin.");
+    expect(fixture.recorded).toEqual([]);
+  });
+
+  it("stays quiet when a context refresh behind a shown line runs over budget", async () => {
+    const fixture = createFixture({ meetingFinalChannel: "llm" });
+    await fixture.render([{ speaker: "Alice Chen", text: "Thanks." }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    expect(fixture.caption()).toBe("[llm] Thanks.");
+
+    // Said again by someone else: painted from local memory, with the model
+    // call behind it only refreshing the background's context.
+    fixture.holdModel("Thanks.");
+    await fixture.render([
+      { speaker: "Alice Chen", text: "Thanks." },
+      { speaker: "Bob Tan", text: "Thanks." }
+    ]);
+    await fixture.wait(MEETING_LLM_CHANNEL_TIMEOUT_MS + TICK_MS);
+
+    // Nothing the user can see was skipped, so nothing is said about it and
+    // Meet's own strip stays out of the way.
+    expect(fixture.errors()).toEqual([]);
+    expect(fixture.caption()).toBe("[llm] Thanks.");
+    expect(fixture.nativeCaptionsVisible()).toBe(false);
   });
 
   it("drops a meeting line the chat model does not answer inside its budget", async () => {
