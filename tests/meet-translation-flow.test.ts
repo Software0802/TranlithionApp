@@ -10,7 +10,11 @@ import {
   type MeetingTranscriptSession
 } from "../src/shared/meeting-transcript";
 import { DEFAULT_SETTINGS, publicSettings } from "../src/shared/settings";
-import type { SubtitleCue, TranslationResponse } from "../src/shared/types";
+import type {
+  PublicTranslationSettings,
+  SubtitleCue,
+  TranslationResponse
+} from "../src/shared/types";
 import { element, type FakeElement } from "./helpers/fake-dom";
 
 /**
@@ -166,15 +170,16 @@ function createFixture() {
     }
   });
 
+  const settings: PublicTranslationSettings = {
+    ...publicSettings(DEFAULT_SETTINGS),
+    meetingMode: true,
+    meetingTranscript: true,
+    draftProvider: "deepl",
+    draftApiKeyConfigured: true
+  };
   const controller = new SubtitleController(
     { kind: "page" },
-    {
-      ...publicSettings(DEFAULT_SETTINGS),
-      meetingMode: true,
-      meetingTranscript: true,
-      draftProvider: "deepl",
-      draftApiKeyConfigured: true
-    },
+    settings,
     async (cue: SubtitleCue): Promise<TranslationResponse> => {
       modelRequests.push(cue.text);
       return {
@@ -224,6 +229,10 @@ function createFixture() {
     draftFailures,
     /** Whether Meet's own caption strip is readable to the user right now. */
     nativeCaptionsVisible: () => !documentStyles.has(MEET_NATIVE_HIDE_STYLE_ID),
+    /** The one-click 「隐藏译文（共享屏幕）」 switch. */
+    setOverlayHidden(hidden: boolean) {
+      controller.updateSettings({ ...settings, meetingOverlayHidden: hidden });
+    },
     /** Holds this line's translation until `release`, as a slow channel would. */
     hold(source: string) {
       heldSources.add(source);
@@ -343,21 +352,58 @@ describe("meeting translation flow", () => {
 
     // Folding what was recorded through the real store is the outcome that
     // matters: the withdrawn wording must not survive in the D7 transcript.
-    const stored = fixture.recorded.reduce<MeetingTranscriptSession | null>(
-      (session, line, index) =>
-        appendTranscriptLine(session, {
-          sessionId: "meeting-1",
-          host: "meet.google.com",
-          title: "Weekly sync",
-          atMs: 1_000 + index,
-          speaker: line.speaker ?? null,
-          source: line.source,
-          translation: line.translation,
-          replaces: line.replaces
-        }),
-      null
-    );
+    expect(storedSources(fixture.recorded)).toEqual(["Hey everyone."]);
+  });
 
-    expect(stored?.lines.map((line) => line.source)).toEqual(["Hey everyone."]);
+  it("keeps a recorded line a take-back from the hidden window would have deleted", async () => {
+    const fixture = createFixture();
+    await fixture.render([{ speaker: "Alice Chen", text: "Okay." }]);
+    await fixture.render([
+      { speaker: "Alice Chen", text: "Okay." },
+      { speaker: "Bob Tan", text: "Okay." }
+    ]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    // Screen share: nothing is shown and nothing is recorded from here.
+    fixture.setOverlayHidden(true);
+    await fixture.render([
+      { speaker: "Alice Chen", text: "Okay." },
+      { speaker: "Bob Tan", text: "Okay, so about the budget." }
+    ]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    fixture.setOverlayHidden(false);
+    await fixture.render([
+      { speaker: "Alice Chen", text: "Okay." },
+      { speaker: "Bob Tan", text: "Okay, so about the budget." },
+      { speaker: "Carol Diaz", text: "Thanks." }
+    ]);
+    await fixture.render([]);
+    await fixture.wait(2_400);
+
+    // Bob's withdrawn "Okay." was never recorded — it was taken back while
+    // the overlay was hidden. Carrying that take-back out of the hidden
+    // window would delete the only "Okay." in the transcript, which is
+    // Alice's, and she really did say it.
+    expect(storedSources(fixture.recorded)).toEqual(["Okay.", "Thanks."]);
   });
 });
+
+/** What the D7 store would hold after these lines were handed to it. */
+function storedSources(recorded: RecordedLine[]): string[] | undefined {
+  const stored = recorded.reduce<MeetingTranscriptSession | null>(
+    (session, line, index) =>
+      appendTranscriptLine(session, {
+        sessionId: "meeting-1",
+        host: "meet.google.com",
+        title: "Weekly sync",
+        atMs: 1_000 + index,
+        speaker: line.speaker ?? null,
+        source: line.source,
+        translation: line.translation,
+        replaces: line.replaces
+      }),
+    null
+  );
+  return stored?.lines.map((line) => line.source);
+}

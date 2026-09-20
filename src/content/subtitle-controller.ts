@@ -181,6 +181,12 @@ export class SubtitleController {
       // Cached text is keyed by source text alone, so it is wrong for the new pair.
       this.localTextCache.clear();
     }
+    if (!settings.enabled || this.overlayHidden()) {
+      // From here nothing is recorded, so a take-back still waiting for a
+      // line to carry it would land on whatever is recorded after the user
+      // comes back.
+      this.retractedLines = [];
+    }
     if (!settings.enabled) {
       this.overlay.hide();
       this.report("idle", "翻译已暂停");
@@ -274,8 +280,17 @@ export class SubtitleController {
   /**
    * Wording the recognizer took back. Whatever settles next carries it to the
    * transcript, which drops the withdrawn line if it had already stored one.
+   *
+   * Nothing settles while translation is paused or the overlay is hidden for
+   * a screen share, so a take-back noted then has no line of its own to
+   * supersede — it would travel to whatever is recorded after the user comes
+   * back and delete a line that really was spoken.
    */
   private noteRetraction(retracts: string[] | undefined): void {
+    if (!this.settings.enabled || this.overlayHidden()) {
+      this.retractedLines = [];
+      return;
+    }
     if (retracts?.length) {
       this.retractedLines.push(...retracts);
     }
