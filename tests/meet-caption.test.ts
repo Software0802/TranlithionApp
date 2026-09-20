@@ -293,6 +293,39 @@ describe("settled segment splitting", () => {
     expect(settledSegmentEnd("we shipped 2.1 last")).toBe(0);
   });
 
+  it("does not cut after a title", () => {
+    // "Mr." is not a sentence. Cutting there would translate and record the
+    // honorific on its own and leave the name it belongs to without it.
+    expect(settledSegmentEnd("Mr.")).toBe(0);
+    expect(settledSegmentEnd("Mr. Chen will")).toBe(0);
+
+    const finished = "Mr. Chen will present. Then";
+    expect(finished.slice(0, settledSegmentEnd(finished))).toBe("Mr. Chen will present.");
+  });
+
+  it("does not cut after initials or an initialism", () => {
+    expect(settledSegmentEnd("the U.S. government")).toBe(0);
+    expect(settledSegmentEnd("J. R. Smith said")).toBe(0);
+
+    const finished = "J. R. Smith runs the U.S. office. Next";
+    expect(finished.slice(0, settledSegmentEnd(finished))).toBe(
+      "J. R. Smith runs the U.S. office."
+    );
+  });
+
+  it("does not cut after the Latin abbreviations that end in a stop", () => {
+    expect(settledSegmentEnd("a few people, e.g. Alice and")).toBe(0);
+    expect(settledSegmentEnd("slides, charts, etc. before")).toBe(0);
+  });
+
+  it("settles after an ordinary capitalized word", () => {
+    // The guard is about titles and initials, not about capitals: a normal
+    // word that finishes a sentence still finishes it.
+    const text = "I said no. Fine. Then";
+    expect(text.slice(0, settledSegmentEnd(text))).toBe("I said no. Fine.");
+    expect(settledSegmentEnd("We ship in the US. Soon")).toBeGreaterThan(0);
+  });
+
   it("settles a finished sentence even when it ends in a short word", () => {
     // "I said no." really is finished; holding it open waiting for a longer
     // sentence would leave the line untranslated until the turn ended.

@@ -110,12 +110,16 @@ export function hasMeetCaptionExpired(lastTextAtMs: number, nowMs: number): bool
  * `text`, or 0 when nothing has settled yet.
  *
  * A Latin full stop only counts when whitespace or the end of the line follows
- * it, so a figure like "3.5" never splits a line.
+ * it, so a figure like "3.5" never splits a line, and never when the stop
+ * belongs to the word in front of it.
  */
 export function settledSegmentEnd(text: string): number {
   const terminators = /[。！？]+|[.!?]+(?=\s|$)/g;
   let cut = 0;
   for (let match = terminators.exec(text); match; match = terminators.exec(text)) {
+    if (ABBREVIATED_WORD_END.test(text.slice(0, match.index))) {
+      continue;
+    }
     cut = match.index + match[0].length;
   }
   if (cut > 0) {
@@ -130,6 +134,19 @@ export function settledSegmentEnd(text: string): number {
   const boundary = head.lastIndexOf(" ");
   return boundary > MEET_MAX_SEGMENT_CHARS / 2 ? boundary + 1 : MEET_MAX_SEGMENT_CHARS;
 }
+
+/**
+ * A word whose full stop is part of the word: a title or an initial, not the
+ * end of a sentence.
+ *
+ * Keyed on capitalization rather than on a list of words, because a meeting
+ * is full of names nobody can list in advance. A capitalized token of one or
+ * two letters is a title or an initial ("Mr", "Dr", "St", "J"), and so is a
+ * run of single capitals joined by stops ("U.S"). Everything else ends the
+ * sentence it finishes — 「Fine.」 and 「I said no.」 still settle — except the
+ * three Latin abbreviations that break the rule, named here and nowhere else.
+ */
+const ABBREVIATED_WORD_END = /(?:^|\s)(?:\p{Lu}\p{Ll}?|(?:\p{Lu}\.)+\p{Lu}|e\.g|i\.e|etc)$/u;
 
 /**
  * Splits one rendered speaker turn into its name and its spoken text.

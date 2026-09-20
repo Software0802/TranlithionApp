@@ -400,6 +400,22 @@ describe("meeting translation flow", () => {
     expect(fixture.caption()).toBe("[zh] Thanks");
   });
 
+  it("keeps a title with the sentence it belongs to", async () => {
+    const fixture = createFixture();
+
+    // The recognizer streams the honorific on its own before the name lands.
+    await fixture.render([{ speaker: "Alice Chen", text: "Mr." }]);
+    await fixture.render([{ speaker: "Alice Chen", text: "Mr. Chen will" }]);
+    await fixture.render([{ speaker: "Alice Chen", text: "Mr. Chen will present. Then" }]);
+
+    // One sentence: one request, and one transcript row that still has the
+    // honorific in it.
+    expect(fixture.draftRequests).toEqual(["Mr. Chen will present."]);
+    expect(fixture.recorded).toMatchObject([
+      { source: "Mr. Chen will present.", translation: "[zh] Mr. Chen will present." }
+    ]);
+  });
+
   it("records only the settled line, not the prefixes it grew through", async () => {
     const fixture = createFixture();
     await fixture.render([{ speaker: "Alice Chen", text: "Good" }]);
