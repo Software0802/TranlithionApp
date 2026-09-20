@@ -261,7 +261,7 @@ async function translateCue(
   // text cache immediately keeps live captions in sync without a network round-trip.
   if (cached) {
     if (latestOnly) {
-      rememberTranslation(request.sessionId, request.cue, { ...cached, latencyMs: 0 }, settings);
+      await rememberTranslation(request.sessionId, request.cue, { ...cached, latencyMs: 0 });
     }
     return { ok: true, translation: { ...cached, latencyMs: 0 } };
   }
@@ -298,7 +298,7 @@ async function translateCue(
     if (signal?.aborted) {
       throw new TranslatorError("CANCELLED", "字幕已更新，已取消过期翻译。");
     }
-    if (rememberTranslation(request.sessionId, request.cue, result, settings)) {
+    if (await rememberTranslation(request.sessionId, request.cue, result)) {
       await persistSession(request.sessionId);
     }
     return result;
@@ -334,12 +334,21 @@ async function translateCue(
  * terms stay for the rest of the session, the sentences and the names that
  * said them are never written into the context that reaches storage.
  */
-function rememberTranslation(
+async function rememberTranslation(
   sessionId: string,
   cue: SubtitleCue,
-  result: TranslationResult,
-  settings: TranslationSettings
-): boolean {
+  result: TranslationResult
+): Promise<boolean> {
+  // Consent as it stands at the moment of writing, not as it stood when the
+  // request left: a translation can be in flight for seconds, and what counts
+  // is the answer the user has given by the time it lands.
+  const settings = await getSettings();
+  if (cue.source === "meet-dom") {
+    // Writing a spoken line is what makes a session a call — including when
+    // the write re-creates a session a retraction has just deleted, which
+    // must still be a call the next retraction can reach.
+    sessionStore.markMeetingSession(sessionId);
+  }
   if (!keepsSpokenRecord(settings, cue.source)) {
     sessionStore.rememberText(sessionId, cue.text, result);
     return false;
@@ -452,17 +461,20 @@ async function recordMeetingLine(
     ? [{ source: message.cue.speaker, target: message.cue.speaker, kind: "name" }]
     : [];
 
-  const recorded = rememberTranslation(
-    message.sessionId,
-    message.cue,
-    { text: translation, provider: settings.provider, latencyMs: 0, entityHints },
-    settings
-  );
+  const recorded = await rememberTranslation(message.sessionId, message.cue, {
+    text: translation,
+    provider: settings.provider,
+    latencyMs: 0,
+    entityHints
+  });
   if (recorded) {
     await persistSession(message.sessionId);
   }
 
-  if (!settings.meetingTranscript) {
+  // Read again rather than trusting the snapshot this line arrived with: the
+  // user may have unchecked the box while it was being translated.
+  const consent = await getSettings();
+  if (!consent.meetingTranscript) {
     return { ok: true };
   }
 
@@ -494,7 +506,7 @@ async function recordMeetingLine(
     if (!current) {
       // A meeting starts: this is the moment to enforce retention and the
       // session cap, rather than on every line of it.
-      await dropExpiredTranscripts(settings.meetingTranscriptRetentionDays);
+      await dropExpiredTranscripts(consent.meetingTranscriptRetentionDays);
     }
   });
   return { ok: true };

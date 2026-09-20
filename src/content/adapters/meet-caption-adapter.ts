@@ -408,7 +408,7 @@ export class MeetCaptionAdapter implements SubtitleAdapter {
       this.refreshAvailability();
       return;
     }
-    if (!this.region || !regionHasText(this.region)) {
+    if (!this.region || !regionHasUnreadableText(this.region)) {
       this.unreadableSinceMs = null;
       this.refreshAvailability();
       return;
@@ -601,8 +601,28 @@ const MEET_CAPTION_STRUCTURE_SELECTOR = [
   ...MEET_CAPTION_TEXT_SELECTORS
 ].join(", ");
 
-function regionHasText(region: Element): boolean {
-  return normalizeSubtitleText(elementText(region)).length > 0;
+/**
+ * Whether the strip is showing words none of the declared selectors can
+ * reach — the state that means Meet has moved them.
+ *
+ * A row the parser read correctly does not count, and neither does a row
+ * Meet has attributed to a speaker before the recognizer has emitted a word:
+ * there is a name on screen, but no speech is being withheld from the user.
+ */
+function regionHasUnreadableText(region: Element): boolean {
+  const blocks = captionBlockElements(region);
+  if (blocks.length === 0) {
+    return normalizeSubtitleText(elementText(region)).length > 0;
+  }
+  return blocks.some((block) => blockHidesText(block));
+}
+
+function blockHidesText(block: Element): boolean {
+  if (pickText(block, MEET_CAPTION_TEXT_SELECTORS)) {
+    return false;
+  }
+  const rendered = normalizeSubtitleText(elementText(block));
+  return rendered.length > 0 && rendered !== pickText(block, MEET_CAPTION_SPEAKER_SELECTORS);
 }
 
 function captionBlockElements(region: Element): Element[] {

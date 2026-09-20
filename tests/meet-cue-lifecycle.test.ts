@@ -372,6 +372,21 @@ describe("Meet cue lifecycle", () => {
     expect(fixture.availability.at(-1)).toBe(true);
   });
 
+  it("keeps the strip hidden while a speaker has yet to say a word", async () => {
+    const fixture = createFixture();
+    fixture.adapter.setNativeCaptionVisibility(false);
+    await fixture.render([{ speaker: "Alice Chen", text: "hello" }]);
+
+    // Meet attributes the row as soon as someone starts speaking, before the
+    // recognizer has a word for it. Nothing is being withheld from the user
+    // here — the row was read correctly and simply has nothing in it yet.
+    await fixture.render([{ speaker: "Alice Chen", text: "" }]);
+    await fixture.wait(2_400);
+
+    expect(fixture.region.getAttribute(MEET_NATIVE_HIDE_ATTRIBUTE)).toBe("");
+    expect(fixture.availability.at(-1)).toBe(true);
+  });
+
   it("does not re-emit an unchanged line", async () => {
     const fixture = createFixture();
     await fixture.render([{ speaker: "Alice Chen", text: "still here" }]);
