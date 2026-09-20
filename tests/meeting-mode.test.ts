@@ -16,6 +16,7 @@ import {
   MEETING_TRANSCRIPT_FAILURE_KEY,
   retainedTranscriptFailures,
   summarizeTranscripts,
+  MAX_TRANSCRIPT_LINES,
   MAX_TRANSCRIPT_SESSIONS,
   readTranscriptSession,
   readTranscriptSessions,
@@ -429,6 +430,22 @@ describe("telling the user a meeting stopped being recorded", () => {
 
     expect(summary.stopped).toBeNull();
     expect(describeTranscriptSummary(summary)).toMatchObject({ state: "success" });
+  });
+
+  it("says every way a stored meeting can disappear, not just the retention window", () => {
+    // The caps evict inside the window: a user with a few meetings a day
+    // loses a three-day-old record while the page promises seven days.
+    const described = describeTranscriptSummary(
+      summarizeTranscripts({
+        stored: storedWith([session("meeting-1", NOW - DAY_MS)], {}),
+        nowMs: NOW,
+        retentionDays: 7
+      })
+    );
+
+    expect(described.text).toContain("7 天");
+    expect(described.text).toContain(`${MAX_TRANSCRIPT_SESSIONS} 场会议`);
+    expect(described.text).toContain(`${MAX_TRANSCRIPT_LINES} 行`);
   });
 
   it("keeps a refused write visible in the settings page, with the newest reason", () => {

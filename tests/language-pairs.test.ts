@@ -96,6 +96,29 @@ describe("subtitle track selection", () => {
     expect(chooseSubtitleTrack(tracks, "en")?.label).toBe("English");
   });
 
+  it("does not match a language code hidden inside another word", () => {
+    // "en" lives inside "auto-generated" and inside "french". A page that
+    // lists those first would otherwise hand the viewer Japanese captions
+    // under an English-to-Chinese translation.
+    const tracks = trackList([
+      { kind: "subtitles", language: "ja", label: "Japanese (auto-generated)" },
+      { kind: "subtitles", language: "fr", label: "French" },
+      { kind: "subtitles", language: "en", label: "English" }
+    ]);
+
+    expect(chooseSubtitleTrack(tracks, "en")?.label).toBe("English");
+    expect(chooseSubtitleTrack(tracks, "ja")?.label).toBe("Japanese (auto-generated)");
+  });
+
+  it("reads the language off a label when the track carries no subtag", () => {
+    const tracks = trackList([
+      { kind: "subtitles", language: "", label: "Deutsch" },
+      { kind: "subtitles", language: "", label: "日本語" }
+    ]);
+
+    expect(chooseSubtitleTrack(tracks, "ja")?.label).toBe("日本語");
+  });
+
   it("falls back to the only track a page offers", () => {
     // Plenty of sites ship one track with no usable language metadata. It is
     // the subtitles the viewer can see, so it is the ones we read.

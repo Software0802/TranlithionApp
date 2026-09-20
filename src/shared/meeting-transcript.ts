@@ -241,7 +241,11 @@ export function describeTranscriptSummary(
     summary.sessions === 0
       ? "本机当前没有保存任何会议记录。"
       : `本机保存了 ${summary.sessions} 场会议、共 ${summary.lines} 行；` +
-        `超过 ${summary.retentionDays} 天的记录会自动删除。`;
+        `超过 ${summary.retentionDays} 天的记录会自动删除，` +
+        // The caps evict inside the window too, and a record that vanishes
+        // three days into a seven-day promise is the promise being broken.
+        `最多只保留最近 ${MAX_TRANSCRIPT_SESSIONS} 场会议、每场最后 ${MAX_TRANSCRIPT_LINES} 行，` +
+        "超出的部分即使没到期也会被删掉。";
   if (!summary.stopped) {
     return { state: "success", text: stored };
   }
