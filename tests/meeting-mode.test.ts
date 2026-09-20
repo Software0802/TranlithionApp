@@ -13,6 +13,8 @@ import {
   describeTranscriptSummary,
   expiredTranscriptKeys,
   isTranscriptSessionKey,
+  readTranscriptFailures,
+  retainedTranscriptFailures,
   summarizeTranscripts,
   MAX_TRANSCRIPT_SESSIONS,
   readTranscriptSession,
@@ -432,6 +434,46 @@ describe("telling the user a meeting stopped being recorded", () => {
     expect(described.text).toContain("2 场会议中途写入失败");
     expect(described.text).toContain("QUOTA_BYTES quota exceeded");
     expect(described.text).toContain("没有再被记录");
+  });
+
+  it("keeps the note as long as the truncated record it describes", () => {
+    const now = 100 * DAY_MS;
+    // What `chrome.storage.local` holds after the write was refused, read
+    // back the way the worker reads it on a later launch.
+    const stored: Record<string, unknown> = {
+      [transcriptSessionKey("meeting-1")]: session("meeting-1", now - 2 * DAY_MS),
+      "meeting-transcript-failures": {
+        "meeting-1": { reason: "存储空间可能已满", atMs: now - 2 * DAY_MS }
+      }
+    };
+
+    const failures = readTranscriptFailures(stored["meeting-transcript-failures"]);
+    const kept = retainedTranscriptFailures(failures, now, 7);
+
+    expect(Object.keys(kept)).toEqual(["meeting-1"]);
+    expect(
+      summarizeTranscripts({
+        sessions: readTranscriptSessions(stored),
+        failures: Object.values(kept),
+        retentionDays: 7
+      }).stopped
+    ).toEqual({ meetings: 1, reason: "存储空间可能已满" });
+  });
+
+  it("drops the note at the same moment the record it describes expires", () => {
+    const now = 100 * DAY_MS;
+    const spoken = now - 8 * DAY_MS;
+    const stored: Record<string, unknown> = {
+      [transcriptSessionKey("meeting-1")]: session("meeting-1", spoken)
+    };
+    const failures = { "meeting-1": { reason: "存储空间可能已满", atMs: spoken } };
+
+    // The record goes at the retention window; so does the note about it —
+    // neither outlives the other.
+    expect(expiredTranscriptKeys(readTranscriptSessions(stored), now, 7)).toEqual([
+      transcriptSessionKey("meeting-1")
+    ]);
+    expect(retainedTranscriptFailures(failures, now, 7)).toEqual({});
   });
 
   it("reports the stopped meeting even when nothing was ever stored", () => {

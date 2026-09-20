@@ -211,6 +211,8 @@ function createFixture(overrides: Partial<PublicTranslationSettings> = {}) {
   /** The controller's own handler for adapter events, and the ends it saw. */
   let deliver: ((event: SubtitleAdapterEvent) => void) | null = null;
   const cueEnds: SubtitleAdapterEvent[] = [];
+  /** The cue a streamed token would belong to. */
+  let openCueId = "";
   const startAdapter = MeetCaptionAdapter.prototype.start;
   vi.spyOn(MeetCaptionAdapter.prototype, "start").mockImplementation(function (
     this: MeetCaptionAdapter,
@@ -220,6 +222,9 @@ function createFixture(overrides: Partial<PublicTranslationSettings> = {}) {
     startAdapter.call(this, (event) => {
       if (event.type === "cue-end") {
         cueEnds.push(event);
+      }
+      if (event.type === "cue-start" || event.type === "cue-revise") {
+        openCueId = event.cue.id;
       }
       onEvent(event);
     });
@@ -314,6 +319,10 @@ function createFixture(overrides: Partial<PublicTranslationSettings> = {}) {
       }
       await vi.advanceTimersByTimeAsync(0);
     },
+    /** One streamed token of the answer the model is still writing. */
+    showPartial(text: string) {
+      controller.showPartialTranslation(controller.sessionId, openCueId, text);
+    },
     /** Hands the controller the cue-end it just saw a second time. */
     async redeliverLastCueEnd() {
       deliver?.(cueEnds[cueEnds.length - 1]);
@@ -402,6 +411,32 @@ describe("meeting translation flow", () => {
     await fixture.releaseModel("Good morning.");
 
     expect(fixture.caption()).toBe("[zh] Thanks");
+  });
+
+  it("shows the model's answer as it is streamed in", async () => {
+    const fixture = createFixture({ meetingFinalChannel: "llm", draftCaptions: false });
+    fixture.holdModel("Good morning everyone.");
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning everyone." }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+    fixture.showPartial("早上好");
+
+    expect(fixture.caption()).toBe("早上好");
+  });
+
+  it("stops painting streamed tokens once the target language changes", async () => {
+    const fixture = createFixture({ meetingFinalChannel: "llm", draftCaptions: false });
+    fixture.holdModel("Good morning everyone.");
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning everyone." }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    // The model is still writing its answer when the user switches away from
+    // the language it was asked for.
+    fixture.setTargetLanguage("en");
+    fixture.showPartial("早上好");
+
+    expect(fixture.caption()).toBeNull();
   });
 
   it("drops an answer that comes back after the target language changed", async () => {

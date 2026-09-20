@@ -29,8 +29,10 @@ import {
   appendTranscriptLine,
   expiredTranscriptKeys,
   isTranscriptSessionKey,
+  readTranscriptFailures,
   readTranscriptSession,
   readTranscriptSessions,
+  retainedTranscriptFailures,
   retainedTranscriptSessions,
   summarizeTranscripts,
   transcriptSessionKey,
@@ -523,7 +525,7 @@ async function meetingTranscriptSummary(): Promise<MeetingTranscriptResponse> {
     ok: true,
     summary: summarizeTranscripts({
       sessions,
-      failures: Object.values(await readTranscriptFailures()),
+      failures: Object.values(await storedTranscriptFailures()),
       retentionDays: settings.meetingTranscriptRetentionDays
     })
   };
@@ -951,6 +953,18 @@ async function dropExpiredTranscripts(retentionDays: number): Promise<void> {
   if (expired.length > 0) {
     await chrome.storage.local.remove(expired);
   }
+  const failures = readTranscriptFailures(stored[TRANSCRIPT_FAILURE_STORAGE_KEY]);
+  const kept = retainedTranscriptFailures(failures, Date.now(), retentionDays);
+  if (Object.keys(kept).length === Object.keys(failures).length) {
+    return;
+  }
+  // A note about a meeting goes when that meeting's record goes: the same
+  // window, so it never outlives what it describes and never leaves first.
+  if (Object.keys(kept).length === 0) {
+    await chrome.storage.local.remove(TRANSCRIPT_FAILURE_STORAGE_KEY);
+    return;
+  }
+  await chrome.storage.local.set({ [TRANSCRIPT_FAILURE_STORAGE_KEY]: kept });
 }
 
 async function clearStoredTranscripts(): Promise<void> {
@@ -1019,32 +1033,31 @@ async function reportTranscriptStorageFailure(
   });
 }
 
+/**
+ * Kept beside the transcripts in `chrome.storage.local`, not in the session
+ * area: the truncated record lives for the whole retention window, and a note
+ * about it that disappeared when the browser closed would leave the user with
+ * a half-recorded meeting and no way to find out.
+ */
 async function rememberTranscriptFailure(sessionId: string, reason: string): Promise<void> {
-  const failures = await readTranscriptFailures();
-  failures[sessionId] = { reason, atMs: Date.now() };
-  await chrome.storage.session.set({ [TRANSCRIPT_FAILURE_STORAGE_KEY]: failures });
+  try {
+    const failures = await storedTranscriptFailures();
+    failures[sessionId] = { reason, atMs: Date.now() };
+    await chrome.storage.local.set({ [TRANSCRIPT_FAILURE_STORAGE_KEY]: failures });
+  } catch {
+    // The same full storage that refused the line can refuse this note; the
+    // popup still says so for this meeting, and captions carry on.
+  }
 }
 
-async function readTranscriptFailures(): Promise<Record<string, TranscriptFailure>> {
-  const stored = await chrome.storage.session.get(TRANSCRIPT_FAILURE_STORAGE_KEY);
-  const value = stored[TRANSCRIPT_FAILURE_STORAGE_KEY];
-  if (typeof value !== "object" || value === null || Array.isArray(value)) {
-    return {};
-  }
-  return Object.fromEntries(
-    Object.entries(value).filter(
-      (entry): entry is [string, TranscriptFailure] =>
-        typeof entry[1] === "object" &&
-        entry[1] !== null &&
-        typeof (entry[1] as TranscriptFailure).reason === "string" &&
-        Number.isFinite((entry[1] as TranscriptFailure).atMs)
-    )
-  );
+async function storedTranscriptFailures(): Promise<Record<string, TranscriptFailure>> {
+  const stored = await chrome.storage.local.get(TRANSCRIPT_FAILURE_STORAGE_KEY);
+  return readTranscriptFailures(stored[TRANSCRIPT_FAILURE_STORAGE_KEY]);
 }
 
 async function forgetTranscriptFailures(): Promise<void> {
   transcriptStorageFailures.clear();
-  await chrome.storage.session.remove(TRANSCRIPT_FAILURE_STORAGE_KEY);
+  await chrome.storage.local.remove(TRANSCRIPT_FAILURE_STORAGE_KEY);
 }
 
 function errorText(error: unknown): string {

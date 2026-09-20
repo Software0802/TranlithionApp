@@ -106,10 +106,14 @@ export function retainedTranscriptSessions(
   nowMs: number,
   retentionDays: number
 ): MeetingTranscriptSession[] {
-  const cutoff = nowMs - Math.max(1, retentionDays) * DAY_MS;
+  const cutoff = retentionCutoff(nowMs, retentionDays);
   return listTranscriptSessions(sessions)
     .filter((session) => session.updatedAtMs >= cutoff)
     .slice(0, MAX_TRANSCRIPT_SESSIONS);
+}
+
+function retentionCutoff(nowMs: number, retentionDays: number): number {
+  return nowMs - Math.max(1, retentionDays) * DAY_MS;
 }
 
 /** Storage keys of the meetings that have expired or fallen past the cap. */
@@ -226,4 +230,42 @@ export function describeTranscriptSummary(
       `（${summary.stopped.reason}），从那一刻起没有再被记录。` +
       "清除会议记录可以腾出空间并重新开始记录。"
   };
+}
+
+/**
+ * The failures still worth telling the user about.
+ *
+ * A meeting stops being recorded at the moment of the refused write, so the
+ * note about it ages exactly like the truncated record it describes: it is
+ * kept for the same retention window and goes when that record goes, never
+ * before. A meeting whose very first write was refused has no stored record
+ * at all, and the same window is what keeps its note honest.
+ */
+export function retainedTranscriptFailures(
+  failures: Record<string, TranscriptFailure>,
+  nowMs: number,
+  retentionDays: number
+): Record<string, TranscriptFailure> {
+  const cutoff = retentionCutoff(nowMs, retentionDays);
+  return Object.fromEntries(
+    Object.entries(failures).filter(([, failure]) => failure.atMs >= cutoff)
+  );
+}
+
+/** Every recorded failure in a `chrome.storage.local` value, ignoring junk. */
+export function readTranscriptFailures(value: unknown): Record<string, TranscriptFailure> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return {};
+  }
+  return Object.fromEntries(
+    Object.entries(value).filter((entry): entry is [string, TranscriptFailure] => {
+      const failure = entry[1] as TranscriptFailure | null;
+      return (
+        typeof failure === "object" &&
+        failure !== null &&
+        typeof failure.reason === "string" &&
+        Number.isFinite(failure.atMs)
+      );
+    })
+  );
 }

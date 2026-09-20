@@ -121,6 +121,8 @@ export class SubtitleController {
   private meetingChannelBroken = false;
   /** Settled cues already handed to the transcript, so each is recorded once. */
   private readonly recordedCueIds = new Set<string>();
+  /** The pair the answer currently streaming in was asked for. */
+  private streamingPair: string | null = null;
   /** One budget per sentence, keyed by its cue. See `runFinalTranslation`. */
   private readonly meetingLineBudgets = new Map<string, MeetingLineBudget>();
 
@@ -233,6 +235,8 @@ export class SubtitleController {
       this.overlayHidden() ||
       this.activeCue?.id !== cueId ||
       !isStickySource(this.activeCue.source) ||
+      // Tokens of an answer the user switched languages away from mid-stream.
+      this.streamingPair !== this.languagePair() ||
       !text.trim()
     ) {
       return;
@@ -1108,6 +1112,7 @@ export class SubtitleController {
   private async translateActiveCue(cue: SubtitleCue, signal?: AbortSignal): Promise<void> {
     try {
       const pair = this.languagePair();
+      this.streamingPair = pair;
       const response = await this.requestTranslation(cue);
       if (this.destroyed || pair !== this.languagePair()) {
         return;
