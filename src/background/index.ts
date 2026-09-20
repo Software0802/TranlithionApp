@@ -29,11 +29,11 @@ import {
   appendTranscriptLine,
   expiredTranscriptKeys,
   isTranscriptSessionKey,
+  MEETING_TRANSCRIPT_FAILURE_KEY,
   readTranscriptFailures,
   readTranscriptSession,
   readTranscriptSessions,
   retainedTranscriptFailures,
-  retainedTranscriptSessions,
   summarizeTranscripts,
   transcriptSessionKey,
   type TranscriptFailure
@@ -64,8 +64,6 @@ import { translateWithAgent, TranslatorError } from "./translator";
 
 const SESSION_CONTEXT_STORAGE_KEY = "translation-session-context";
 const TAB_STATUS_STORAGE_KEY = "tab-runtime-status";
-/** Meetings whose recording stopped, kept where a later caption cannot erase it. */
-const TRANSCRIPT_FAILURE_STORAGE_KEY = "meeting-transcript-failures";
 /** Dynamic registration created by the popup's "启用全站" button. */
 const ALL_PAGES_CONTENT_SCRIPT_ID = "tranlithion-all-pages";
 const sessionStore = new TranslationSessionStore();
@@ -948,7 +946,7 @@ async function dropExpiredTranscripts(retentionDays: number): Promise<void> {
   if (expired.length > 0) {
     await chrome.storage.local.remove(expired);
   }
-  const failures = readTranscriptFailures(stored[TRANSCRIPT_FAILURE_STORAGE_KEY]);
+  const failures = readTranscriptFailures(stored[MEETING_TRANSCRIPT_FAILURE_KEY]);
   const kept = retainedTranscriptFailures(failures, Date.now(), retentionDays);
   if (Object.keys(kept).length === Object.keys(failures).length) {
     return;
@@ -956,10 +954,10 @@ async function dropExpiredTranscripts(retentionDays: number): Promise<void> {
   // A note about a meeting goes when that meeting's record goes: the same
   // window, so it never outlives what it describes and never leaves first.
   if (Object.keys(kept).length === 0) {
-    await chrome.storage.local.remove(TRANSCRIPT_FAILURE_STORAGE_KEY);
+    await chrome.storage.local.remove(MEETING_TRANSCRIPT_FAILURE_KEY);
     return;
   }
-  await chrome.storage.local.set({ [TRANSCRIPT_FAILURE_STORAGE_KEY]: kept });
+  await chrome.storage.local.set({ [MEETING_TRANSCRIPT_FAILURE_KEY]: kept });
 }
 
 async function clearStoredTranscripts(): Promise<void> {
@@ -1038,7 +1036,7 @@ async function rememberTranscriptFailure(sessionId: string, reason: string): Pro
   try {
     const failures = await storedTranscriptFailures();
     failures[sessionId] = { reason, atMs: Date.now() };
-    await chrome.storage.local.set({ [TRANSCRIPT_FAILURE_STORAGE_KEY]: failures });
+    await chrome.storage.local.set({ [MEETING_TRANSCRIPT_FAILURE_KEY]: failures });
   } catch {
     // The same full storage that refused the line can refuse this note; the
     // popup still says so for this meeting, and captions carry on.
@@ -1046,13 +1044,13 @@ async function rememberTranscriptFailure(sessionId: string, reason: string): Pro
 }
 
 async function storedTranscriptFailures(): Promise<Record<string, TranscriptFailure>> {
-  const stored = await chrome.storage.local.get(TRANSCRIPT_FAILURE_STORAGE_KEY);
-  return readTranscriptFailures(stored[TRANSCRIPT_FAILURE_STORAGE_KEY]);
+  const stored = await chrome.storage.local.get(MEETING_TRANSCRIPT_FAILURE_KEY);
+  return readTranscriptFailures(stored[MEETING_TRANSCRIPT_FAILURE_KEY]);
 }
 
 async function forgetTranscriptFailures(): Promise<void> {
   transcriptStorageFailures.clear();
-  await chrome.storage.local.remove(TRANSCRIPT_FAILURE_STORAGE_KEY);
+  await chrome.storage.local.remove(MEETING_TRANSCRIPT_FAILURE_KEY);
 }
 
 function errorText(error: unknown): string {

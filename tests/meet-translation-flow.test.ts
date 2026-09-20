@@ -462,10 +462,27 @@ describe("meeting translation flow", () => {
     expect(fixture.draftRequests.filter((text) => text === "Good morning.")).toHaveLength(2);
   });
 
+  it("translates a one-word answer once the turn is over", async () => {
+    const fixture = createFixture();
+
+    // "No." reads exactly like a title while it is the only text there, so
+    // it waits — but the turn ending is what it was waiting for.
+    await fixture.render([{ speaker: "Bob Tan", text: "No." }]);
+
+    expect(fixture.draftRequests).toEqual([]);
+
+    await fixture.render([]);
+    await fixture.wait(3_000);
+
+    expect(fixture.draftRequests).toEqual(["No."]);
+    expect(fixture.recorded).toMatchObject([{ source: "No.", translation: "[zh] No." }]);
+  });
+
   it("keeps a title with the sentence it belongs to", async () => {
     const fixture = createFixture();
 
-    // The recognizer streams the title with the name it belongs to.
+    // The recognizer streams the honorific on its own before the name lands.
+    await fixture.render([{ speaker: "Alice Chen", text: "Mr." }]);
     await fixture.render([{ speaker: "Alice Chen", text: "Mr. Chen will" }]);
     await fixture.render([{ speaker: "Alice Chen", text: "Mr. Chen will present. Then" }]);
 

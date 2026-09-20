@@ -376,6 +376,17 @@ async function grantMeetingHosts(): Promise<void> {
   }
 }
 
+async function storedTranscriptText(): Promise<string> {
+  try {
+    const response = (await chrome.runtime.sendMessage({
+      type: "GET_MEETING_TRANSCRIPTS"
+    } satisfies ExtensionMessage)) as MeetingTranscriptResponse;
+    return response.summary ? describeTranscriptSummary(response.summary).text : "";
+  } catch {
+    return "";
+  }
+}
+
 async function loadTranscriptSummary(): Promise<void> {
   try {
     const response = (await chrome.runtime.sendMessage({
@@ -399,9 +410,19 @@ async function loadTranscriptSummary(): Promise<void> {
 async function wipeTranscripts(): Promise<void> {
   clearTranscripts.disabled = true;
   try {
-    await chrome.runtime.sendMessage({
+    // The worker answers a refused wipe rather than throwing, and saying the
+    // records are gone while they are still on disk is the one mistake a
+    // delete button must never make.
+    const response = (await chrome.runtime.sendMessage({
       type: "CLEAR_MEETING_TRANSCRIPTS"
-    } satisfies ExtensionMessage);
+    } satisfies ExtensionMessage)) as { ok?: boolean; error?: string } | undefined;
+    if (response?.ok !== true) {
+      const stored = await storedTranscriptText();
+      transcriptSummary.dataset.state = "error";
+      transcriptSummary.textContent =
+        `清除失败（${response?.error ?? "请重试"}）：会议记录仍在本机。${stored}`;
+      return;
+    }
     transcriptSummary.dataset.state = "success";
     transcriptSummary.textContent = "已清除本机保存的全部会议记录。";
   } catch {

@@ -83,23 +83,45 @@ describe("reading the track the user asked for", () => {
     ).toEqual(["Good morning"]);
   });
 
-  it("says the captions are unavailable when the new language has no track", () => {
+  it("keeps reading the only track a page offers after a switch", () => {
+    // The same fallback a fresh load uses: one readable track is what the
+    // viewer can see, whichever language the picker is set to.
     const fixture = createFixture(
-      [track("ja", "日本語", [{ startTime: 1, endTime: 2, text: "おはよう" }])],
+      [track("", "Subtitles", [{ startTime: 1, endTime: 2, text: "Good morning" }])],
       "ja"
     );
 
     fixture.events.length = 0;
-    fixture.adapter.setSourceLanguage("zh-CN");
+    fixture.adapter.setSourceLanguage("en");
 
-    // Better to say nothing is readable than to keep translating Japanese as
-    // if it were the Chinese the user asked for.
     const availability = fixture.events.filter((event) => event.type === "availability");
     expect(availability.at(-1)).toEqual({
       type: "availability",
       source: "text-track",
-      available: false
+      available: true
     });
+    expect(
+      fixture.events.filter((event) => event.type === "cue-start").map((event) =>
+        event.type === "cue-start" ? event.cue.text : ""
+      )
+    ).toEqual(["Good morning"]);
+  });
+
+  it("stops reading the old track even while the new one has nothing on screen", () => {
+    const fixture = createFixture(
+      [
+        track("ja", "日本語", [{ startTime: 1, endTime: 2, text: "おはよう" }]),
+        track("en", "English", [])
+      ],
+      "ja"
+    );
+
+    fixture.events.length = 0;
+    fixture.adapter.setSourceLanguage("en");
+
+    // The Japanese line ends here rather than staying on screen under a
+    // translator that has been asked for English.
+    expect(fixture.events.filter((event) => event.type === "cue-end")).toHaveLength(1);
     expect(fixture.events.some((event) => event.type === "cue-start")).toBe(false);
   });
 });

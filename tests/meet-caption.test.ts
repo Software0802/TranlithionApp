@@ -293,11 +293,17 @@ describe("settled segment splitting", () => {
     expect(settledSegmentEnd("we shipped 2.1 last")).toBe(0);
   });
 
-  it("does not cut after a title the name follows", () => {
-    // A title comes with its name in the same breath. Cutting between them
-    // would translate and record the honorific on its own and leave the name
-    // it belongs to without it.
+  it("holds the line open on a stop that may belong to the word before it", () => {
+    // One read cannot tell a title from a one-word answer: "Mr." and "No."
+    // look the same. Neither closes a segment here; what follows decides,
+    // and a turn that ends on it settles at its cue-end instead.
+    expect(settledSegmentEnd("Mr.")).toBe(0);
     expect(settledSegmentEnd("Mr. Chen will")).toBe(0);
+    expect(settledSegmentEnd("No.")).toBe(0);
+    expect(settledSegmentEnd("Hi.")).toBe(0);
+
+    // Once the sentence ends on an ordinary word, everything before it
+    // settles in one piece — the honorific included.
     const whole = "Mr. Chen will present.";
     expect(whole.slice(0, settledSegmentEnd(whole))).toBe(whole);
 
@@ -305,14 +311,10 @@ describe("settled segment splitting", () => {
     expect(finished.slice(0, settledSegmentEnd(finished))).toBe("Mr. Chen will present.");
   });
 
-  it("settles a short utterance that is the whole of what was said", () => {
-    // "No." is a complete answer, and one of the commonest things anyone says
-    // in a meeting. Holding it open would leave it untranslated until the
-    // speaker happened to say something else.
-    expect(settledSegmentEnd("No.")).toBe(3);
-    expect(settledSegmentEnd("Hi.")).toBe(3);
-    expect(settledSegmentEnd("Let us ask Jo.")).toBe(14);
+  it("settles a sentence that ends on an ordinary word", () => {
     expect(settledSegmentEnd("Okay.")).toBe(5);
+    expect(settledSegmentEnd("Let us ask Jo. Then")).toBe(0);
+    expect("I said no. Then".slice(0, settledSegmentEnd("I said no. Then"))).toBe("I said no.");
   });
 
   it("does not cut after initials or an initialism the sentence carries on past", () => {

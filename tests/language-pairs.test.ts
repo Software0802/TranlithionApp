@@ -96,15 +96,12 @@ describe("subtitle track selection", () => {
     expect(chooseSubtitleTrack(tracks, "en")?.label).toBe("English");
   });
 
-  it("reads an unlabelled track but never one that says it is another language", () => {
-    // A site that forgot to label its only track is worth guessing at. A
-    // track that says it is Japanese is not the English the user asked for,
-    // and captioning it as if it were would be inventing a translation.
-    const unlabelled = trackList([{ kind: "subtitles", language: "", label: "" }]);
-    const japanese = trackList([{ kind: "subtitles", language: "ja", label: "日本語" }]);
+  it("falls back to the only track a page offers", () => {
+    // Plenty of sites ship one track with no usable language metadata. It is
+    // the subtitles the viewer can see, so it is the ones we read.
+    const unlabelled = trackList([{ kind: "subtitles", language: "", label: "Subtitles" }]);
 
-    expect(chooseSubtitleTrack(unlabelled, "en")).toBeDefined();
-    expect(chooseSubtitleTrack(japanese, "en")).toBeUndefined();
+    expect(chooseSubtitleTrack(unlabelled, "en")?.label).toBe("Subtitles");
   });
 });
 

@@ -117,12 +117,10 @@ export function settledSegmentEnd(text: string): number {
   const terminators = /[。！？]+|[.!?]+(?=\s|$)/g;
   let cut = 0;
   for (let match = terminators.exec(text); match; match = terminators.exec(text)) {
-    const end = match.index + match[0].length;
-    const followedByMore = text.slice(end).trim().length > 0;
-    if (followedByMore && ABBREVIATED_WORD_END.test(text.slice(0, match.index))) {
+    if (ABBREVIATED_WORD_END.test(text.slice(0, match.index))) {
       continue;
     }
-    cut = end;
+    cut = match.index + match[0].length;
   }
   if (cut > 0) {
     return cut;
@@ -148,10 +146,11 @@ export function settledSegmentEnd(text: string): number {
  * sentence it finishes — 「Fine.」 and 「I said no.」 still settle — except the
  * three Latin abbreviations that break the rule, named here and nowhere else.
  *
- * It only holds a sentence open when more of the read follows it: a title
- * comes with the name in the same breath, while 「No.」 and 「Hi.」 arrive as
- * the whole thing anyone said, and waiting on those would leave a finished
- * utterance untranslated.
+ * A stop it catches holds the sentence open rather than ending it, because a
+ * single read cannot tell 「Mr.」 from 「No.」 — at that instant they look the
+ * same. What follows decides: the next read of the same block carries on
+ * into the name and the two become one segment, while a turn that ends there
+ * settles what was held, so a one-word answer is still translated once.
  */
 const ABBREVIATED_WORD_END = /(?:^|\s)(?:\p{Lu}\p{Ll}?|(?:\p{Lu}\.)+\p{Lu}|e\.g|i\.e|etc)$/u;
 
