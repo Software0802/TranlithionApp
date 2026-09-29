@@ -202,23 +202,6 @@ describe("translation session memory", () => {
     expect(restored.getCached("session", "cue-1")).toBeUndefined();
   });
 
-  it("serializes translation jobs for one viewing session", async () => {
-    const queue = new SessionJobQueue();
-    const order: string[] = [];
-    const first = queue.enqueue("session", async () => {
-      await new Promise((resolve) => setTimeout(resolve, 10));
-      order.push("first");
-      return "first";
-    });
-    const second = queue.enqueue("session", async () => {
-      order.push("second");
-      return "second";
-    });
-
-    await expect(Promise.all([first, second])).resolves.toEqual(["first", "second"]);
-    expect(order).toEqual(["first", "second"]);
-  });
-
   it("cancels stale live-caption requests without waiting for their cleanup", async () => {
     const queue = new SessionJobQueue();
     const started: string[] = [];

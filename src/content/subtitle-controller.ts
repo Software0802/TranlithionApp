@@ -65,6 +65,14 @@ const NETFLIX_REVISE_DEBOUNCE_MS = 100;
 const MEETING_REVISE_DEBOUNCE_MS = 400;
 /** First streamed paint needs at least this many characters to avoid flashing a lone glyph. */
 const EARLY_STREAM_MIN_CHARS = 2;
+/**
+ * A prefetched line or a local draft answers within a frame or two. Showing
+ * 「正在翻译…」 before it would flash the placeholder once per line, so it only
+ * goes up once the wait is long enough to notice.
+ */
+const PENDING_PLACEHOLDER_DELAY_MS = 150;
+/** How many upcoming text-track lines are translated ahead of playback. */
+const PREFETCH_AHEAD_CUES = 3;
 
 /** How long to wait for a source to settle before translating it. */
 export function reviseDebounceMs(source: SubtitleSource): number {
@@ -106,6 +114,11 @@ export class SubtitleController {
   private draftTranslator: DraftChannel | null = null;
   /** Meeting mode's single low-cost channel; null when the model is the final. */
   private meetingChannel: DraftChannel | null = null;
+  /**
+   * DeepL alone on Netflix. Its answer is the caption itself, with nothing
+   * behind it, so it runs as a final channel rather than as a draft.
+   */
+  private filmFinalChannel: DraftChannel | null = null;
   private draftAbort: AbortController | null = null;
   private captionShownAtMs = 0;
   private teardownTimer: number | null = null;
@@ -116,6 +129,9 @@ export class SubtitleController {
   private lastStreamText = "";
   private reviseTimer: number | null = null;
   private pendingReviseCue: SubtitleCue | null = null;
+  private placeholderTimer: number | null = null;
+  /** The translation services' connections were opened for this page. */
+  private warmedUp = false;
   /** Meeting translations, one at a time. See `runFinalTranslation`. */
   private meetingQueue: Promise<void> = Promise.resolve();
   /** Aborted on destroy only: a finished sentence outlives its on-screen slot. */
@@ -176,6 +192,9 @@ export class SubtitleController {
     for (const adapter of this.adapters) {
       adapter.start((event) => this.handleAdapterEvent(event));
     }
+    if (this.target.kind === "video") {
+      this.target.video.addEventListener("play", this.handlePlay);
+    }
     if (!this.settings.enabled) {
       this.report("idle", "翻译已暂停");
     } else if (this.overlayHidden()) {
@@ -231,6 +250,7 @@ export class SubtitleController {
     this.meetingLineBudgets.clear();
     this.cancelTeardown();
     this.cancelReviseDebounce();
+    this.cancelPendingPlaceholder();
     this.draftAbort?.abort();
     this.draftAbort = null;
     this.settleAbort.abort();
@@ -238,6 +258,11 @@ export class SubtitleController {
     this.draftTranslator = null;
     this.meetingChannel?.destroy();
     this.meetingChannel = null;
+    this.filmFinalChannel?.destroy();
+    this.filmFinalChannel = null;
+    if (this.target.kind === "video") {
+      this.target.video.removeEventListener("play", this.handlePlay);
+    }
     for (const adapter of this.adapters) {
       adapter.stop();
     }
@@ -254,21 +279,24 @@ export class SubtitleController {
       !this.settings.enabled ||
       this.overlayHidden() ||
       this.activeCue?.id !== cueId ||
-      !isStickySource(this.activeCue.source) ||
       // Tokens of an answer the user switched languages away from mid-stream.
       this.streamingPair !== this.languagePair() ||
       !text.trim()
     ) {
       return;
     }
-    // Early stream only while nothing is on screen yet. If a draft already
-    // painted, ignore tokens so the caption is not rewritten mid-line; final
-    // may still replace draft once when the main model finishes.
-    if (this.activeCueStage !== "none") {
+    // A draft on screen is a whole sentence already, and the model's first
+    // tokens would only shorten what the viewer is reading: the finished
+    // answer replaces it once. Otherwise the answer is painted as it streams
+    // in, so the line fills in as it is written instead of at its end.
+    if (this.activeCueStage !== "none" && this.activeCueStage !== "streaming") {
       return;
     }
     const trimmed = text.trim();
-    if (trimmed.length < EARLY_STREAM_MIN_CHARS) {
+    if (this.activeCueStage === "none" && trimmed.length < EARLY_STREAM_MIN_CHARS) {
+      return;
+    }
+    if (!this.shouldPaintStreaming(trimmed)) {
       return;
     }
     this.applyCaption(this.activeCue, "streaming", trimmed);
@@ -307,6 +335,13 @@ export class SubtitleController {
     if (!event.available && this.activeSource === event.source && !this.activeCue) {
       this.activeSource = null;
     }
+    if (event.available && this.settings.enabled && !this.overlayHidden()) {
+      this.warmUpTranslationServices(event.source);
+      if (event.source === "text-track") {
+        // The first lines are asked for before playback reaches them too.
+        this.prefetchUpcoming(null);
+      }
+    }
     if (!this.settings.enabled || this.overlayHidden() || this.activeCue) {
       return;
     }
@@ -331,6 +366,7 @@ export class SubtitleController {
     // A newer caption always wins over the previous one's reading-time hold.
     this.cancelTeardown();
     this.cancelReviseDebounce();
+    this.cancelPendingPlaceholder();
     this.activeCue = cue;
     this.activeCueStage = "none";
     this.lastStreamPaintAt = 0;
@@ -366,17 +402,112 @@ export class SubtitleController {
       return;
     }
 
-    this.overlay.show({
-      translation: "正在翻译…",
-      original: cue.text,
-      speaker: cue.speaker,
-      pending: true
-    });
+    this.schedulePendingPlaceholder(cue);
     this.report("translating", "正在翻译当前字幕", cue.source);
     // Both channels start together. The local draft normally lands within tens
     // of milliseconds; the service answer replaces it whenever it arrives.
     void this.showDraftTranslation(cue, this.draftAbort.signal);
     void this.translateActiveCue(cue);
+    if (cue.source === "text-track") {
+      this.prefetchUpcoming(cue);
+    }
+  }
+
+  /** 「正在翻译…」 for a line whose translation has not arrived in time to skip it. */
+  private schedulePendingPlaceholder(cue: SubtitleCue): void {
+    this.cancelPendingPlaceholder();
+    this.placeholderTimer = window.setTimeout(() => {
+      this.placeholderTimer = null;
+      if (
+        this.destroyed ||
+        this.activeCue?.id !== cue.id ||
+        this.activeCueStage !== "none" ||
+        !this.settings.enabled ||
+        this.overlayHidden()
+      ) {
+        return;
+      }
+      this.overlay.show({
+        translation: "正在翻译…",
+        original: cue.text,
+        speaker: cue.speaker,
+        pending: true
+      });
+    }, PENDING_PLACEHOLDER_DELAY_MS);
+  }
+
+  private cancelPendingPlaceholder(): void {
+    if (this.placeholderTimer !== null) {
+      window.clearTimeout(this.placeholderTimer);
+      this.placeholderTimer = null;
+    }
+  }
+
+  /**
+   * A text track carries the lines still to come, so the next few are
+   * translated before they are due and each is waiting in the background's
+   * cache when it comes on screen. Captions a page renders itself cannot be
+   * known before they are shown, and are translated as they appear.
+   *
+   * The line on screen leads the list. A prefetch already working on it is
+   * then kept for the caption asking for it, however the two messages
+   * interleave, instead of being dropped as a line the viewer moved past.
+   */
+  private prefetchUpcoming(onScreen: SubtitleCue | null): void {
+    const track = this.textTrackAdapter;
+    if (
+      !track ||
+      !this.settings.enabled ||
+      (this.activeSource !== null && this.activeSource !== "text-track")
+    ) {
+      return;
+    }
+    const upcoming = track.upcomingCues(
+      onScreen?.startMs ?? this.clock.nowMs(),
+      PREFETCH_AHEAD_CUES
+    );
+    const cues = onScreen
+      ? [onScreen, ...upcoming.filter((cue) => cue.id !== onScreen.id)]
+      : upcoming;
+    if (cues.length === 0) {
+      return;
+    }
+    void safeRuntimeSendMessage({
+      type: "PREFETCH_CUES",
+      sessionId: this.sessionId,
+      cues
+    } satisfies ExtensionMessage);
+  }
+
+  /**
+   * Opens the connections this page's captions will use once captions show
+   * up, so the first line does not pay the connection setup. Only services
+   * this page actually sends lines to: a meeting on a machine-translation
+   * channel never touches the chat model, not even with an empty request.
+   */
+  private warmUpTranslationServices(source: SubtitleSource): void {
+    if (this.warmedUp) {
+      return;
+    }
+    this.warmedUp = true;
+    const meeting = this.meetingMode();
+    const channel = this.settings.meetingFinalChannel;
+    const model = meeting
+      ? channel === "llm"
+      : !(isStickySource(source) && this.usesDeepLOnly());
+    const draft =
+      this.settings.draftProvider !== "browser" &&
+      (meeting
+        ? channel === "fast-mt" || (channel === "llm" && this.settings.draftCaptions)
+        : this.settings.draftCaptions);
+    if (!model && !draft) {
+      return;
+    }
+    void safeRuntimeSendMessage({
+      type: "WARM_UP_TRANSLATOR",
+      model,
+      draft
+    } satisfies ExtensionMessage);
   }
 
   /**
@@ -679,6 +810,7 @@ export class SubtitleController {
   private teardownCue(source: SubtitleSource): void {
     this.cancelTeardown();
     this.cancelReviseDebounce();
+    this.cancelPendingPlaceholder();
     this.draftAbort?.abort();
     this.draftAbort = null;
     this.activeCue = null;
@@ -720,7 +852,7 @@ export class SubtitleController {
     if (this.meetingMode()) {
       return this.meetingChannel;
     }
-    return this.usesDeepLOnly() ? this.draftTranslator : null;
+    return this.usesDeepLOnly() ? this.filmFinalChannel : null;
   }
 
   /**
@@ -833,6 +965,11 @@ export class SubtitleController {
     // The on-device translator has neither an address nor a Key, so sending
     // the user to check them would be pointing at the wrong screen.
     if (this.meetingMode() && this.settings.draftProvider === "browser") {
+      // Nothing is wrong with the configuration: Chrome is waiting for the
+      // one click that lets this site set the language pair up.
+      if (this.meetingChannel?.awaitingActivation?.()) {
+        return "Chrome 内置翻译还没启用：在这个网站第一次使用这个语言对时，Chrome 要等你在会议页面上点击或按键一次。点一下页面后，下一句就会翻译。";
+      }
       return "Chrome 内置翻译没有给出结果：这台设备或这个语言对可能不支持它。请在设置中把会议翻译通道改为 DeepL / 自定义机器翻译或本机 LibreTranslate。";
     }
     return `${this.singleChannelLabel()}：翻译失败或超时；请在设置中检查该通道的地址与 Key。`;
@@ -1158,6 +1295,8 @@ export class SubtitleController {
     this.draftTranslator = null;
     this.meetingChannel?.destroy();
     this.meetingChannel = null;
+    this.filmFinalChannel?.destroy();
+    this.filmFinalChannel = null;
 
     if (this.meetingMode() && this.settings.meetingFinalChannel !== "llm") {
       this.meetingChannel =
@@ -1168,7 +1307,8 @@ export class SubtitleController {
               this.sessionId,
               () => this.activeCue?.id ?? "",
               true,
-              () => this.settings.glossary
+              () => this.settings.glossary,
+              true
             );
       void this.meetingChannel?.prepare();
       return;
@@ -1182,7 +1322,36 @@ export class SubtitleController {
     // Warm the channel now so the first caption does not pay a one-time model
     // download. An unsupported pair simply disables the channel.
     void this.draftTranslator?.prepare();
+    if (this.usesDeepLOnly()) {
+      // With nothing behind it, a DeepL answer slower than a draft's budget
+      // would leave the line blank, and a name that reads the same in both
+      // languages would count as a failure. As the caption itself it gets a
+      // final channel's budget and the user's glossary.
+      this.filmFinalChannel = createFastChannel(
+        this.settings,
+        this.sessionId,
+        () => this.activeCue?.id ?? "",
+        true
+      );
+    }
   }
+
+  /**
+   * Playback resumed. After a long pause the connection opened for the first
+   * caption may be gone, and the next line would pay for a new one. The
+   * worker skips a service it warmed within the last half minute.
+   */
+  private readonly handlePlay = (): void => {
+    const source =
+      this.activeSource ??
+      [...this.availability].find(([, available]) => available)?.[0] ??
+      null;
+    if (!source || !this.settings.enabled || this.overlayHidden()) {
+      return;
+    }
+    this.warmedUp = false;
+    this.warmUpTranslationServices(source);
+  };
 
   private async translateActiveCue(cue: SubtitleCue, signal?: AbortSignal): Promise<void> {
     try {
@@ -1231,6 +1400,8 @@ export class SubtitleController {
           }
           this.syncNativeCaptionVisibility();
         } else {
+          // The failure is what this line is waiting on now, not 「正在翻译…」.
+          this.cancelPendingPlaceholder();
           this.overlay.show({
             translation: "翻译服务不可用",
             original: cue.text,

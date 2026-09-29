@@ -38,6 +38,16 @@ import type {
 const PREPARE_TIMEOUT_MS = 10_000;
 /** A draft slower than this is pointless: the service answer is already close. */
 const DRAFT_TIMEOUT_MS = 800;
+/**
+ * Input that gives the page transient user activation. The Translator API
+ * reports every pair as `downloadable` to a site until that site has created a
+ * translator for it, and creating one then needs user activation — which a
+ * caption turning up on its own never has. The viewer's next click or key
+ * press on the player is the first moment the local model can be set up.
+ */
+const ACTIVATION_EVENTS = ["pointerdown", "pointerup", "keydown"] as const;
+/** Creation failing for some other reason must not retry on every click forever. */
+const MAX_CREATE_ATTEMPTS = 5;
 
 /**
  * A source of immediate, lower-quality captions. Implementations must resolve
@@ -49,6 +59,11 @@ export interface DraftChannel {
   prepare(): Promise<boolean>;
   translate(text: string, signal?: AbortSignal): Promise<string | null>;
   destroy(): void;
+  /**
+   * The channel is not broken but waiting for the viewer to click or press a
+   * key on the page, which is what the browser needs before it can be set up.
+   */
+  awaitingActivation?(): boolean;
 }
 
 type TranslatorAvailability = "unavailable" | "downloadable" | "downloading" | "available";
@@ -85,6 +100,23 @@ function toTranslatorLanguage(language: SourceLanguage | TargetLanguage): string
   return toShortLanguageCode(language);
 }
 
+/** Where the page's input events can be heard; absent outside a document. */
+function activationTarget(): Pick<EventTarget, "addEventListener" | "removeEventListener"> | null {
+  const target = (globalThis as { window?: unknown }).window ?? globalThis;
+  return typeof (target as EventTarget).addEventListener === "function"
+    ? (target as EventTarget)
+    : null;
+}
+
+/** False only when the browser says outright that the page has no activation now. */
+function mayHaveUserActivation(): boolean {
+  const navigatorLike = (globalThis as {
+    navigator?: { userActivation?: { isActive?: unknown } };
+  }).navigator;
+  const isActive = navigatorLike?.userActivation?.isActive;
+  return typeof isActive === "boolean" ? isActive : true;
+}
+
 function readTranslatorFactory(): TranslatorFactory | null {
   const candidate = (globalThis as { Translator?: unknown }).Translator;
   // Chrome exposes Translator as a class, so `typeof` is "function" rather than
@@ -102,8 +134,19 @@ function readTranslatorFactory(): TranslatorFactory | null {
 export class DraftTranslator implements DraftChannel {
   private readonly pair: TranslatorLanguagePair;
   private instance: TranslatorInstance | null = null;
-  private preparation: Promise<TranslatorInstance | null> | null = null;
+  /** The one availability probe and first creation attempt this channel makes. */
+  private preparation: Promise<void> | null = null;
   private unsupported = false;
+  private destroyed = false;
+  private factory: TranslatorFactory | null = null;
+  /**
+   * A `create()` still running. It is kept past any caller's wait: a model
+   * download can take longer than a caption stays on screen, and the
+   * translator it finally yields serves every caption after it.
+   */
+  private creating: Promise<TranslatorInstance | null> | null = null;
+  private createAttempts = 0;
+  private stopWaitingForActivation: (() => void) | null = null;
 
   constructor(
     sourceLanguage: SourceLanguage,
@@ -126,7 +169,9 @@ export class DraftTranslator implements DraftChannel {
 
   /**
    * Warms the local model so the first caption does not pay the download cost.
-   * Resolves to false when this browser cannot serve the configured pair.
+   * Resolves to false while no translator exists: when this browser cannot
+   * serve the configured pair, or while a pair that still has to be
+   * downloaded waits for the viewer's first click or key press on the page.
    */
   async prepare(): Promise<boolean> {
     return (await this.resolveInstance()) !== null;
@@ -172,39 +217,40 @@ export class DraftTranslator implements DraftChannel {
     }
   }
 
+  awaitingActivation(): boolean {
+    return !this.instance && !this.destroyed && this.stopWaitingForActivation !== null;
+  }
+
   destroy(): void {
+    this.destroyed = true;
+    this.stopWaitingForActivation?.();
+    this.stopWaitingForActivation = null;
     this.instance?.destroy?.();
     this.instance = null;
     this.preparation = null;
   }
 
-  private resolveInstance(): Promise<TranslatorInstance | null> {
-    if (this.unsupported) {
-      return Promise.resolve(null);
+  /**
+   * Waits for the first preparation only. After that a caption never waits on
+   * the local model: until a translator exists the channel answers null at
+   * once, and the model's answer serves the caption as it did before.
+   */
+  private async resolveInstance(): Promise<TranslatorInstance | null> {
+    if (this.instance || this.unsupported || this.destroyed) {
+      return this.instance;
     }
-    if (this.instance) {
-      return Promise.resolve(this.instance);
-    }
-    this.preparation ??= this.createInstance().then(
-      (instance) => {
-        this.instance = instance;
-        if (!instance) {
-          this.unsupported = true;
-        }
-        return instance;
-      },
-      () => {
-        this.unsupported = true;
-        return null;
-      }
-    );
-    return this.preparation;
+    this.preparation ??= this.probe().catch(() => {
+      this.unsupported = true;
+    });
+    await this.preparation;
+    return this.instance;
   }
 
-  private async createInstance(): Promise<TranslatorInstance | null> {
+  private async probe(): Promise<void> {
     const factory = readTranslatorFactory();
     if (!factory) {
-      return null;
+      this.unsupported = true;
+      return;
     }
     const availability: TranslatorAvailability | null = await withTimeout(
       factory.availability(this.pair),
@@ -214,9 +260,84 @@ export class DraftTranslator implements DraftChannel {
     // explicit "unavailable" so the channel disables itself instead of retrying
     // a hanging call on every caption.
     if (availability === null || availability === "unavailable") {
-      return null;
+      this.unsupported = true;
+      return;
     }
-    return withTimeout(factory.create(this.pair), PREPARE_TIMEOUT_MS);
+    this.factory = factory;
+    await withTimeout(this.startCreating(), PREPARE_TIMEOUT_MS);
+  }
+
+  /**
+   * Asks for a translator. A pair that is already on the device needs nothing
+   * more; one that still has to be downloaded is refused until the page has
+   * user activation, so a refusal waits for the viewer's next click or key
+   * press and asks again from inside it.
+   */
+  private startCreating(): Promise<TranslatorInstance | null> {
+    const factory = this.factory;
+    if (this.creating || !factory || this.destroyed) {
+      return this.creating ?? Promise.resolve(null);
+    }
+    this.createAttempts += 1;
+    const creating: Promise<TranslatorInstance | null> = Promise.resolve()
+      .then(() => factory.create(this.pair))
+      .then(
+        (instance) => {
+          if (this.destroyed) {
+            instance.destroy?.();
+            return null;
+          }
+          this.instance = instance;
+          return instance;
+        },
+        () => {
+          this.waitForActivation();
+          return null;
+        }
+      )
+      .finally(() => {
+        if (this.creating === creating) {
+          this.creating = null;
+        }
+      });
+    this.creating = creating;
+    return creating;
+  }
+
+  private waitForActivation(): void {
+    if (
+      this.destroyed ||
+      this.instance ||
+      this.stopWaitingForActivation ||
+      this.createAttempts >= MAX_CREATE_ATTEMPTS
+    ) {
+      return;
+    }
+    const target = activationTarget();
+    if (!target) {
+      return;
+    }
+    const onInput = () => {
+      // A touch's pointerdown carries no activation yet; its pointerup will.
+      if (!mayHaveUserActivation()) {
+        return;
+      }
+      stop();
+      void this.startCreating();
+    };
+    const stop = () => {
+      for (const type of ACTIVATION_EVENTS) {
+        target.removeEventListener(type, onInput, { capture: true });
+      }
+      if (this.stopWaitingForActivation === stop) {
+        this.stopWaitingForActivation = null;
+      }
+    };
+    for (const type of ACTIVATION_EVENTS) {
+      // Capture on the window hears the click before a player can stop it.
+      target.addEventListener(type, onInput, { capture: true, passive: true });
+    }
+    this.stopWaitingForActivation = stop;
   }
 }
 
@@ -229,8 +350,13 @@ export class RemoteDraftTranslator implements DraftChannel {
   constructor(
     private readonly sessionId: string,
     private readonly cueIdOf: () => string,
-    /** Meeting mode: this channel is the caption, so drafts being off must not disable it. */
-    private readonly asFinal = false
+    /**
+     * This channel is the caption itself — a meeting's channel, or DeepL alone
+     * on Netflix — so it gets a final caption's budget rather than a draft's.
+     */
+    private readonly asFinal = false,
+    /** The lines are a call's, which a withdrawn record consent must reach. */
+    private readonly meeting = false
   ) {}
 
   /**
@@ -251,7 +377,8 @@ export class RemoteDraftTranslator implements DraftChannel {
         sessionId: this.sessionId,
         cueId: this.cueIdOf(),
         text,
-        asFinal: this.asFinal
+        asFinal: this.asFinal,
+        meeting: this.meeting
       } satisfies ExtensionMessage);
       if (!response?.ok || typeof response.text !== "string" || signal?.aborted) {
         return null;
@@ -334,7 +461,8 @@ export function createFastChannel(
   sessionId: string,
   cueIdOf: () => string,
   asFinal = false,
-  terminology: () => GlossaryEntry[] = () => []
+  terminology: () => GlossaryEntry[] = () => [],
+  meeting = false
 ): DraftChannel | null {
   if (settings.draftProvider === "browser") {
     return new DraftTranslator(
@@ -348,5 +476,5 @@ export function createFastChannel(
   if (settings.draftProvider === "deepl" && !settings.draftApiKeyConfigured) {
     return null;
   }
-  return new RemoteDraftTranslator(sessionId, cueIdOf, asFinal);
+  return new RemoteDraftTranslator(sessionId, cueIdOf, asFinal, meeting);
 }

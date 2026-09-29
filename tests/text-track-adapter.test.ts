@@ -16,7 +16,7 @@ interface FakeCue {
   text: string;
 }
 
-function track(language: string, label: string, cues: FakeCue[]) {
+function track(language: string, label: string, cues: FakeCue[], timeline: FakeCue[] = cues) {
   const listeners = new Set<() => void>();
   return {
     kind: "subtitles",
@@ -24,8 +24,17 @@ function track(language: string, label: string, cues: FakeCue[]) {
     label,
     mode: "disabled",
     activeCues: cues,
+    /** Every line of the track, as `TextTrack.cues` lists it. */
+    cues: timeline as FakeCue[] | null,
     addEventListener: (_type: string, handler: () => void) => listeners.add(handler),
-    removeEventListener: (_type: string, handler: () => void) => listeners.delete(handler)
+    removeEventListener: (_type: string, handler: () => void) => listeners.delete(handler),
+    /** Plays on to `active`, as the browser's cuechange would report it. */
+    showOnly(active: FakeCue[]) {
+      this.activeCues = active;
+      for (const listener of [...listeners]) {
+        listener();
+      }
+    }
   };
 }
 
@@ -115,5 +124,51 @@ describe("reading the track the user asked for", () => {
     // translator that has been asked for English.
     expect(fixture.events.filter((event) => event.type === "cue-end")).toHaveLength(1);
     expect(fixture.events.some((event) => event.type === "cue-start")).toBe(false);
+  });
+});
+
+describe("reading the lines still to come", () => {
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  const timeline: FakeCue[] = [
+    { startTime: 1, endTime: 2, text: "おはよう" },
+    { startTime: 3, endTime: 4, text: "こんにちは" },
+    { startTime: 5, endTime: 6, text: "こんばんは" },
+    { startTime: 7, endTime: 8, text: "さようなら" }
+  ];
+
+  it("lists the next lines after the one on screen, soonest first", () => {
+    // TextTrack.cues is ordered by the browser, but nothing here relies on it.
+    const shuffled = [timeline[3], timeline[1], timeline[0], timeline[2]];
+    const fixture = createFixture([track("ja", "日本語", [timeline[0]], shuffled)], "ja");
+
+    expect(fixture.adapter.upcomingCues(1_000, 2).map((cue) => cue.text)).toEqual([
+      "こんにちは",
+      "こんばんは"
+    ]);
+  });
+
+  it("builds each line exactly as it will be read once it is on screen", () => {
+    // A translation prefetched for a line is only found again if the line
+    // that comes on screen later carries the same id.
+    const japanese = track("ja", "日本語", [timeline[0]], timeline);
+    const fixture = createFixture([japanese], "ja");
+    const [next] = fixture.adapter.upcomingCues(1_000, 1);
+
+    fixture.events.length = 0;
+    japanese.showOnly([timeline[1]]);
+
+    const started = fixture.events.find((event) => event.type === "cue-start");
+    expect(started?.type === "cue-start" ? started.cue.id : null).toBe(next?.id);
+  });
+
+  it("has nothing ahead when the track exposes no timeline", () => {
+    const bare = track("ja", "日本語", [timeline[0]]);
+    bare.cues = null;
+    const fixture = createFixture([bare], "ja");
+
+    expect(fixture.adapter.upcomingCues(0, 3)).toEqual([]);
   });
 });

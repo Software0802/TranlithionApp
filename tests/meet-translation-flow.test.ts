@@ -71,6 +71,10 @@ function createFixture(overrides: Partial<PublicTranslationSettings> = {}) {
   const draftRequests: string[] = [];
   const modelRequests: string[] = [];
   const recorded: RecordedLine[] = [];
+  /** Every connection warm-up the page asked the worker for. */
+  const warmUps: Array<{ model: unknown; draft: unknown }> = [];
+  /** How each channel request described itself to the worker. */
+  const draftFlags: Array<{ asFinal: unknown; meeting: unknown }> = [];
   /** Everything the popup was told, newest last. */
   const statuses: RuntimeStatus[] = [];
   /** Source lines the channel refuses to translate. */
@@ -182,7 +186,12 @@ function createFixture(overrides: Partial<PublicTranslationSettings> = {}) {
     runtime: {
       id: "tranlithion-test",
       sendMessage: async (message: { type: string; [key: string]: unknown }) => {
+        if (message.type === "WARM_UP_TRANSLATOR") {
+          warmUps.push({ model: message.model, draft: message.draft });
+          return { ok: true };
+        }
         if (message.type === "DRAFT_TRANSLATE") {
+          draftFlags.push({ asFinal: message.asFinal, meeting: message.meeting });
           const text = String(message.text);
           draftRequests.push(text);
           if (heldSources.has(text)) {
@@ -290,6 +299,8 @@ function createFixture(overrides: Partial<PublicTranslationSettings> = {}) {
     draftRequests,
     modelRequests,
     recorded,
+    warmUps,
+    draftFlags,
     draftFailures,
     caption,
     /** Whether Meet's own caption strip is readable to the user right now. */
@@ -683,6 +694,53 @@ describe("meeting translation flow", () => {
     await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
 
     expect(fixture.modelRequests).toEqual([]);
+  });
+
+  it("warms only the channel the meeting's lines go to, never the chat model it opted out of", async () => {
+    const fixture = createFixture();
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Let's" }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    expect(fixture.warmUps).toEqual([{ model: false, draft: true }]);
+  });
+
+  it("asks the meeting's channel for a call's line, which consent withdrawal reaches", async () => {
+    const fixture = createFixture();
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Let's" }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    expect(fixture.draftFlags.length).toBeGreaterThan(0);
+    expect(fixture.draftFlags.every((flags) => flags.asFinal === true && flags.meeting === true)).toBe(
+      true
+    );
+  });
+
+  it("warms the chat model when the meeting has chosen it", async () => {
+    const fixture = createFixture({ meetingFinalChannel: "llm", draftCaptions: false });
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Let's" }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    expect(fixture.warmUps).toEqual([{ model: true, draft: false }]);
+  });
+
+  it("tells the user to click the page when Chrome is only waiting to set its model up", async () => {
+    // Chrome refuses to create an on-device translator for a new pair
+    // without user activation. That is not a broken configuration, and
+    // sending the user to switch channels would be the wrong advice.
+    class TranslatorStub {
+      static availability = vi.fn().mockResolvedValue("downloadable");
+      static create = vi
+        .fn()
+        .mockRejectedValue(new DOMException("Requires user activation.", "NotAllowedError"));
+    }
+    vi.stubGlobal("Translator", TranslatorStub);
+    const fixture = createFixture({ draftProvider: "browser" });
+    await fixture.wait(0);
+
+    await fixture.render([{ speaker: "Alice Chen", text: "Good morning. Let's" }]);
+    await fixture.wait(REVISE_DEBOUNCE_MS + TICK_MS);
+
+    expect(fixture.errors().at(-1)).toContain("点击或按键一次");
   });
 
   it("brings Meet's own captions back when the only channel answers with nothing", async () => {

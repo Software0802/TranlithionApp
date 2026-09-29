@@ -272,4 +272,48 @@ describe("translation agent", () => {
       entityHints: [{ source: "五条悟", target: "五条悟", kind: "name" }]
     });
   });
+
+  it("leaves a long line room to be translated whole", async () => {
+    // A merged or long caption cut off at a fixed token cap would be cached
+    // as if the half sentence were the whole translation.
+    const encoder = new TextEncoder();
+    // A fresh stream per request: a response body can only be read once.
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      new Response(
+        new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(encoder.encode('data: {"choices":[{"delta":{"content":"很长的一句。"}}]}\n\n'));
+            controller.close();
+          }
+        }),
+        { status: 200, headers: { "Content-Type": "text/event-stream" } }
+      )
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    const settings = {
+      ...DEFAULT_SETTINGS,
+      provider: "openai-compatible" as const,
+      apiKey: "test-key"
+    };
+    const translate = (text: string) =>
+      translateWithAgent({
+        cue: { id: text, startMs: 0, endMs: null, text, isFinal: true, source: "text-track" },
+        settings,
+        recentContext: [],
+        rememberedTerms: [],
+        onPartial: () => undefined
+      });
+    const maxTokens = (call: number) =>
+      (JSON.parse(String((fetchMock.mock.calls[call] as [string, RequestInit])[1].body)) as {
+        max_tokens: number;
+      }).max_tokens;
+
+    await translate("はい");
+    await translate("あ".repeat(120));
+
+    expect(maxTokens(0)).toBe(96);
+    expect(maxTokens(1)).toBeGreaterThan(96);
+    expect(maxTokens(1)).toBeLessThanOrEqual(400);
+  });
 });
+

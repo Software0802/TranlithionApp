@@ -22,6 +22,17 @@ export type ExtensionMessage =
   | { type: "GET_TAB_STATUS"; tabId: number }
   | { type: "REPORT_TAB_STATUS"; status: RuntimeStatus }
   | { type: "TRANSLATE_CUE"; request: TranslationRequest }
+  /**
+   * The next lines of a text track, translated ahead of playback so each is
+   * already in the session's cache when it comes on screen.
+   */
+  | { type: "PREFETCH_CUES"; sessionId: string; cues: SubtitleCue[] }
+  /**
+   * Captions appeared on a page: open the connections its lines will use now.
+   * `model` is the main translation service, `draft` the remote draft or
+   * machine-translation endpoint; neither request carries a key or any text.
+   */
+  | { type: "WARM_UP_TRANSLATOR"; model: boolean; draft: boolean }
   | { type: "CLEAR_TRANSLATION_SESSION"; sessionId: string }
   | { type: "TEST_TRANSLATION"; settings: TranslationSettings }
   | { type: "SETTINGS_UPDATED"; settings: PublicTranslationSettings }
@@ -31,8 +42,13 @@ export type ExtensionMessage =
       sessionId: string;
       cueId: string;
       text: string;
-      /** Meeting mode: this channel is the caption, not an optional preview. */
+      /**
+       * This channel is the caption, not an optional preview: a meeting's
+       * channel, or DeepL alone on Netflix.
+       */
       asFinal?: boolean;
+      /** The line was said in a call; only these sessions count as meetings. */
+      meeting?: boolean;
     }
   /** `sessionId` marks a caption channel, whose session memory answers repeats. */
   | { type: "TRANSLATE_PLAIN"; text: string; sessionId?: string }

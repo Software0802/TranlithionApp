@@ -164,4 +164,41 @@ describe("remote draft translator", () => {
     expect(shared.draftApiKeyConfigured).toBe(true);
     expect(JSON.stringify(shared)).not.toContain("draft-key");
   });
+
+  it("gives DeepL as the caption itself longer than it gives a draft", async () => {
+    // A draft slower than 1.2 s is overtaken by the model behind it. DeepL
+    // alone on Netflix, or as a meeting's channel, has nothing behind it: a
+    // slow link to the service must cost a late line, not a missing one.
+    vi.useFakeTimers();
+    try {
+      const answers: Array<() => void> = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(
+          (_url: string, init?: RequestInit) =>
+            new Promise<Response>((resolve, reject) => {
+              init?.signal?.addEventListener(
+                "abort",
+                () => reject(new DOMException("aborted", "AbortError")),
+                { once: true }
+              );
+              answers.push(() => resolve(jsonResponse({ translations: [{ text: "你好。" }] })));
+            })
+        )
+      );
+
+      const draft = translateDraft({ text: "こんにちは", settings: DEEPL });
+      const final = translateDraft({ text: "こんにちは", settings: DEEPL, asFinal: true });
+      await vi.advanceTimersByTimeAsync(2_000);
+      for (const answer of answers) {
+        answer();
+      }
+
+      expect(await draft).toBeNull();
+      expect(await final).toBe("你好。");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 });
+

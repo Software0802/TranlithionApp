@@ -12,6 +12,10 @@ import type {
 } from "../shared/types";
 
 const REQUEST_TIMEOUT_MS = 15_000;
+/** A service already warmed this recently still has its connection open. */
+const WARM_UP_INTERVAL_MS = 30_000;
+const WARM_UP_TIMEOUT_MS = 5_000;
+const lastWarmUpAt = new Map<string, number>();
 
 export class TranslatorError extends Error {
   constructor(
@@ -74,6 +78,56 @@ function cancelledTranslation(): TranslatorError {
   return new TranslatorError("CANCELLED", "字幕已更新，已取消过期翻译。");
 }
 
+/**
+ * Opens the connection the first caption will need before it is needed.
+ *
+ * A first request to a translation service pays DNS, TCP and TLS before any
+ * token can come back — a few hundred milliseconds that would otherwise land
+ * on the first line the viewer reads. This is sent when captions appear on a
+ * page, and the browser keeps the connection for the caption requests that
+ * follow. It carries neither the key nor any caption text.
+ */
+export async function warmUpTranslator(
+  settings: TranslationSettings,
+  nowMs = Date.now()
+): Promise<void> {
+  if (settings.provider === "openai-compatible") {
+    await warmUpEndpoint(chatCompletionsEndpoint(settings.apiBaseUrl), nowMs);
+    return;
+  }
+  if (settings.provider === "websocket" && claimWarmUp(settings.webSocketUrl, nowMs)) {
+    socketPoolFor(settings.webSocketUrl).warm();
+  }
+}
+
+/** The same for any HTTP translation endpoint, such as the draft channel's. */
+export async function warmUpEndpoint(url: string, nowMs = Date.now()): Promise<void> {
+  if (!claimWarmUp(url, nowMs)) {
+    return;
+  }
+  const controller = new AbortController();
+  const timer = globalThis.setTimeout(() => controller.abort(), WARM_UP_TIMEOUT_MS);
+  try {
+    // Any answer will do, an error status included: the connection is what
+    // is being opened. The caption's own request reports real failures.
+    await fetch(url, { method: "HEAD", signal: controller.signal });
+  } catch {
+    // Unreachable now is reported by the first caption that needs it.
+  } finally {
+    globalThis.clearTimeout(timer);
+  }
+}
+
+/** Whether this endpoint is due a warm-up, marking it warmed if so. */
+function claimWarmUp(endpoint: string, nowMs: number): boolean {
+  const lastAt = lastWarmUpAt.get(endpoint);
+  if (lastAt !== undefined && nowMs - lastAt < WARM_UP_INTERVAL_MS) {
+    return false;
+  }
+  lastWarmUpAt.set(endpoint, nowMs);
+  return true;
+}
+
 function translateWithMock(cue: SubtitleCue): Omit<TranslationResult, "latencyMs"> {
   return {
     text: DEMO_TRANSLATIONS[cue.text] ?? `【演示翻译】${cue.text}`,
@@ -112,7 +166,7 @@ async function translateWithOpenAiCompatibleApi(
       body: JSON.stringify({
         model: settings.model,
         temperature: 0.15,
-        max_tokens: input.onPartial ? 96 : 400,
+        max_tokens: input.onPartial ? streamingTokenBudget(input.cue.text) : 400,
         stream: Boolean(input.onPartial),
         ...(shouldDisableDeepSeekThinking(settings) ? { thinking: { type: "disabled" } } : {}),
         messages: [
@@ -193,6 +247,145 @@ async function translateWithOpenAiCompatibleApi(
   }
 }
 
+/** Connections kept open between captions; one is enough for a caption and its prefetch. */
+const IDLE_SOCKET_LIMIT = 2;
+/**
+ * An idle socket older than this is not trusted: after a sleep or a network
+ * change it can still read as open while nothing on it arrives any more.
+ */
+const IDLE_SOCKET_MAX_AGE_MS = 60_000;
+
+/**
+ * Open WebSockets to one translation server, reused between captions.
+ *
+ * Opening a WebSocket costs a TCP and TLS handshake and an HTTP upgrade: round
+ * trips every caption used to pay again before its request could be sent. A
+ * socket that has answered is now kept for the next caption instead of being
+ * closed. Each socket still carries one request at a time, so the server sees
+ * what it always saw — one question and one answer per connection at a time —
+ * and a caption that is cancelled or times out closes its socket as before,
+ * rather than leaving the next caption queued behind it on a shared line.
+ */
+class TranslationSocketPool {
+  private idle: Array<{ socket: WebSocket; since: number }> = [];
+  /** Opened ahead of the first caption and not yet handed to one. */
+  private warming: WebSocket | null = null;
+
+  constructor(readonly url: string) {}
+
+  /** A socket for one request: one still opening, an idle open one, or a new one. */
+  take(nowMs = Date.now()): WebSocket {
+    const warming = this.warming;
+    this.warming = null;
+    if (
+      warming &&
+      (warming.readyState === WebSocket.CONNECTING || warming.readyState === WebSocket.OPEN)
+    ) {
+      return warming;
+    }
+    while (this.idle.length > 0) {
+      const entry = this.idle.pop();
+      if (
+        entry &&
+        entry.socket.readyState === WebSocket.OPEN &&
+        nowMs - entry.since < IDLE_SOCKET_MAX_AGE_MS
+      ) {
+        return entry.socket;
+      }
+      if (entry) {
+        closeQuietly(entry.socket);
+      }
+    }
+    return new WebSocket(this.url);
+  }
+
+  /** Keeps a socket whose request was answered, for the next caption. */
+  release(socket: WebSocket, nowMs = Date.now()): void {
+    if (socket.readyState !== WebSocket.OPEN) {
+      closeQuietly(socket);
+      return;
+    }
+    socket.onopen = null;
+    socket.onerror = null;
+    // Nothing is waiting on an idle socket; whatever arrives on it is dropped.
+    socket.onmessage = null;
+    socket.onclose = () => {
+      this.idle = this.idle.filter((entry) => entry.socket !== socket);
+    };
+    this.idle.push({ socket, since: nowMs });
+    while (this.idle.length > IDLE_SOCKET_LIMIT) {
+      const oldest = this.idle.shift();
+      if (oldest) {
+        closeQuietly(oldest.socket);
+      }
+    }
+  }
+
+  /** Opens a socket before the first caption needs one. */
+  warm(nowMs = Date.now()): void {
+    const hasOpenIdle = this.idle.some(
+      (entry) =>
+        entry.socket.readyState === WebSocket.OPEN && nowMs - entry.since < IDLE_SOCKET_MAX_AGE_MS
+    );
+    if (this.warming || hasOpenIdle) {
+      return;
+    }
+    const socket = new WebSocket(this.url);
+    this.warming = socket;
+    socket.onopen = () => {
+      if (this.warming === socket) {
+        this.warming = null;
+        this.release(socket);
+      }
+    };
+    socket.onerror = null;
+    socket.onclose = () => {
+      if (this.warming === socket) {
+        this.warming = null;
+      }
+    };
+    // A handshake that never completes is abandoned rather than kept pending.
+    globalThis.setTimeout(() => {
+      if (this.warming === socket && socket.readyState !== WebSocket.OPEN) {
+        this.warming = null;
+        closeQuietly(socket);
+      }
+    }, WARM_UP_TIMEOUT_MS);
+  }
+
+  close(): void {
+    const warming = this.warming;
+    this.warming = null;
+    if (warming) {
+      closeQuietly(warming);
+    }
+    for (const entry of this.idle.splice(0)) {
+      closeQuietly(entry.socket);
+    }
+  }
+}
+
+function closeQuietly(socket: WebSocket): void {
+  socket.onopen = null;
+  socket.onmessage = null;
+  socket.onerror = null;
+  socket.onclose = null;
+  if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
+    socket.close();
+  }
+}
+
+let socketPool: TranslationSocketPool | null = null;
+
+/** The pool for this server; a changed address closes the old one's sockets. */
+function socketPoolFor(url: string): TranslationSocketPool {
+  if (socketPool?.url !== url) {
+    socketPool?.close();
+    socketPool = new TranslationSocketPool(url);
+  }
+  return socketPool;
+}
+
 async function translateWithWebSocket(
   input: TranslationAgentInput
 ): Promise<Omit<TranslationResult, "latencyMs">> {
@@ -209,34 +402,38 @@ async function translateWithWebSocket(
     context: input.recentContext,
     terminology: mergeTerminology(input.settings.glossary, input.rememberedTerms)
   };
+  const pool = socketPoolFor(input.settings.webSocketUrl);
 
   return new Promise((resolve, reject) => {
     let settled = false;
     let abortHandler: (() => void) | null = null;
-    const socket = new WebSocket(input.settings.webSocketUrl);
+    const socket = pool.take();
     const timeout = globalThis.setTimeout(() => {
       finishWithError(new TranslatorError("TIMEOUT", "翻译 WebSocket 连接超时。"));
     }, REQUEST_TIMEOUT_MS);
 
-    const cleanup = () => {
+    /**
+     * A socket goes back to the pool only after a clean answer. One that was
+     * cancelled, timed out or sent something unreadable is closed, exactly as
+     * every socket used to be.
+     */
+    const cleanup = (keepSocket: boolean) => {
       globalThis.clearTimeout(timeout);
       if (abortHandler) {
         input.signal?.removeEventListener("abort", abortHandler);
       }
-      socket.onopen = null;
-      socket.onmessage = null;
-      socket.onerror = null;
-      socket.onclose = null;
-      if (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING) {
-        socket.close();
+      if (keepSocket) {
+        pool.release(socket);
+      } else {
+        closeQuietly(socket);
       }
     };
-    const finishWithError = (error: TranslatorError) => {
+    const finishWithError = (error: TranslatorError, keepSocket = false) => {
       if (settled) {
         return;
       }
       settled = true;
-      cleanup();
+      cleanup(keepSocket);
       reject(error);
     };
     const finish = (result: Omit<TranslationResult, "latencyMs">) => {
@@ -244,11 +441,23 @@ async function translateWithWebSocket(
         return;
       }
       settled = true;
-      cleanup();
+      cleanup(true);
       resolve(result);
     };
+    let sent = false;
+    const send = () => {
+      if (sent || settled) {
+        return;
+      }
+      sent = true;
+      try {
+        socket.send(JSON.stringify(payload));
+      } catch {
+        finishWithError(new TranslatorError("NETWORK", "翻译 WebSocket 服务意外断开。"));
+      }
+    };
 
-    socket.onopen = () => socket.send(JSON.stringify(payload));
+    socket.onopen = send;
     socket.onerror = () => {
       finishWithError(new TranslatorError("NETWORK", "无法连接到翻译 WebSocket 服务。"));
     };
@@ -269,11 +478,14 @@ async function translateWithWebSocket(
           return;
         }
         if (typeof response.error === "string") {
-          finishWithError(new TranslatorError("PROVIDER", response.error));
+          finishWithError(new TranslatorError("PROVIDER", response.error), true);
           return;
         }
         if (typeof response.translation !== "string" || !response.translation.trim()) {
-          finishWithError(new TranslatorError("INVALID_RESPONSE", "翻译服务未返回有效字幕。"));
+          finishWithError(
+            new TranslatorError("INVALID_RESPONSE", "翻译服务未返回有效字幕。"),
+            true
+          );
           return;
         }
         finish({
@@ -292,7 +504,19 @@ async function translateWithWebSocket(
     } else {
       input.signal?.addEventListener("abort", abortHandler, { once: true });
     }
+    if (socket.readyState === WebSocket.OPEN) {
+      send();
+    }
   });
+}
+
+/**
+ * Room for one caption's translation. A hard cap is what stops a model that
+ * starts explaining itself, but a long or merged line must not be cut off
+ * mid-sentence and then cached as if it were the whole translation.
+ */
+function streamingTokenBudget(text: string): number {
+  return Math.min(400, Math.max(96, 64 + text.length * 2));
 }
 
 function shouldDisableDeepSeekThinking(settings: TranslationSettings): boolean {

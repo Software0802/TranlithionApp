@@ -48,6 +48,49 @@ export class TextTrackAdapter implements SubtitleAdapter {
     this.refresh();
   }
 
+  /**
+   * The lines the track will show after `afterMs`, soonest first, at most
+   * `limit` of them.
+   *
+   * Each is built exactly as it will be read once it is on screen alone, so a
+   * translation made for it now answers the request made for it then. A line
+   * that ends up on screen together with another is read as one merged cue,
+   * which is simply translated when it comes.
+   */
+  upcomingCues(afterMs: number, limit: number): SubtitleCue[] {
+    const cues = this.track?.cues;
+    if (!cues || limit <= 0) {
+      return [];
+    }
+    const later: ReadableTextTrackCue[] = [];
+    for (let index = 0; index < cues.length; index += 1) {
+      const cue = cues[index] as ReadableTextTrackCue;
+      // Rounded as a cue's own start is, so the line on screen is not also
+      // counted as one still to come.
+      if (Math.round(cue.startTime * 1_000) > afterMs) {
+        later.push(cue);
+      }
+    }
+    later.sort((left, right) => left.startTime - right.startTime);
+    const upcoming: SubtitleCue[] = [];
+    for (const cue of later) {
+      if (upcoming.length >= limit) {
+        break;
+      }
+      const next = createSubtitleCue({
+        source: this.source,
+        startMs: cue.startTime * 1_000,
+        endMs: cue.endTime * 1_000,
+        text: readCueText(cue),
+        isFinal: true
+      });
+      if (next) {
+        upcoming.push(next);
+      }
+    }
+    return upcoming;
+  }
+
   start(onEvent: (event: SubtitleAdapterEvent) => void): void {
     this.callback = onEvent;
     this.refresh();
