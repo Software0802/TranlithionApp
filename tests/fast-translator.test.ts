@@ -29,6 +29,43 @@ function stubTranslatorApi(options: StubOptions) {
   return { availability, create, translate };
 }
 
+/** The page's input events and user-activation state, as the channel sees them. */
+function stubPage() {
+  const listeners = new Map<string, Set<() => void>>();
+  let userActivation = true;
+  vi.stubGlobal("window", {
+    addEventListener: (type: string, listener: () => void) => {
+      const forType = listeners.get(type) ?? new Set<() => void>();
+      forType.add(listener);
+      listeners.set(type, forType);
+    },
+    removeEventListener: (type: string, listener: () => void) => {
+      listeners.get(type)?.delete(listener);
+    }
+  });
+  vi.stubGlobal("navigator", {
+    get userActivation() {
+      return { isActive: userActivation };
+    }
+  });
+  return {
+    dispatch(type: string) {
+      for (const listener of [...(listeners.get(type) ?? [])]) {
+        listener();
+      }
+    },
+    setUserActivation(active: boolean) {
+      userActivation = active;
+    },
+    listenerCount: () =>
+      [...listeners.values()].reduce((count, forType) => count + forType.size, 0)
+  };
+}
+
+function flushPromises(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
 describe("on-device draft translator", () => {
   afterEach(() => {
     vi.unstubAllGlobals();
@@ -209,6 +246,102 @@ describe("on-device draft translator", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  it("sets the local model up on the viewer's first click when the pair must be downloaded", async () => {
+    // Chrome reports every pair as downloadable to a site that has not yet
+    // created a translator for it, and refuses to create one without user
+    // activation. A caption arriving on its own has none, so the channel
+    // waits for the click that starts the video and asks again from there.
+    const page = stubPage();
+    let activated = false;
+    const { create } = stubTranslatorApi({
+      availability: "downloadable",
+      create: async () => {
+        if (!activated) {
+          throw new DOMException("Requires user activation.", "NotAllowedError");
+        }
+        return { translate: async () => "你好。" };
+      }
+    });
+    const translator = new DraftTranslator("ja", "zh-CN");
+
+    expect(await translator.prepare()).toBe(false);
+    expect(await translator.translate("こんにちは")).toBeNull();
+
+    activated = true;
+    page.dispatch("pointerdown");
+    await flushPromises();
+
+    expect(create).toHaveBeenCalledTimes(2);
+    expect(await translator.translate("こんにちは")).toBe("你好。");
+    expect(page.listenerCount()).toBe(0);
+  });
+
+  it("ignores input that carries no user activation", async () => {
+    // A touch's pointerdown is not activation yet; asking then would only be
+    // refused again and use up one of the channel's attempts.
+    const page = stubPage();
+    const { create } = stubTranslatorApi({
+      availability: "downloadable",
+      create: async () => {
+        throw new DOMException("Requires user activation.", "NotAllowedError");
+      }
+    });
+    const translator = new DraftTranslator("ja", "zh-CN");
+    await translator.prepare();
+
+    page.setUserActivation(false);
+    page.dispatch("pointerdown");
+    await flushPromises();
+
+    expect(create).toHaveBeenCalledOnce();
+    expect(page.listenerCount()).toBeGreaterThan(0);
+  });
+
+  it("keeps a translator whose download outlasts the first wait", async () => {
+    vi.useFakeTimers();
+    try {
+      let finish: ((instance: unknown) => void) | undefined;
+      stubTranslatorApi({
+        availability: "downloadable",
+        create: () =>
+          new Promise((resolve) => {
+            finish = resolve;
+          })
+      });
+      const translator = new DraftTranslator("ja", "zh-CN");
+
+      const prepared = translator.prepare();
+      await vi.advanceTimersByTimeAsync(10_000);
+      expect(await prepared).toBe(false);
+
+      // The language pack finishes downloading after the channel stopped
+      // waiting for it; every caption after that is translated locally.
+      finish?.({ translate: async () => "你好。" });
+      await vi.advanceTimersByTimeAsync(0);
+
+      expect(await translator.translate("こんにちは")).toBe("你好。");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops listening for input once the channel is destroyed", async () => {
+    const page = stubPage();
+    stubTranslatorApi({
+      availability: "downloadable",
+      create: async () => {
+        throw new DOMException("Requires user activation.", "NotAllowedError");
+      }
+    });
+    const translator = new DraftTranslator("ja", "zh-CN");
+    await translator.prepare();
+    expect(page.listenerCount()).toBeGreaterThan(0);
+
+    translator.destroy();
+
+    expect(page.listenerCount()).toBe(0);
   });
 
   it("drops a draft whose caption was already superseded", async () => {

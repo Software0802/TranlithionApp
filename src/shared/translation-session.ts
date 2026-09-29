@@ -298,24 +298,7 @@ export class SupersededJobError extends Error {
 }
 
 export class SessionJobQueue {
-  private readonly tails = new Map<string, Promise<void>>();
   private readonly latestControllers = new Map<string, AbortController>();
-
-  enqueue<T>(sessionId: string, job: () => Promise<T>): Promise<T> {
-    const previous = this.tails.get(sessionId) ?? Promise.resolve();
-    const result = previous.catch(() => undefined).then(job);
-    const tail = result.then(
-      () => undefined,
-      () => undefined
-    );
-    this.tails.set(sessionId, tail);
-    void tail.then(() => {
-      if (this.tails.get(sessionId) === tail) {
-        this.tails.delete(sessionId);
-      }
-    });
-    return result;
-  }
 
   /**
    * Cancels the stale live-caption request and starts the newest one without

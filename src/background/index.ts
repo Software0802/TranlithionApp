@@ -57,19 +57,32 @@ import type {
   TranslationResult,
   TranslationSettings
 } from "../shared/types";
+import { CuePrefetcher } from "./cue-prefetcher";
 import { translateDraft } from "./draft-translator";
 import {
   translateBatchWithLibreTranslate,
   translateWithLibreTranslate
 } from "./local-mt";
-import { translateWithAgent, TranslatorError } from "./translator";
+import {
+  translateWithAgent,
+  TranslatorError,
+  warmUpEndpoint,
+  warmUpTranslator
+} from "./translator";
 
 const SESSION_CONTEXT_STORAGE_KEY = "translation-session-context";
 const TAB_STATUS_STORAGE_KEY = "tab-runtime-status";
 /** Dynamic registration created by the popup's "启用全站" button. */
 const ALL_PAGES_CONTENT_SCRIPT_ID = "tranlithion-all-pages";
+/** How far ahead of playback one prefetch request may reach. */
+const MAX_PREFETCH_CUES = 5;
+/** A line longer than this is not a subtitle; it is not sent ahead of time. */
+const MAX_PREFETCH_CUE_LENGTH = 500;
 const sessionStore = new TranslationSessionStore();
 const jobQueue = new SessionJobQueue();
+const prefetcher = new CuePrefetcher(prefetchCue);
+/** The line each session is translating live, which a prefetch never asks for again. */
+const liveCueIds = new Map<string, string>();
 const tabStatuses = new Map<number, TabRuntimeStatus>();
 /**
  * Draft requests cancel on their own timeline. They must not share the main
@@ -168,8 +181,21 @@ async function handleMessage(
     case "TRANSLATE_CUE": {
       return translateCue(message.request, sender.tab?.id);
     }
+    case "PREFETCH_CUES": {
+      return prefetchCues(message.sessionId, message.cues);
+    }
+    case "WARM_UP_TRANSLATOR": {
+      // Nothing waits on this: the answer only says the request was heard.
+      void warmUpTranslationServices(message.model === true, message.draft === true);
+      return { ok: true };
+    }
     case "DRAFT_TRANSLATE": {
-      return draftTranslate(message.sessionId, message.text, message.asFinal === true);
+      return draftTranslate(
+        message.sessionId,
+        message.text,
+        message.asFinal === true,
+        message.meeting === true
+      );
     }
     case "RECORD_MEETING_LINE": {
       return recordMeetingLine(message, sender.tab?.id);
@@ -194,6 +220,8 @@ async function handleMessage(
       draftControllers.get(message.sessionId)?.abort();
       draftControllers.delete(message.sessionId);
       jobQueue.cancelLatest(message.sessionId);
+      prefetcher.clear(message.sessionId);
+      liveCueIds.delete(message.sessionId);
       sessionStore.clear(message.sessionId);
       hydratedSessionIds.delete(message.sessionId);
       transcriptStorageFailures.delete(message.sessionId);
@@ -237,6 +265,7 @@ async function translateCue(
   request: { sessionId: string; cue: SubtitleCue },
   tabId?: number
 ): Promise<TranslationResponse> {
+  const receivedAt = performance.now();
   // Restore session memory without blocking the first cached/settings reads when
   // the session is already hydrated (common after the first caption).
   const hydrate = restorePersistedSession(request.sessionId);
@@ -262,20 +291,14 @@ async function translateCue(
     sessionStore.markMeetingSession(request.sessionId);
   }
 
-  // Live captions that rewrite themselves: only the newest line is worth
-  // finishing, and repeats hit the text cache instead of the network.
-  const latestOnly = request.cue.source === "netflix-dom" || request.cue.source === "meet-dom";
+  // A line the viewer has already read again, or one prefetched ahead of
+  // playback, goes straight back. Page-rendered cue ids include the moment the
+  // line appeared, so their repeats only hit via text.
   const cached =
     sessionStore.getCached(request.sessionId, request.cue.id) ??
-    (latestOnly
-      ? sessionStore.getCachedByText(request.sessionId, request.cue.text)
-      : undefined);
-  // Netflix cue ids include startMs, so repeats only hit via text. Serving the
-  // text cache immediately keeps live captions in sync without a network round-trip.
+    sessionStore.getCachedByText(request.sessionId, request.cue.text);
   if (cached) {
-    if (latestOnly) {
-      await rememberTranslation(request.sessionId, request.cue, { ...cached, latencyMs: 0 });
-    }
+    await rememberTranslation(request.sessionId, request.cue, { ...cached, latencyMs: 0 });
     return { ok: true, translation: { ...cached, latencyMs: 0 } };
   }
 
@@ -289,38 +312,57 @@ async function translateCue(
     }).catch(() => undefined);
   }
 
-  const runTranslation = async (signal?: AbortSignal) => {
+  const runTranslation = async (signal: AbortSignal) => {
+    // A prefetch already working on this line is waited for, not repeated.
+    const prefetch = prefetcher.claim(request.sessionId, request.cue.id);
+    if (prefetch) {
+      await Promise.race([prefetch, whenAborted(signal)]);
+      if (signal.aborted) {
+        throw new TranslatorError("CANCELLED", "字幕已更新，已取消过期翻译。");
+      }
+      await throwIfPairChanged(settings);
+    }
     const duplicate =
       sessionStore.getCached(request.sessionId, request.cue.id) ??
-      (latestOnly
-        ? sessionStore.getCachedByText(request.sessionId, request.cue.text)
-        : undefined);
+      sessionStore.getCachedByText(request.sessionId, request.cue.text);
     if (duplicate) {
-      return { ...duplicate, latencyMs: 0 };
+      return { ...duplicate, latencyMs: Math.round(performance.now() - receivedAt) };
     }
-    const result = await translateWithAgent({
-      cue: request.cue,
-      settings,
-      recentContext: sessionStore.getContext(request.sessionId),
-      rememberedTerms: sessionStore.getEntityHints(request.sessionId),
-      signal,
-      onPartial: latestOnly && tabId !== undefined
-        ? (text) => publishPartialTranslation(tabId, request.sessionId, request.cue.id, text)
-        : undefined
-    });
-    if (signal?.aborted) {
+    liveCueIds.set(request.sessionId, request.cue.id);
+    let result: TranslationResult;
+    try {
+      result = await translateWithAgent({
+        cue: request.cue,
+        settings,
+        recentContext: sessionStore.getContext(request.sessionId),
+        rememberedTerms: sessionStore.getEntityHints(request.sessionId),
+        signal,
+        onPartial: tabId !== undefined
+          ? (text) => publishPartialTranslation(tabId, request.sessionId, request.cue.id, text)
+          : undefined
+      });
+    } finally {
+      if (liveCueIds.get(request.sessionId) === request.cue.id) {
+        liveCueIds.delete(request.sessionId);
+      }
+    }
+    if (signal.aborted) {
       throw new TranslatorError("CANCELLED", "字幕已更新，已取消过期翻译。");
     }
+    await throwIfPairChanged(settings);
     if (await rememberTranslation(request.sessionId, request.cue, result)) {
-      await persistSession(request.sessionId);
+      // Storage only carries the context across a worker restart; the caption
+      // is not held back while it is written.
+      void persistSession(request.sessionId).catch(() => undefined);
     }
     return result;
   };
 
   try {
-    const translation = latestOnly
-      ? await jobQueue.enqueueLatest(request.sessionId, (signal) => runTranslation(signal))
-      : await jobQueue.enqueue(request.sessionId, () => runTranslation());
+    // Every source is a live caption: a line the viewer has moved past is never
+    // painted, so the newest request cancels the one before it rather than
+    // queueing behind it and falling further behind with every line.
+    const translation = await jobQueue.enqueueLatest(request.sessionId, runTranslation);
     return { ok: true, translation };
   } catch (error) {
     const response = toFailure(error);
@@ -375,10 +417,151 @@ function sessionTerminology(sessionId: string, settings: TranslationSettings): G
   return mergeTerminology(settings.glossary, sessionStore.getEntityHints(sessionId));
 }
 
+/**
+ * Queues the next lines of a text track for translation ahead of playback.
+ *
+ * Only a text track is prefetched: its lines are known before they are shown,
+ * where a page's rendered captions are not. The lines come from the track the
+ * viewer is playing; nothing is read that the page did not expose.
+ */
+async function prefetchCues(sessionId: string, cues: unknown): Promise<{ ok: boolean }> {
+  const settings = await getSettings();
+  // The offline demo answers instantly, so there is nothing to get ahead of.
+  if (!settings.enabled || settings.provider === "mock") {
+    return { ok: false };
+  }
+  if (await cachedPermissionFailure(settings)) {
+    return { ok: false };
+  }
+  await restorePersistedSession(sessionId);
+  sessionStore.useLanguagePair(sessionId, settings.sourceLanguage, settings.targetLanguage);
+  const wanted = (Array.isArray(cues) ? cues : [])
+    .filter(isPrefetchableCue)
+    .slice(0, MAX_PREFETCH_CUES);
+  prefetcher.schedule(sessionId, wanted, (cue) => isAnswered(sessionId, cue));
+  return { ok: true };
+}
+
+/** Translated already, or being translated live for the caption on screen. */
+function isAnswered(sessionId: string, cue: SubtitleCue): boolean {
+  return (
+    sessionStore.getCached(sessionId, cue.id) !== undefined ||
+    liveCueIds.get(sessionId) === cue.id
+  );
+}
+
+/**
+ * Translates one line ahead of playback into the session, exactly as the
+ * live request for it would: with the context and names so far, and recorded
+ * into the context the next line is translated with.
+ */
+async function prefetchCue(
+  sessionId: string,
+  cue: SubtitleCue,
+  signal: AbortSignal
+): Promise<void> {
+  if (isAnswered(sessionId, cue)) {
+    return;
+  }
+  const settings = await getSettings();
+  if (!settings.enabled || signal.aborted) {
+    return;
+  }
+  // Queued before a language switch, it is translated under the new pair,
+  // with none of the old pair's context.
+  sessionStore.useLanguagePair(sessionId, settings.sourceLanguage, settings.targetLanguage);
+  const result = await translateWithAgent({
+    cue,
+    settings,
+    recentContext: sessionStore.getContext(sessionId),
+    rememberedTerms: sessionStore.getEntityHints(sessionId),
+    signal
+  });
+  const current = await getSettings();
+  // Written in a language the user has since switched away from, it would
+  // come back later as a caption in the wrong language.
+  if (
+    signal.aborted ||
+    current.sourceLanguage !== settings.sourceLanguage ||
+    current.targetLanguage !== settings.targetLanguage
+  ) {
+    return;
+  }
+  if (await rememberTranslation(sessionId, cue, result)) {
+    void persistSession(sessionId).catch(() => undefined);
+  }
+}
+
+function isPrefetchableCue(value: unknown): value is SubtitleCue {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    return false;
+  }
+  const cue = value as SubtitleCue;
+  return (
+    cue.source === "text-track" &&
+    typeof cue.id === "string" &&
+    typeof cue.text === "string" &&
+    cue.text.trim().length > 0 &&
+    cue.text.length <= MAX_PREFETCH_CUE_LENGTH &&
+    typeof cue.startMs === "number" &&
+    Number.isFinite(cue.startMs)
+  );
+}
+
+/**
+ * Opens the connections a page's captions are about to use. Without the
+ * user's grant for a service's origin nothing is sent to it, not even a
+ * request without a body.
+ */
+async function warmUpTranslationServices(model: boolean, draft: boolean): Promise<void> {
+  const settings = await getSettings();
+  if (!settings.enabled) {
+    return;
+  }
+  const warmUps: Promise<void>[] = [];
+  if (model && !(await cachedPermissionFailure(settings))) {
+    warmUps.push(warmUpTranslator(settings));
+  }
+  if (
+    draft &&
+    settings.draftProvider !== "browser" &&
+    !(await requiredDraftPermissionMissing(settings))
+  ) {
+    warmUps.push(warmUpEndpoint(settings.draftEndpointUrl));
+  }
+  await Promise.all(warmUps);
+}
+
+/**
+ * A request asked under a language pair the user has since left is over: its
+ * answer is in the wrong language, and remembering it would serve that
+ * language back later — from the cache, with nothing left to correct it.
+ */
+async function throwIfPairChanged(askedWith: TranslationSettings): Promise<void> {
+  const current = await getSettings();
+  if (
+    current.sourceLanguage !== askedWith.sourceLanguage ||
+    current.targetLanguage !== askedWith.targetLanguage
+  ) {
+    throw new TranslatorError("CANCELLED", "语言设置已更改，已取消旧语言的翻译。");
+  }
+}
+
+/** Settles when the signal aborts; never rejects. */
+function whenAborted(signal: AbortSignal): Promise<void> {
+  if (signal.aborted) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    signal.addEventListener("abort", () => resolve(), { once: true });
+  });
+}
+
 async function draftTranslate(
   sessionId: string,
   text: string,
-  asFinal: boolean
+  asFinal: boolean,
+  meeting: boolean
 ): Promise<DraftTranslationResponse> {
   const settings = await getSettings();
   if (!settings.enabled || settings.draftProvider === "browser") {
@@ -393,14 +576,15 @@ async function draftTranslate(
     return { ok: false };
   }
   sessionStore.useLanguagePair(sessionId, settings.sourceLanguage, settings.targetLanguage);
-  if (asFinal) {
-    // Only meeting mode asks this channel to be the caption itself.
+  if (meeting) {
+    // What is said in a call is what a withdrawn record consent must reach.
+    // An episode on DeepL alone is a final caption too, but not a call.
     sessionStore.markMeetingSession(sessionId);
   }
 
-  // As the caption itself this channel carries a whole meeting, where the same
-  // sentence comes round again and again. What the session already learned is
-  // both faster and cheaper than asking the service a second time.
+  // As the caption itself this channel carries a whole meeting or episode,
+  // where the same sentence comes round again and again. What the session
+  // already learned is both faster and cheaper than asking a second time.
   const remembered = asFinal ? sessionStore.getCachedByText(sessionId, text) : undefined;
   if (remembered) {
     return { ok: true, text: remembered.text };

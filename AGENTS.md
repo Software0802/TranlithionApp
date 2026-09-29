@@ -52,8 +52,10 @@ Manifest V3 Chrome 扩展：在 YouTube / Netflix / Google Meet 等页已显示�
 - **会议页没有可用的播放时间轴**：用墙钟计时、Overlay 锚在视口（`SubtitleOverlay` 的 anchor 传 null）；空白同样不等于结束。
 - 会议字幕是 ASR 流：只提交**未提交过的增量**并在句末标点/长度上限处切段；说话人切换或另起字幕块（按渲染节点判断，不比文本）即结束当前句。识别器收回已断句的文本时**原地更正**（在适配器内重开同一条 cue），不得把收回的措辞当成新的一句去翻译或记录。**已写入本机记录的行一律不回头删改**：更正只是后面新的一行，听到的与更正后的措辞都留着。去重按**定稿 cue 的身份**在提交侧做（每个 cue 只记一次），绝不按文本比对——同一场会里「Okay.」说两遍就是两行。
 - Meet 字幕区靠语义选择器 + 结构校验定位（不读本地化 `aria-label`）；**解析出第一行之前不隐藏**原生字幕条，读不出来就把它放回来并如实报不可用。
-- 翻译在 background **按观看会话串行**；带近期上下文、术语表、人物名线索；术语宜放在稳定 system 前缀以利缓存。
-- 双轨：可选草稿（本地 / DeepL / 自定义 HTTP）先上屏，主译覆盖；**晚到的草稿不得盖掉已定稿**。
+- 翻译在 background **按观看会话最新优先**（`enqueueLatest`：新字幕取消旧请求，不排队积压），全部走流式；带近期上下文、术语表、人物名线索；术语宜放在稳定 system 前缀以利缓存。存储写入不得挡在译文返回前面。请求期间语言对变了，答复一律丢弃、不进缓存（`throwIfPairChanged`）。
+- TextTrack 源提前预翻译后续几句（`src/background/cue-prefetcher.ts`，按顺序、一次一句）；屏上那句排在预翻译列表首位，后台用 `liveCueIds` 保证同一句**只请求一次**。页面 DOM 字幕在出现前不可知，不预翻译，也不为「提前拿到字幕」去读媒体请求。
+- 连接预热（`WARM_UP_TRANSLATOR`）只发不带 Key、不带文本的 `HEAD`，且只对这一页实际会用到的通道（会议走机器翻译通道时不碰大模型）。自建 WebSocket 用连接池复用已答复的连接，但**每条连接同一时间只跑一句**，取消/超时照旧关闭该连接——服务端看到的必须仍是一问一答。
+- 双轨：可选草稿（本地 / DeepL / 自定义 HTTP）先上屏，主译覆盖；**晚到的草稿不得盖掉已定稿**；草稿在屏时不让流式半句把它缩短。Netflix 只用 DeepL 时 DeepL 是终稿（`asFinal`：终稿时限、保留原样译文、套术语表），但 `meeting` 只由会议通道置位——影视会话不得被标成会议。Chrome 内置翻译对新语言对要求用户激活：`create()` 被拒后等页面上第一次点击/按键再建，不得因此永久关闭通道。
 - 会议模式默认**单通道终稿**（机器翻译 / 本机 MT），大模型是可选项；通道没配好要如实报错，**不得**偷偷回落到大模型。
 - YouTube：译开时可视觉隐藏原字幕，停译恢复。Netflix：会话内隐藏原字幕 + Overlay 粘性更新，防闪回日文。
 - MV3 worker 休眠：会话上下文用 `chrome.storage.session` 等现有机制恢复；离页清理。
@@ -79,7 +81,7 @@ npm run verify   # typecheck + test + build
 | 会议模式（判定 / 文案 / 本机记录） | `src/shared/meeting.ts`、`meeting-transcript.ts` |
 | 语言对与语言代码映射 | `src/shared/language.ts`（DeepL / LibreTranslate / Translator API 代码都在这里） |
 | Overlay 显示与原生字幕显隐 | `src/content/overlay.ts` 及站点分支 |
-| 主翻译协议 / 队列 / 缓存 | `src/background/translator.ts`、`translation-session` |
+| 主翻译协议 / 队列 / 缓存 / 预翻译 | `src/background/translator.ts`、`translation-session`、`cue-prefetcher.ts` |
 | 草稿通道 | `draft-translator.ts`、`local-mt.ts`、`fast-translator.ts` |
 | 设置与权限 UX | `src/options/*`、`src/shared/settings.ts` |
 | 消息形状 | `src/shared/messages.ts`、`types.ts` |
