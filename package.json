@@ -1,6 +1,6 @@
 {
   "name": "tranlithion-subtitle-translator",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Caption translation for YouTube / Netflix / Meet, plus crash-safe whole-page, selection and side-panel translation",
   "private": true,
   "type": "module",

@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Tranlithion 字幕翻译",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "在 YouTube / Netflix 视频字幕与 Google Meet 会议字幕上叠加译文；一键翻译整页（不改动页面结构）、划词翻译与侧边栏对照。",
   "permissions": [
     "storage",
