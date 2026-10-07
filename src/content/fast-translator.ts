@@ -4,9 +4,17 @@ import type {
   PlainTranslationResponse
 } from "../shared/messages";
 import { safeRuntimeSendMessage } from "../shared/extension-context";
-import { toShortLanguageCode } from "../shared/language";
 import { MEETING_FINAL_CHANNEL_TIMEOUT_MS } from "../shared/meeting";
 import { applyTerminology } from "../shared/terminology";
+import {
+  readTranslatorFactory,
+  translatorPair,
+  withTimeout,
+  type TranslatorAvailability,
+  type TranslatorFactory,
+  type TranslatorInstance,
+  type TranslatorLanguagePair
+} from "../shared/translator-api";
 import type {
   GlossaryEntry,
   PublicTranslationSettings,
@@ -66,40 +74,6 @@ export interface DraftChannel {
   awaitingActivation?(): boolean;
 }
 
-type TranslatorAvailability = "unavailable" | "downloadable" | "downloading" | "available";
-
-interface TranslatorLanguagePair {
-  sourceLanguage: string;
-  targetLanguage: string;
-}
-
-interface TranslatorInstance {
-  translate: (input: string) => Promise<string>;
-  destroy?: () => void;
-}
-
-interface TranslatorFactory {
-  availability: (options: TranslatorLanguagePair) => Promise<TranslatorAvailability>;
-  create: (options: TranslatorLanguagePair) => Promise<TranslatorInstance>;
-}
-
-/** Resolves to null instead of hanging or rejecting, whichever comes first. */
-function withTimeout<T>(work: Promise<T>, timeoutMs: number): Promise<T | null> {
-  return new Promise((resolve) => {
-    const timer = globalThis.setTimeout(() => resolve(null), timeoutMs);
-    const settle = (value: T | null) => {
-      globalThis.clearTimeout(timer);
-      resolve(value);
-    };
-    work.then(settle, () => settle(null));
-  });
-}
-
-/** The Translator API expects a base BCP-47 tag; `zh-CN` is rejected by some builds. */
-function toTranslatorLanguage(language: SourceLanguage | TargetLanguage): string {
-  return toShortLanguageCode(language);
-}
-
 /** Where the page's input events can be heard; absent outside a document. */
 function activationTarget(): Pick<EventTarget, "addEventListener" | "removeEventListener"> | null {
   const target = (globalThis as { window?: unknown }).window ?? globalThis;
@@ -115,20 +89,6 @@ function mayHaveUserActivation(): boolean {
   }).navigator;
   const isActive = navigatorLike?.userActivation?.isActive;
   return typeof isActive === "boolean" ? isActive : true;
-}
-
-function readTranslatorFactory(): TranslatorFactory | null {
-  const candidate = (globalThis as { Translator?: unknown }).Translator;
-  // Chrome exposes Translator as a class, so `typeof` is "function" rather than
-  // "object". Accept either shape and let the method probe below decide.
-  if (!candidate || (typeof candidate !== "object" && typeof candidate !== "function")) {
-    return null;
-  }
-  const factory = candidate as Partial<TranslatorFactory>;
-  if (typeof factory.availability !== "function" || typeof factory.create !== "function") {
-    return null;
-  }
-  return factory as TranslatorFactory;
 }
 
 export class DraftTranslator implements DraftChannel {
@@ -161,10 +121,7 @@ export class DraftTranslator implements DraftChannel {
      */
     private readonly terminology: () => GlossaryEntry[] = () => []
   ) {
-    this.pair = {
-      sourceLanguage: toTranslatorLanguage(sourceLanguage),
-      targetLanguage: toTranslatorLanguage(targetLanguage)
-    };
+    this.pair = translatorPair(sourceLanguage, targetLanguage);
   }
 
   /**

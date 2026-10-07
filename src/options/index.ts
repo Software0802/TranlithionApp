@@ -5,6 +5,7 @@ import {
   sampleSourceText
 } from "../shared/language";
 import { MEETING_HOST_PERMISSIONS, meetingTextDestination } from "../shared/meeting";
+import { pageTextDestination } from "../shared/page-translation";
 import { describeTranscriptSummary } from "../shared/meeting-transcript";
 import type {
   ExtensionMessage,
@@ -31,7 +32,10 @@ const targetLanguage = byId<HTMLSelectElement>("target-language");
 const showOriginal = byId<HTMLInputElement>("show-original-setting");
 const meetingMode = byId<HTMLInputElement>("meeting-mode");
 const meetingFinalChannel = byId<HTMLSelectElement>("meeting-final-channel");
-const meetingMascot = byId<HTMLInputElement>("meeting-mascot");
+const meetingSelectionToolbar = byId<HTMLInputElement>("meeting-selection-toolbar");
+const pageTranslateChannel = byId<HTMLSelectElement>("page-translate-channel");
+const pageDestination = byId<HTMLParagraphElement>("page-destination");
+const selectionToolbar = byId<HTMLInputElement>("selection-toolbar");
 const meetingOverlayHidden = byId<HTMLInputElement>("meeting-overlay-hidden");
 const meetingTranscript = byId<HTMLInputElement>("meeting-transcript");
 const meetingRetention = byId<HTMLSelectElement>("meeting-retention");
@@ -64,12 +68,14 @@ provider.addEventListener("change", renderProviderFields);
 draftProvider.addEventListener("change", renderProviderFields);
 draftCaptions.addEventListener("change", renderProviderFields);
 meetingFinalChannel.addEventListener("change", renderProviderFields);
+pageTranslateChannel.addEventListener("change", renderProviderFields);
 sourceLanguage.addEventListener("change", renderLanguagePair);
 targetLanguage.addEventListener("change", renderLanguagePair);
 // D7: the disclosure names a host read from these fields, so it has to follow
 // them as they are typed — otherwise it keeps naming the previous service.
 for (const field of [draftEndpoint, localMtUrl, apiBaseUrl, websocketUrl, model]) {
   field.addEventListener("input", renderMeetingDestination);
+  field.addEventListener("input", renderPageDestination);
 }
 toggleKey.addEventListener("click", toggleApiKeyVisibility);
 fontSize.addEventListener("input", renderRangeOutputs);
@@ -107,7 +113,9 @@ function hydrate(settings: TranslationSettings): void {
   showOriginal.checked = settings.showOriginal;
   meetingMode.checked = settings.meetingMode;
   meetingFinalChannel.value = settings.meetingFinalChannel;
-  meetingMascot.checked = settings.meetingMascot;
+  meetingSelectionToolbar.checked = settings.meetingSelectionToolbar;
+  pageTranslateChannel.value = settings.pageTranslateChannel;
+  selectionToolbar.checked = settings.selectionToolbar;
   meetingOverlayHidden.checked = settings.meetingOverlayHidden;
   meetingTranscript.checked = settings.meetingTranscript;
   meetingRetention.value = String(settings.meetingTranscriptRetentionDays);
@@ -143,6 +151,7 @@ function renderProviderFields(): void {
   );
   testButton.textContent = selected === "mock" ? "保存并运行演示测试" : `保存并测试「${sample}」`;
   renderMeetingDestination();
+  renderPageDestination();
 }
 
 /**
@@ -169,6 +178,20 @@ function renderMeetingDestination(): void {
     draftEndpointUrl: draftEndpoint.value || DEFAULT_SETTINGS.draftEndpointUrl,
     localMtUrl: localMtUrl.value || DEFAULT_SETTINGS.localMtUrl,
     provider: provider.value as TranslationSettings["provider"],
+    apiBaseUrl: apiBaseUrl.value || DEFAULT_SETTINGS.apiBaseUrl,
+    webSocketUrl: websocketUrl.value || DEFAULT_SETTINGS.webSocketUrl,
+    model: model.value
+  });
+}
+
+/** Where the text of a page the user translates goes, following the fields as they are typed. */
+function renderPageDestination(): void {
+  pageDestination.textContent = pageTextDestination({
+    pageTranslateChannel: pageTranslateChannel.value as TranslationSettings["pageTranslateChannel"],
+    draftProvider: draftProvider.value as TranslationSettings["draftProvider"],
+    provider: provider.value as TranslationSettings["provider"],
+    draftEndpointUrl: draftEndpoint.value || DEFAULT_SETTINGS.draftEndpointUrl,
+    localMtUrl: localMtUrl.value || DEFAULT_SETTINGS.localMtUrl,
     apiBaseUrl: apiBaseUrl.value || DEFAULT_SETTINGS.apiBaseUrl,
     webSocketUrl: websocketUrl.value || DEFAULT_SETTINGS.webSocketUrl,
     model: model.value
@@ -234,6 +257,16 @@ function buildSettings(): TranslationSettings {
   if (meetingMode.checked && meetingFinalChannel.value === "local-mt" && !localMtEnabled.checked) {
     throw new Error("会议译文通道选择了本机 LibreTranslate，请同时勾选下方「启用本机 LibreTranslate」。");
   }
+  if (pageTranslateChannel.value === "local-mt" && !localMtEnabled.checked) {
+    throw new Error("网页翻译通道选择了本机 LibreTranslate，请同时勾选下方「启用本机 LibreTranslate」。");
+  }
+  if (
+    pageTranslateChannel.value === "fast-mt" &&
+    draftProvider.value === "deepl" &&
+    !draftApiKey.value.trim()
+  ) {
+    throw new Error("网页翻译通道选择了 DeepL，请先在「草稿翻译 API Key」里填写 DeepL Key。");
+  }
   const languages = normalizeLanguagePair(
     normalizeLanguageTag(sourceLanguage.value, DEFAULT_SETTINGS.sourceLanguage),
     normalizeLanguageTag(targetLanguage.value, DEFAULT_SETTINGS.targetLanguage)
@@ -262,9 +295,11 @@ function buildSettings(): TranslationSettings {
     localMtUrl: localMtUrl.value.trim()
       ? validateUrl(localMtUrl.value, ["https:", "http:"], "本机翻译地址")
       : DEFAULT_SETTINGS.localMtUrl,
+    pageTranslateChannel: pageTranslateChannel.value as TranslationSettings["pageTranslateChannel"],
+    selectionToolbar: selectionToolbar.checked,
     meetingMode: meetingMode.checked,
     meetingFinalChannel: meetingFinalChannel.value as TranslationSettings["meetingFinalChannel"],
-    meetingMascot: meetingMascot.checked,
+    meetingSelectionToolbar: meetingSelectionToolbar.checked,
     meetingOverlayHidden: meetingOverlayHidden.checked,
     meetingTranscript: meetingTranscript.checked,
     meetingTranscriptRetentionDays: Number(meetingRetention.value)
@@ -307,10 +342,14 @@ async function requestEndpointPermission(settings: TranslationSettings): Promise
  * broken rather than unauthorized.
  */
 async function requestDraftPermission(settings: TranslationSettings): Promise<void> {
-  // Meeting mode can use this endpoint as its only translator, so the grant is
-  // needed even when draft captions themselves are switched off.
+  // Meeting mode and page translation can use this endpoint as their only
+  // translator, so the grant is needed even with draft captions switched off.
   const usedByMeeting = settings.meetingMode && settings.meetingFinalChannel === "fast-mt";
-  if ((!settings.draftCaptions && !usedByMeeting) || settings.draftProvider === "browser") {
+  const usedByPages = settings.pageTranslateChannel === "fast-mt";
+  if (
+    (!settings.draftCaptions && !usedByMeeting && !usedByPages) ||
+    settings.draftProvider === "browser"
+  ) {
     return;
   }
   const url = new URL(settings.draftEndpointUrl);

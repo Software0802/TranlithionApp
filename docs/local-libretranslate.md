@@ -1,8 +1,10 @@
-# 本机 LibreTranslate（全页 / 选区翻译）
+# 本机 LibreTranslate
 
-视频字幕（Netflix 等）继续走 DeepL。
-网页全文与选中文字默认走本机 LibreTranslate，不经过云端大模型。
-会议模式也可以把本机 LibreTranslate 选作会议译文通道：启用步骤、地址是否为回环地址决定的文本去向，见 README「会议模式」章节。
+视频字幕（Netflix 等）继续走草稿通道与主翻译服务。
+本机 LibreTranslate 是两个地方的可选通道：
+
+- **网页翻译**（整页 / 划词 / 侧边栏）：设置页「网页翻译通道」选「本机 LibreTranslate」。默认通道是 Chrome 内置本地翻译，不需要装 LibreTranslate；见 README「网页翻译」章节。
+- **会议模式**：「会议译文通道」选「本机 LibreTranslate」。启用步骤、地址是否为回环地址决定的文本去向，见 README「会议模式」章节。
 
 ## 要求
 
@@ -33,10 +35,10 @@ Python 模式日志：`tools/libretranslate/libretranslate.out.log` / `.err.log`
 ## 扩展里怎么配
 
 1. 打开 Tranlithion **选项**
-2. 开启 **本机翻译服务（LibreTranslate）**
+2. 在「本机 LibreTranslate」里勾选 **启用本机 LibreTranslate**
 3. 地址保持 `http://127.0.0.1:5000/translate`（一般不用改）
-4. 保存；若 Chrome 询问访问 `127.0.0.1` → **允许**
-5. 重新加载扩展，刷新要翻译的网页
+4. 在「网页翻译通道」（或「会议译文通道」）里选 **本机 LibreTranslate**
+5. 保存；若 Chrome 询问访问 `127.0.0.1` → **允许**
 
 ## 停止
 

@@ -15,6 +15,18 @@ export type TranslatorProvider = "openai-compatible" | "websocket" | "mock";
 export type MeetingFinalChannel = "fast-mt" | "local-mt" | "llm";
 
 /**
+ * Which service translates web page text — a whole page, a selection, or what
+ * is sent to the side panel.
+ *
+ * `browser` is Chrome's on-device model: the page's text never leaves the
+ * machine. The others reuse a channel the user already configured for
+ * captions (`local-mt` LibreTranslate, `fast-mt` the draft channel's DeepL or
+ * custom endpoint, `llm` the main translation service), and the options page
+ * names where each one sends the text.
+ */
+export type PageTranslateChannel = "browser" | "local-mt" | "fast-mt" | "llm";
+
+/**
  * Which service produces the immediate draft caption. `browser` runs Chrome's
  * on-device model inside the content script; the remote options run in the
  * background worker because they need a key the page must never see.
@@ -119,11 +131,16 @@ export interface TranslationSettings {
   draftEndpointUrl: string;
   draftApiKey: string;
   /**
-   * Local LibreTranslate (or compatible) for full-page / selection translation.
-   * Video captions keep using DeepL / the main provider.
+   * Local LibreTranslate (or compatible). It serves the `local-mt` page
+   * translation channel and the `local-mt` meeting channel; video captions
+   * keep using the draft channel and the main provider.
    */
   localMtEnabled: boolean;
   localMtUrl: string;
+  /** Where whole-page, selection and side-panel translation is sent. */
+  pageTranslateChannel: PageTranslateChannel;
+  /** Show the 「翻译 / 侧边栏」 buttons after the user selects text on a page. */
+  selectionToolbar: boolean;
   /**
    * Meeting mode. Only ever applies on a supported meeting host (currently
    * Google Meet web); every other page behaves exactly as before.
@@ -131,10 +148,11 @@ export interface TranslationSettings {
   meetingMode: boolean;
   meetingFinalChannel: MeetingFinalChannel;
   /**
-   * The selection mascot is off in meetings by default: the overlay is often
-   * inside a shared screen, and a floating sprite there is everyone's problem.
+   * The selection buttons are off in meetings by default: the page is often
+   * inside a shared screen, and anything floating over it there is everyone's
+   * problem. (Stored as `meetingMascot` before the buttons replaced the mascot.)
    */
-  meetingMascot: boolean;
+  meetingSelectionToolbar: boolean;
   /** One-click screen-share hide: overlay off, the site's own captions back. */
   meetingOverlayHidden: boolean;
   /** Keep a local bilingual transcript of the meeting. */

@@ -49,10 +49,20 @@
         </label>
       </section>
 
-      <section class="quick-controls" aria-label="网页翻译">
-        <button id="enable-hosts" class="secondary-button" type="button">启用全站</button>
-        <button id="translate-page" class="secondary-button" type="button">全页翻译</button>
-        <button id="restore-page" class="secondary-button" type="button">恢复原文</button>
+      <section class="page-controls" aria-labelledby="page-heading">
+        <div class="control-copy">
+          <p id="page-heading">网页翻译</p>
+          <span id="page-channel-note">正在读取网页翻译通道…</span>
+        </div>
+        <div class="page-actions">
+          <button id="toggle-page" class="primary-button" type="button">翻译整页</button>
+          <button id="open-side-panel" class="secondary-button" type="button">打开侧边栏</button>
+        </div>
+        <p class="control-hint">
+          <span id="shortcut-hint">快捷键可在 chrome://extensions/shortcuts 设置</span>。
+          选中文字后可点「翻译」或「侧边栏」。
+        </p>
+        <button id="enable-hosts" class="link-button" type="button">在所有网站启用划词按钮</button>
       </section>
 
       <section class="quick-controls" aria-label="字幕显示控制">

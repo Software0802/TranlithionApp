@@ -11,11 +11,18 @@ export function toLibreTranslateLang(language: LanguageTag): string {
 /**
  * Calls a local LibreTranslate-compatible `/translate` endpoint.
  * Never throws: returns null on timeout, network, or invalid payload.
+ *
+ * `pair` overrides the configured languages: a web page is translated from
+ * whichever language each string is written in.
  */
 export async function translateWithLibreTranslate(
   text: string,
   settings: TranslationSettings,
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  pair: { source: LanguageTag; target: LanguageTag } = {
+    source: settings.sourceLanguage,
+    target: settings.targetLanguage
+  }
 ): Promise<string | null> {
   const source = text.trim();
   if (!source || !settings.localMtEnabled) {
@@ -36,8 +43,8 @@ export async function translateWithLibreTranslate(
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         q: source,
-        source: toLibreTranslateLang(settings.sourceLanguage),
-        target: toLibreTranslateLang(settings.targetLanguage),
+        source: toLibreTranslateLang(pair.source),
+        target: toLibreTranslateLang(pair.target),
         format: "text"
       }),
       signal: controller.signal
@@ -62,28 +69,4 @@ export async function translateWithLibreTranslate(
     globalThis.clearTimeout(timer);
     signal?.removeEventListener("abort", onAbort);
   }
-}
-
-/** Translate many strings with limited concurrency to avoid flooding the local server. */
-export async function translateBatchWithLibreTranslate(
-  texts: string[],
-  settings: TranslationSettings,
-  concurrency = 4
-): Promise<Array<string | null>> {
-  const results: Array<string | null> = Array.from({ length: texts.length }, () => null);
-  let next = 0;
-
-  async function worker(): Promise<void> {
-    while (next < texts.length) {
-      const index = next;
-      next += 1;
-      results[index] = await translateWithLibreTranslate(texts[index] ?? "", settings);
-    }
-  }
-
-  const workers = Array.from({ length: Math.min(concurrency, Math.max(1, texts.length)) }, () =>
-    worker()
-  );
-  await Promise.all(workers);
-  return results;
 }

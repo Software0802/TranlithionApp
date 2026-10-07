@@ -179,6 +179,55 @@
           </div>
         </section>
 
+        <section class="settings-section" aria-labelledby="page-heading">
+          <div class="section-heading">
+            <h2 id="page-heading">网页翻译（整页 / 划词 / 侧边栏）</h2>
+            <p>
+              一键翻译整页：先翻屏幕上和附近的文字、分批请求、滚动到哪里翻到哪里。
+              只替换页面已有文字节点里的文字，不增删、不移动任何页面元素，
+              也不碰输入框、编辑器和代码，所以网页不会因为翻译而报错或白屏；恢复原文随时一键完成。
+              选中文字后，可以点「翻译」就地查看，或点「侧边栏」在 Chrome 侧边栏里对照阅读。
+            </p>
+          </div>
+
+          <div class="field">
+            <label for="page-translate-channel">网页翻译通道</label>
+            <select id="page-translate-channel" name="page-translate-channel">
+              <option value="browser">Chrome 内置本地翻译（默认，文字不离开这台电脑）</option>
+              <option value="local-mt">本机 LibreTranslate（见下方「本机 LibreTranslate」）</option>
+              <option value="fast-mt">机器翻译通道（上方「草稿翻译」里配置的 DeepL / 自定义服务）</option>
+              <option value="llm">大模型主翻译服务（质量最好，但最慢、按用量计费）</option>
+            </select>
+            <p class="hint">
+              网页翻译会自动识别每段文字是日语、英语还是中文，统一译成上方的「目标语言」；
+              已经是目标语言的文字不会发送。这里的选择同样用于划词翻译和侧边栏。
+              通道没配置好时会直接说明原因，不会偷偷换用别的服务。字幕术语表不用于网页翻译。
+            </p>
+          </div>
+
+          <div class="notice" role="note">
+            <strong>网页文字的去向</strong>
+            <p id="page-destination">正在读取当前配置…</p>
+          </div>
+
+          <label class="checkbox-field">
+            <input id="selection-toolbar" type="checkbox" />
+            <span>
+              <strong>选中文字后显示「翻译 / 侧边栏」按钮</strong>
+              <small>
+                选中文字不会自动翻译，点了按钮才会。关闭后仍可用右键菜单「在侧边栏翻译」。
+                要在所有网站上出现按钮，需在扩展弹窗里点「在所有网站启用划词」。
+              </small>
+            </span>
+          </label>
+
+          <p class="hint">
+            快捷键 <code>Alt+T</code>：翻译整页 / 显示原文（可在 <code>chrome://extensions/shortcuts</code> 修改）；
+            右键菜单也有「翻译整页 / 显示原文」。Chrome 内置本地翻译第一次在某个网站上使用某个语言对时，
+            Chrome 要求你在页面上点一次，页面右下角会出现「开始翻译」按钮。
+          </p>
+        </section>
+
         <section class="settings-section" aria-labelledby="meeting-heading">
           <div class="section-heading">
             <h2 id="meeting-heading">会议模式（Google Meet 网页版）</h2>
@@ -226,10 +275,10 @@
           </div>
 
           <label class="checkbox-field">
-            <input id="meeting-mascot" type="checkbox" />
+            <input id="meeting-selection-toolbar" type="checkbox" />
             <span>
-              <strong>会议中也显示 3D 精灵</strong>
-              <small>默认关闭：会议页面常被共享出去，精灵会出现在所有人的屏幕上。</small>
+              <strong>会议中也显示划词按钮</strong>
+              <small>默认关闭：会议页面常被共享出去，按钮会出现在所有人的屏幕上。</small>
             </span>
           </label>
 
@@ -269,12 +318,12 @@
 
         <section class="settings-section" aria-labelledby="local-mt-heading">
           <div class="section-heading">
-            <h2 id="local-mt-heading">本机翻译（全页 / 选区）</h2>
+            <h2 id="local-mt-heading">本机 LibreTranslate</h2>
             <p>
-              网页全文与选中文字走本机 LibreTranslate；视频字幕仍用上方 DeepL / 主服务。
-              上面的会议模式也可以把它选作会议译文通道：文本是否留在这台电脑，取决于下面填的地址
-              是不是回环地址（<code>localhost</code> / <code>127.x</code> / <code>::1</code>），
-              以「会议文本的去向」那一行为准。
+              「网页翻译通道」或「会议译文通道」选择本机 LibreTranslate 时使用；视频字幕仍用上方的草稿通道与主服务。
+              文本是否留在这台电脑，取决于下面填的地址是不是回环地址
+              （<code>localhost</code> / <code>127.x</code> / <code>::1</code>），
+              以「网页文字的去向」「会议文本的去向」为准。
               启动说明见仓库 <code>docs/local-libretranslate.md</code>。
             </p>
           </div>
@@ -282,7 +331,7 @@
             <input id="local-mt-enabled" type="checkbox" />
             <span>
               <strong>启用本机 LibreTranslate</strong>
-              <small>选中文字时 3D 精灵头顶冒泡；弹窗可一键全页翻译。</small>
+              <small>把它选作网页翻译或会议译文通道时需要勾选。</small>
             </span>
           </label>
           <label class="field">
