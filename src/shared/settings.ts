@@ -4,6 +4,7 @@ import type {
   DraftProvider,
   GlossaryEntry,
   MeetingFinalChannel,
+  PageTranslateChannel,
   PublicTranslationSettings,
   TranslationSettings,
   TranslatorProvider
@@ -36,12 +37,17 @@ export const DEFAULT_SETTINGS: TranslationSettings = {
   draftApiKey: "",
   localMtEnabled: true,
   localMtUrl: "http://127.0.0.1:5000/translate",
+  // Page text can be anything the user reads — mail, internal documents — so
+  // the default channel keeps it on the device. Sending pages to a cloud
+  // service is a choice the user makes in settings, where its host is named.
+  pageTranslateChannel: "browser",
+  selectionToolbar: true,
   // Meeting mode is opt-in: reading what people say in a call, and keeping it
   // on disk, starts when the user asks for it in settings — never because an
   // earlier all-sites permission happens to cover meet.google.com.
   meetingMode: false,
   meetingFinalChannel: "fast-mt",
-  meetingMascot: false,
+  meetingSelectionToolbar: false,
   meetingOverlayHidden: false,
   meetingTranscript: false,
   meetingTranscriptRetentionDays: DEFAULT_TRANSCRIPT_RETENTION_DAYS
@@ -57,6 +63,12 @@ const DRAFT_PROVIDERS = new Set<DraftProvider>(["browser", "deepl", "custom"]);
 const MEETING_FINAL_CHANNELS = new Set<MeetingFinalChannel>([
   "fast-mt",
   "local-mt",
+  "llm"
+]);
+const PAGE_TRANSLATE_CHANNELS = new Set<PageTranslateChannel>([
+  "browser",
+  "local-mt",
+  "fast-mt",
   "llm"
 ]);
 
@@ -197,6 +209,15 @@ export function normalizeSettings(value: unknown): TranslationSettings {
       DEFAULT_SETTINGS.localMtUrl,
       ["https:", "http:"]
     ),
+    pageTranslateChannel: PAGE_TRANSLATE_CHANNELS.has(
+      record.pageTranslateChannel as PageTranslateChannel
+    )
+      ? (record.pageTranslateChannel as PageTranslateChannel)
+      : DEFAULT_SETTINGS.pageTranslateChannel,
+    selectionToolbar:
+      typeof record.selectionToolbar === "boolean"
+        ? record.selectionToolbar
+        : DEFAULT_SETTINGS.selectionToolbar,
     meetingMode:
       typeof record.meetingMode === "boolean"
         ? record.meetingMode
@@ -206,10 +227,14 @@ export function normalizeSettings(value: unknown): TranslationSettings {
     )
       ? (record.meetingFinalChannel as MeetingFinalChannel)
       : DEFAULT_SETTINGS.meetingFinalChannel,
-    meetingMascot:
-      typeof record.meetingMascot === "boolean"
-        ? record.meetingMascot
-        : DEFAULT_SETTINGS.meetingMascot,
+    // Before the selection buttons replaced the mascot this was
+    // `meetingMascot`; a user who allowed the mascot in meetings keeps that.
+    meetingSelectionToolbar:
+      typeof record.meetingSelectionToolbar === "boolean"
+        ? record.meetingSelectionToolbar
+        : typeof record.meetingMascot === "boolean"
+          ? record.meetingMascot
+          : DEFAULT_SETTINGS.meetingSelectionToolbar,
     meetingOverlayHidden:
       typeof record.meetingOverlayHidden === "boolean"
         ? record.meetingOverlayHidden

@@ -1,6 +1,6 @@
 # 项目规则（Tranlithion 字幕翻译）
 
-Manifest V3 Chrome 扩展：在 YouTube / Netflix / Google Meet 等页已显示、**可访问**的文本字幕上同步叠加译文。语言对为 ja / en / zh-CN 三向互译。
+Manifest V3 Chrome 扩展：在 YouTube / Netflix / Google Meet 等页已显示、**可访问**的文本字幕上同步叠加译文；另有网页整页 / 划词 / 侧边栏翻译。语言对为 ja / en / zh-CN 三向互译（网页翻译按段自动识别这三种原文，译成设置的目标语言）。
 
 ## 阅读顺序
 
@@ -8,16 +8,17 @@ Manifest V3 Chrome 扩展：在 YouTube / Netflix / Google Meet 等页已显示�
 - 产品定位与设计原则：**`PRODUCT.md`**（冷静、低打扰；反仪表盘/反花哨特效）。
 - 本机 LibreTranslate 草稿通道：`docs/local-libretranslate.md`。
 - 会议模式（Google Meet）的启用步骤、译文通道、计时规则与本机记录保留策略：README「会议模式」章节。
+- 网页翻译（整页 / 划词 / 侧边栏）的入口、防崩溃做法、通道与文字去向：README「网页翻译」章节。
 - 改行为时同步更新 README / 本文件中过时的硬约束；不要只改代码不改文档。
 
 ## 仓库结构
 
 | 路径 | 职责 |
 | --- | --- |
-| `src/content/` | 内容脚本：适配器、字幕控制器、Overlay、页内/快译 |
+| `src/content/` | 内容脚本：适配器、字幕控制器、Overlay、划词按钮；`page/` 为整页翻译（分段、占位标签、通道、调度、状态行） |
 | `src/content/adapters/` | `text-track` / YouTube DOM / Netflix DOM / Meet DOM |
 | `src/background/` | MV3 service worker：主译、草稿译、本地 MT |
-| `src/popup/` `src/options/` | 弹窗与设置页 |
+| `src/popup/` `src/options/` `src/sidepanel/` | 弹窗、设置页、侧边栏翻译页 |
 | `src/shared/` | 设置、语言对、消息、字幕类型、会话、会议记录、扩展上下文安全封装 |
 | `src/demo/` | 演示页相关 |
 | `public/manifest.json` | 扩展清单（构建写入 `dist/`） |
@@ -32,6 +33,7 @@ Manifest V3 Chrome 扩展：在 YouTube / Netflix / Google Meet 等页已显示�
 - 会议场景**不**碰音频：无 tabCapture、无麦克风、无 ASR、无会议 SDK、不录制会议。
 - **不**伪造翻译成功：未配置服务、无字幕、超时/失败必须对用户说清楚（可保留已有可读草稿/上一句，避免把好译文换成吓人空白）。
 - V1 优先 **观看稳定与上下文一致**，不是「所有视频都强行能译」。
+- 网页翻译**只写页面已有文本节点的 `data`**：不新建、包裹、移动、删除任何节点（那正是 Chrome 自带翻译让 React 页面 `removeChild` 报错白屏的原因）；不碰表单控件、可编辑区、代码、`translate="no"` / `.notranslate` 与字幕区。页面反复改写的地方先降级为逐节点翻译，仍被改写就放手，不和页面抢。
 
 ## 安全与隐私
 
@@ -43,6 +45,7 @@ Manifest V3 Chrome 扩展：在 YouTube / Netflix / Google Meet 等页已显示�
 - 会议本机记录（`chrome.storage.local`，一场会议一个 `meeting-transcript:<sessionId>` 键）保留 7 天并自动过期；单行写入不得改写整库。写入失败要如实告知用户，不能静默丢弃。设置页必须写清会议文本发往哪个服务、存多久、如何清除。不得在文档或 UI 中声称「完全不留痕」。
 - 未勾选本机记录时，会话记忆**只在内存里留术语/重复句**：不得把原话或发言人姓名写进任何 `chrome.storage`（含 `storage.session` 的会话上下文）。这条对大模型通道同样成立，判定见 `keepsSpokenRecord`。取消勾选或清除会议记录时要**当场作废**这场会话记下的原话与发言人姓名（`forgetMeetingSessions` + 从 `storage.session` 上下文里剔除会议会话）；**只动会议会话**，别把影视标签页的上下文/缓存一起清掉（会话来源标在 `PersistedTranslationSession.meeting`）。取消勾选不删已写入的本机记录——那要按「立即清除全部会议记录」或等保留期到。会议三个机器翻译通道都先读会话记忆再发请求；它们不收术语表，由通道自己用 `applyTerminology`（严格大小写、仅 `asFinal`）把用户译名替换回译文——影视页草稿不得被改写。
 - 会话记忆按语言对隔离（`TranslationSessionStore.useLanguagePair`）：中途改语言对必须整块作废，旧目标语的缓存/上下文/译名不得当成新语言的结果。
+- 网页翻译默认 Chrome 内置本地翻译（文字不出本机）；换成 LibreTranslate / DeepL / 大模型时，设置页与弹窗须写明文字去向（`pageTextDestination`），通道没配好或额度用完要如实报错，**不得**偷偷换通道。侧边栏的内容只在侧边栏页面内存里、页面和后台的译文缓存只在内存里，不写入任何 `chrome.storage`。
 - 文档与提交中禁止真实 Key；示例用占位符。
 
 ## 运行时行为要点
@@ -59,6 +62,8 @@ Manifest V3 Chrome 扩展：在 YouTube / Netflix / Google Meet 等页已显示�
 - 会议模式默认**单通道终稿**（机器翻译 / 本机 MT），大模型是可选项；通道没配好要如实报错，**不得**偷偷回落到大模型。
 - YouTube：译开时可视觉隐藏原字幕，停译恢复。Netflix：会话内隐藏原字幕 + Overlay 粘性更新，防闪回日文。
 - MV3 worker 休眠：会话上下文用 `chrome.storage.session` 等现有机制恢复；离页清理。
+- 网页翻译按视口优先（IntersectionObserver，上下各 1.5 屏）、批量、去重；DeepL / 大模型通道用 `<t0>…</t0>` 占位标签整句翻译，标签顺序对不上就退回按片段，绝不移动节点。写回前核对节点仍是读到的原文。扫描按时间片（约 8ms）让出主线程。
+- 入口（弹窗 / `Alt+T` / 右键菜单）靠 `activeTab` 按需注入内容脚本；内容脚本有单实例守卫，先注册消息监听再读设置。`sidePanel.open()` 只能在用户手势里调用：后台处理 `SHOW_IN_SIDE_PANEL` 和右键菜单时必须在任何 `await` 之前同步调用它。
 
 ## 技术栈与命令
 
@@ -84,6 +89,7 @@ npm run verify   # typecheck + test + build
 | 主翻译协议 / 队列 / 缓存 / 预翻译 | `src/background/translator.ts`、`translation-session`、`cue-prefetcher.ts` |
 | 草稿通道 | `draft-translator.ts`、`local-mt.ts`、`fast-translator.ts` |
 | 设置与权限 UX | `src/options/*`、`src/shared/settings.ts` |
+| 网页翻译 / 划词 / 侧边栏 | `src/content/page/*`、`selection-toolbar.ts`、`src/shared/page-translation.ts`（通道、语言识别、去向文案）、`src/background/page-translation.ts`、`src/sidepanel/*` |
 | 消息形状 | `src/shared/messages.ts`、`types.ts` |
 
 ## 验证期望
@@ -98,7 +104,7 @@ npm run verify   # typecheck + test + build
 
 - 把 Key 下发到 content script 或页面 `window`。
 - 为「读到更多字幕」而注入破解、抓媒体请求或绕过 DRM 的代码。
-- 默认打开吵闹的调试 UI 抢占视频区（吉祥物/演示须可关且不挡观看）。
+- 默认打开吵闹的调试 UI 抢占视频区（演示页须可关且不挡观看；划词按钮只在用户选中文字后出现，会议页默认关闭）。
 
 ## Maintaining this file
 

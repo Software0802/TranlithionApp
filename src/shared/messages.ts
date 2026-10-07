@@ -1,3 +1,4 @@
+import type { LanguageTag } from "./language";
 import type {
   PublicTranslationSettings,
   RuntimeStatus,
@@ -11,9 +12,16 @@ import type {
 export type PageCommand =
   | "translate-page"
   | "restore-page"
+  /** Translates the page, or puts the original back if it is translated. */
+  | "toggle-page"
+  /** Reports whether the page is translated without changing anything. */
+  | "page-state"
   | "ensure-hosts"
   /** Grants only the meeting hosts and registers their content script. */
   | "enable-meeting-hosts";
+
+/** What the toolbar badge says about a tab's page translation. */
+export type PageTranslationBadgeState = "idle" | "working" | "translated" | "error";
 
 export type ExtensionMessage =
   | { type: "GET_PUBLIC_SETTINGS" }
@@ -52,7 +60,29 @@ export type ExtensionMessage =
     }
   /** `sessionId` marks a caption channel, whose session memory answers repeats. */
   | { type: "TRANSLATE_PLAIN"; text: string; sessionId?: string }
-  | { type: "TRANSLATE_PLAIN_BATCH"; texts: string[] }
+  /**
+   * Page or selection text for the configured page translation channel.
+   * `source` is the language the content script detected; the target is the
+   * configured one. `markup` strings carry `<t0>…</t0>` placeholder tags.
+   */
+  | { type: "TRANSLATE_TEXTS"; texts: string[]; source: LanguageTag; markup?: boolean }
+  /**
+   * The user chose to read a selection in the side panel. Sent from inside
+   * their click: the worker opens the panel before it awaits anything, while
+   * the click still counts as a user gesture.
+   */
+  | { type: "SHOW_IN_SIDE_PANEL"; text: string; source?: LanguageTag | null }
+  /**
+   * The side panel of `windowId` takes the selections sent while it was still
+   * opening. Each is handed over once: taking it removes it.
+   */
+  | { type: "GET_SIDE_PANEL_INBOX"; windowId?: number }
+  /** Worker → side panel: a selection to translate. The panel that takes it answers `{ received: true }`. */
+  | { type: "SIDE_PANEL_ENTRY"; entry: SidePanelEntry }
+  /** Content script → worker: drives the toolbar badge for this tab. */
+  | { type: "PAGE_TRANSLATION_STATE"; state: PageTranslationBadgeState }
+  /** Worker → content script: is a content script listening in this tab? */
+  | { type: "PING" }
   /**
    * A settled bilingual meeting line. The background worker owns both the
    * retention-limited transcript and the session's term memory, so the
@@ -68,7 +98,11 @@ export type ExtensionMessage =
     }
   | { type: "GET_MEETING_TRANSCRIPTS" }
   | { type: "CLEAR_MEETING_TRANSCRIPTS" }
-  | { type: "PAGE_COMMAND"; command: PageCommand };
+  /**
+   * `tabId` names the tab when the sender is not one — the popup acts on the
+   * active tab but is not itself a tab.
+   */
+  | { type: "PAGE_COMMAND"; command: PageCommand; tabId?: number };
 
 export interface MeetingTranscriptSummary {
   sessions: number;
@@ -98,10 +132,38 @@ export interface PlainTranslationResponse {
   error?: string;
 }
 
-export interface PlainBatchTranslationResponse {
+export interface TextsTranslationResponse {
   ok: boolean;
-  texts?: string[];
+  /** One per requested string, in order; null for a string that failed. */
+  texts?: Array<string | null>;
   error?: string;
+  /** The request failed but a later one may not (a timeout, a rate limit). */
+  retryable?: boolean;
+}
+
+/** A selection waiting to be translated in the side panel. */
+export interface SidePanelEntry {
+  id: string;
+  text: string;
+  /** Detected on the page, where the page's own language can settle it. */
+  source: LanguageTag | null;
+  /** Title of the tab it came from, shown under the entry. */
+  pageTitle: string;
+  /** The window whose side panel it is for; each window has its own panel. */
+  windowId: number | null;
+  at: number;
+}
+
+export interface SidePanelInboxResponse {
+  entries: SidePanelEntry[];
+}
+
+export interface PageCommandResponse {
+  ok: boolean;
+  message?: string;
+  error?: string;
+  /** Whether the page shows a translation after the command. */
+  translated?: boolean;
 }
 
 export interface SaveSettingsResponse {

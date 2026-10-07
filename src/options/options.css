@@ -15,6 +15,8 @@
 }
 
 * { box-sizing: border-box; }
+/* Author display rules must not override the hidden attribute. */
+[hidden] { display: none !important; }
 body { min-width: 320px; margin: 0; background: var(--bg); color: var(--ink); }
 button, input, select, textarea { font: inherit; }
 button { cursor: pointer; }

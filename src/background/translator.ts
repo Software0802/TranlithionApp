@@ -519,7 +519,7 @@ function streamingTokenBudget(text: string): number {
   return Math.min(400, Math.max(96, 64 + text.length * 2));
 }
 
-function shouldDisableDeepSeekThinking(settings: TranslationSettings): boolean {
+export function shouldDisableDeepSeekThinking(settings: TranslationSettings): boolean {
   try {
     return new URL(settings.apiBaseUrl).hostname === "api.deepseek.com" &&
       settings.model.toLocaleLowerCase().startsWith("deepseek-");
@@ -681,7 +681,7 @@ function translationSystemPrompt(
   ].join(" "), terminology);
 }
 
-function chatCompletionsEndpoint(baseUrl: string): string {
+export function chatCompletionsEndpoint(baseUrl: string): string {
   const normalized = baseUrl.replace(/\/$/, "");
   return normalized.endsWith("/chat/completions")
     ? normalized

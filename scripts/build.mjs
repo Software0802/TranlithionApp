@@ -18,6 +18,8 @@ const buildOptions = {
     resolve(sourceDirectory, "popup/popup.css"),
     resolve(sourceDirectory, "options/index.ts"),
     resolve(sourceDirectory, "options/options.css"),
+    resolve(sourceDirectory, "sidepanel/index.ts"),
+    resolve(sourceDirectory, "sidepanel/sidepanel.css"),
     resolve(sourceDirectory, "demo/index.ts"),
     resolve(sourceDirectory, "demo/demo.css")
   ],

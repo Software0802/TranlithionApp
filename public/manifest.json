@@ -2,8 +2,14 @@
   "manifest_version": 3,
   "name": "Tranlithion 字幕翻译",
   "version": "0.3.0",
-  "description": "在 YouTube / Netflix 视频字幕与 Google Meet 会议字幕上叠加译文；网页选中与全页翻译走本机 LibreTranslate。",
-  "permissions": ["storage", "activeTab", "scripting"],
+  "description": "在 YouTube / Netflix 视频字幕与 Google Meet 会议字幕上叠加译文；一键翻译整页（不改动页面结构）、划词翻译与侧边栏对照。",
+  "permissions": [
+    "storage",
+    "activeTab",
+    "scripting",
+    "sidePanel",
+    "contextMenus"
+  ],
   "host_permissions": [
     "https://www.youtube.com/*",
     "https://www.youtube-nocookie.com/*",
@@ -28,6 +34,18 @@
     "default_popup": "popup.html"
   },
   "options_page": "options.html",
+  "side_panel": {
+    "default_path": "sidepanel.html"
+  },
+  "commands": {
+    "translate-page": {
+      "suggested_key": {
+        "default": "Alt+T",
+        "mac": "Alt+T"
+      },
+      "description": "翻译整页 / 显示原文"
+    }
+  },
   "content_scripts": [
     {
       "matches": [
@@ -38,7 +56,9 @@
         "https://x.com/*",
         "https://twitter.com/*"
       ],
-      "js": ["content/index.js"],
+      "js": [
+        "content/index.js"
+      ],
       "run_at": "document_idle"
     }
   ],

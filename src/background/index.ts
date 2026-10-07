@@ -11,13 +11,23 @@ import {
   type ExtensionMessage,
   type MeetingTranscriptResponse,
   type PageCommand,
-  type PlainBatchTranslationResponse,
+  type PageCommandResponse,
+  type PageTranslationBadgeState,
   type PlainTranslationResponse,
   type SettingsResponse,
+  type SidePanelEntry,
+  type SidePanelInboxResponse,
   type TabStatusResponse,
-  type TestTranslationResponse
+  type TestTranslationResponse,
+  type TextsTranslationResponse
 } from "../shared/messages";
-import { sampleSourceText } from "../shared/language";
+import { isLanguageTag, sampleSourceText, type LanguageTag } from "../shared/language";
+import {
+  PAGE_MAX_ITEM_CHARS,
+  PAGE_MAX_REQUEST_CHARS,
+  PAGE_MAX_REQUEST_ITEMS,
+  resolvePageEngine
+} from "../shared/page-translation";
 import {
   isMeetingHost,
   keepsSpokenRecord,
@@ -59,10 +69,12 @@ import type {
 } from "../shared/types";
 import { CuePrefetcher } from "./cue-prefetcher";
 import { translateDraft } from "./draft-translator";
+import { translateWithLibreTranslate } from "./local-mt";
 import {
-  translateBatchWithLibreTranslate,
-  translateWithLibreTranslate
-} from "./local-mt";
+  clearPageTranslationCache,
+  PageTranslationError,
+  translatePageTexts
+} from "./page-translation";
 import {
   translateWithAgent,
   TranslatorError,
@@ -72,8 +84,16 @@ import {
 
 const SESSION_CONTEXT_STORAGE_KEY = "translation-session-context";
 const TAB_STATUS_STORAGE_KEY = "tab-runtime-status";
-/** Dynamic registration created by the popup's "启用全站" button. */
+/** Dynamic registration created by the popup's "在所有网站启用划词" button. */
 const ALL_PAGES_CONTENT_SCRIPT_ID = "tranlithion-all-pages";
+const ALL_SITES_ORIGINS = ["https://*/*", "http://*/*"];
+const MENU_TRANSLATE_PAGE = "tranlithion-translate-page";
+const MENU_SELECTION_SIDE_PANEL = "tranlithion-selection-side-panel";
+/** Selections waiting for the side panel to finish opening. */
+const SIDE_PANEL_INBOX_LIMIT = 10;
+const SIDE_PANEL_INBOX_TTL_MS = 2 * 60_000;
+/** Longest selection the side panel takes in one entry. */
+const SIDE_PANEL_MAX_CHARS = PAGE_MAX_ITEM_CHARS;
 /** How far ahead of playback one prefetch request may reach. */
 const MAX_PREFETCH_CUES = 5;
 /** A line longer than this is not a subtitle; it is not sent ahead of time. */
@@ -101,13 +121,16 @@ let settingsCache: TranslationSettings | null = null;
 let permissionCache:
   | { key: string; failure: TranslationFailure | null }
   | null = null;
+const sidePanelInbox: SidePanelEntry[] = [];
 
 chrome.runtime.onInstalled.addListener(() => {
   void initializeSettings().then(pruneStoredTranscripts);
+  installContextMenus();
 });
 
 chrome.runtime.onStartup.addListener(() => {
   void initializeSettings().then(pruneStoredTranscripts);
+  installContextMenus();
 });
 
 void initializeSettings().then(pruneStoredTranscripts);
@@ -116,6 +139,7 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
   if (areaName === "local" && changes[SETTINGS_STORAGE_KEY]) {
     settingsCache = null;
     permissionCache = null;
+    clearPageTranslationCache();
     void broadcastPublicSettings();
   }
 });
@@ -123,6 +147,40 @@ chrome.storage.onChanged.addListener((changes, areaName) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   tabStatuses.delete(tabId);
   void removePersistedTabStatus(tabId);
+});
+
+// Registered defensively: every entry point below is optional in older
+// Chrome builds, and a missing one must not take the caption path down.
+chrome.tabs.onUpdated?.addListener((tabId, changeInfo) => {
+  // A navigation leaves the translated page behind, and its badge with it.
+  if (changeInfo.status === "loading") {
+    setPageBadge(tabId, "idle");
+  }
+});
+
+chrome.contextMenus?.onClicked.addListener((info, tab) => {
+  if (info.menuItemId === MENU_SELECTION_SIDE_PANEL) {
+    void showSelectionInSidePanel(info.selectionText ?? "", null, tab);
+    return;
+  }
+  if (info.menuItemId === MENU_TRANSLATE_PAGE && tab?.id !== undefined) {
+    void runPageCommandInTab("toggle-page", tab.id);
+  }
+});
+
+chrome.commands?.onCommand.addListener((command, tab) => {
+  if (command === "translate-page" && tab?.id !== undefined) {
+    void runPageCommandInTab("toggle-page", tab.id);
+  }
+});
+
+// The popup asks for the all-sites grant itself, from the user's click. Its
+// window can close while Chrome shows the prompt, so the registration that
+// the grant allows happens here, whenever the grant arrives.
+chrome.permissions?.onAdded?.addListener((permissions) => {
+  if (permissions.origins?.some((origin) => ALL_SITES_ORIGINS.includes(origin))) {
+    void registerAllPagesScript();
+  }
 });
 
 chrome.runtime.onMessage.addListener((rawMessage: unknown, sender, sendResponse) => {
@@ -210,11 +268,26 @@ async function handleMessage(
     case "TRANSLATE_PLAIN": {
       return translatePlain(message.text, message.sessionId);
     }
-    case "TRANSLATE_PLAIN_BATCH": {
-      return translatePlainBatch(message.texts);
+    case "TRANSLATE_TEXTS": {
+      return translateTexts(message.texts, message.source, message.markup === true);
+    }
+    case "SHOW_IN_SIDE_PANEL": {
+      // Nothing may be awaited before the panel is asked to open: Chrome only
+      // allows it while the click that sent this message counts as a gesture.
+      return showSelectionInSidePanel(message.text, message.source ?? null, sender.tab);
+    }
+    case "GET_SIDE_PANEL_INBOX": {
+      return { entries: takeSidePanelEntries(message.windowId) } satisfies SidePanelInboxResponse;
+    }
+    case "PAGE_TRANSLATION_STATE": {
+      if (sender.tab?.id !== undefined) {
+        setPageBadge(sender.tab.id, message.state);
+      }
+      return { ok: true };
     }
     case "PAGE_COMMAND": {
-      return handlePageCommand(message.command, sender.tab?.id);
+      // The popup is not a tab, so it names the one it acts on.
+      return handlePageCommand(message.command, message.tabId ?? sender.tab?.id);
     }
     case "CLEAR_TRANSLATION_SESSION": {
       draftControllers.get(message.sessionId)?.abort();
@@ -761,23 +834,317 @@ async function translatePlain(
   return { ok: true, text: caption };
 }
 
-async function translatePlainBatch(texts: string[]): Promise<PlainBatchTranslationResponse> {
+/**
+ * Page and selection text, translated by the page channel from the language
+ * the page showed it in into the configured target language.
+ */
+async function translateTexts(
+  rawTexts: unknown,
+  rawSource: unknown,
+  markup: boolean
+): Promise<TextsTranslationResponse> {
   const settings = await getSettings();
   if (!settings.enabled) {
-    return { ok: false, error: "翻译已暂停。" };
+    return { ok: false, error: "翻译已暂停。请在扩展弹窗中重新开启。" };
   }
-  if (!settings.localMtEnabled) {
-    return { ok: false, error: "本机翻译服务未开启。" };
+  const texts = readPageTexts(rawTexts);
+  if (!texts || !isLanguageTag(rawSource)) {
+    return { ok: false, error: "页面发来的翻译请求格式不正确。" };
   }
-  if (await localMtPermissionMissing(settings)) {
-    return { ok: false, error: "尚未授权访问本机翻译服务地址。" };
+  const source: LanguageTag = rawSource;
+  const target = settings.targetLanguage;
+  if (source === target) {
+    return { ok: true, texts };
   }
-  const capped = texts.slice(0, 200);
-  const results = await translateBatchWithLibreTranslate(capped, settings, 4);
-  return {
-    ok: true,
-    texts: results.map((item, index) => item ?? capped[index] ?? "")
-  };
+  const blocked = await pageChannelProblem(settings);
+  if (blocked) {
+    return { ok: false, error: blocked };
+  }
+  try {
+    const translated = await translatePageTexts({ texts, source, target, markup, settings });
+    // Answers are cached under the pair they were asked in, so the cache is
+    // never wrong; but a page that asked in a language the user has since
+    // left gets nothing back to paint.
+    if ((await getSettings()).targetLanguage !== target) {
+      return { ok: false, error: "语言设置已更改，已丢弃旧语言的译文。", retryable: true };
+    }
+    return { ok: true, texts: translated };
+  } catch (error) {
+    if (error instanceof PageTranslationError) {
+      return { ok: false, error: error.message, retryable: error.retryable };
+    }
+    return { ok: false, error: "翻译过程中发生未知错误。", retryable: true };
+  }
+}
+
+function readPageTexts(value: unknown): string[] | null {
+  if (!Array.isArray(value) || value.length === 0 || value.length > PAGE_MAX_REQUEST_ITEMS) {
+    return null;
+  }
+  let chars = 0;
+  for (const text of value) {
+    if (typeof text !== "string" || text.length > PAGE_MAX_ITEM_CHARS) {
+      return null;
+    }
+    chars += text.length;
+  }
+  return chars <= PAGE_MAX_REQUEST_CHARS ? (value as string[]) : null;
+}
+
+/**
+ * Why the page channel cannot take a request right now, in words the user
+ * can act on — or null when it can. A channel that is not set up says so; it
+ * never quietly hands the page to another service.
+ */
+async function pageChannelProblem(settings: TranslationSettings): Promise<string | null> {
+  switch (resolvePageEngine(settings)) {
+    case "browser":
+      return "网页翻译通道是 Chrome 内置本地翻译，它在页面里运行。请刷新页面后重试。";
+    case "deepl":
+      if (!settings.draftApiKey) {
+        return "网页翻译通道选的是 DeepL，但还没有填写 DeepL API Key（设置页「草稿翻译 API Key」）。";
+      }
+      return draftPermissionProblem(settings);
+    case "custom":
+      return draftPermissionProblem(settings);
+    case "libretranslate":
+      if (!settings.localMtEnabled) {
+        return "网页翻译通道选的是本机 LibreTranslate，但它没有启用：请在设置里勾选「启用本机 LibreTranslate」。";
+      }
+      return (await localMtPermissionMissing(settings))
+        ? `尚未授权访问本机翻译服务 ${hostOf(settings.localMtUrl)}：请在设置页保存一次并允许。`
+        : null;
+    case "openai-compatible":
+    case "websocket":
+      return (await cachedPermissionFailure(settings))?.message ?? null;
+    case "mock":
+    default:
+      return null;
+  }
+}
+
+async function draftPermissionProblem(settings: TranslationSettings): Promise<string | null> {
+  return (await requiredDraftPermissionMissing(settings))
+    ? `尚未授权连接 ${hostOf(settings.draftEndpointUrl)}：请在设置页保存「网页翻译通道」，并在 Chrome 询问时允许。`
+    : null;
+}
+
+function hostOf(url: string): string {
+  try {
+    return new URL(url).host;
+  } catch {
+    return url;
+  }
+}
+
+/**
+ * Opens the side panel for a selection and hands the selection over.
+ *
+ * The panel is asked to open first and synchronously: Chrome only lets an
+ * extension open it in response to a user action, and this runs inside the
+ * click (on the page's button, or on the context menu) that asked for it.
+ * The text waits in a short-lived inbox, because a panel that is still
+ * loading cannot hear the message that follows.
+ */
+function showSelectionInSidePanel(
+  rawText: unknown,
+  source: LanguageTag | null,
+  tab: chrome.tabs.Tab | undefined
+): Promise<{ ok: boolean; error?: string }> {
+  const text = typeof rawText === "string" ? rawText.trim() : "";
+  if (tab?.id === undefined) {
+    return Promise.resolve({ ok: false, error: "没有可以打开侧边栏的标签页。" });
+  }
+  if (!text) {
+    return Promise.resolve({ ok: false, error: "没有选中任何文字。" });
+  }
+  if (text.length > SIDE_PANEL_MAX_CHARS) {
+    return Promise.resolve({
+      ok: false,
+      error: `选中的文字超过 ${SIDE_PANEL_MAX_CHARS} 字，请分段选择后再发送到侧边栏。`
+    });
+  }
+  if (typeof chrome.sidePanel?.open !== "function") {
+    return Promise.resolve({ ok: false, error: "这个 Chrome 版本不支持扩展侧边栏（需要 Chrome 116 或更新版本）。" });
+  }
+  let opening: Promise<void>;
+  try {
+    opening = chrome.sidePanel.open({ tabId: tab.id });
+  } catch (error) {
+    return Promise.resolve({ ok: false, error: `无法打开侧边栏：${errorText(error)}` });
+  }
+  const entry = queueSidePanelEntry({
+    text,
+    source: source && isLanguageTag(source) ? source : null,
+    pageTitle: tab.title ?? "",
+    windowId: tab.windowId ?? null
+  });
+  return opening.then(
+    () => {
+      deliverToSidePanel(entry);
+      return { ok: true };
+    },
+    (error: unknown) => ({ ok: false, error: `无法打开侧边栏：${errorText(error)}` })
+  );
+}
+
+function queueSidePanelEntry(input: Omit<SidePanelEntry, "id" | "at">): SidePanelEntry {
+  const entry: SidePanelEntry = { ...input, id: crypto.randomUUID(), at: Date.now() };
+  sidePanelInbox.push(entry);
+  sidePanelInbox.splice(0, Math.max(0, sidePanelInbox.length - SIDE_PANEL_INBOX_LIMIT));
+  return entry;
+}
+
+/**
+ * What a panel missed while it was opening, handed over once: the panel keeps
+ * its entries only while it is open, and one opened again later must not
+ * replay what an earlier one already showed.
+ */
+function takeSidePanelEntries(windowId: number | undefined): SidePanelEntry[] {
+  const now = Date.now();
+  const taken: SidePanelEntry[] = [];
+  const kept: SidePanelEntry[] = [];
+  for (const entry of sidePanelInbox) {
+    if (now - entry.at >= SIDE_PANEL_INBOX_TTL_MS) {
+      continue;
+    }
+    const forThisPanel =
+      windowId === undefined || entry.windowId === null || entry.windowId === windowId;
+    (forThisPanel ? taken : kept).push(entry);
+  }
+  sidePanelInbox.splice(0, sidePanelInbox.length, ...kept);
+  return taken;
+}
+
+/** Sent to whichever panel is open; the one that takes it answers, and it leaves the inbox. */
+function deliverToSidePanel(entry: SidePanelEntry): void {
+  try {
+    const sent = chrome.runtime.sendMessage?.({
+      type: "SIDE_PANEL_ENTRY",
+      entry
+    } satisfies ExtensionMessage) as Promise<unknown> | undefined;
+    void sent?.then(
+      (reply) => {
+        if ((reply as { received?: unknown } | undefined)?.received === true) {
+          const index = sidePanelInbox.findIndex((queued) => queued.id === entry.id);
+          if (index >= 0) {
+            sidePanelInbox.splice(index, 1);
+          }
+        }
+      },
+      () => undefined
+    );
+  } catch {
+    // No panel is open yet; it takes the entry from the inbox when it is.
+  }
+}
+
+/** Extension pages (the side panel, an open popup) hear runtime messages; tabs do not. */
+function sendToExtensionPages(message: ExtensionMessage): void {
+  try {
+    const sent = chrome.runtime.sendMessage?.(message) as Promise<unknown> | undefined;
+    void sent?.catch?.(() => undefined);
+  } catch {
+    // No extension page is open to hear it.
+  }
+}
+
+function installContextMenus(): void {
+  const menus = chrome.contextMenus;
+  if (!menus) {
+    return;
+  }
+  const ignoreError = () => void chrome.runtime.lastError;
+  menus.removeAll(() => {
+    ignoreError();
+    menus.create(
+      { id: MENU_TRANSLATE_PAGE, title: "翻译整页 / 显示原文", contexts: ["page"] },
+      ignoreError
+    );
+    menus.create(
+      { id: MENU_SELECTION_SIDE_PANEL, title: "在侧边栏翻译「%s」", contexts: ["selection"] },
+      ignoreError
+    );
+  });
+}
+
+/** The toolbar badge says which tab shows a translated page — in text, not only colour. */
+function setPageBadge(tabId: number, state: PageTranslationBadgeState): void {
+  const action = chrome.action;
+  if (!action?.setBadgeText) {
+    return;
+  }
+  const text = state === "translated" ? "译" : state === "working" ? "…" : state === "error" ? "!" : "";
+  void action.setBadgeText({ tabId, text }).catch(() => undefined);
+  if (text) {
+    void action
+      .setBadgeBackgroundColor({ tabId, color: state === "error" ? "#b3261e" : "#4d6b1f" })
+      .catch(() => undefined);
+  }
+}
+
+/**
+ * Runs a page command in a tab, putting the content script there first when
+ * the command needs one. `activeTab` covers that: the user just clicked the
+ * toolbar button, a context menu item or the shortcut for this very tab, so
+ * no site-wide permission is needed to translate the page in front of them.
+ */
+async function runPageCommandInTab(
+  command: PageCommand,
+  tabId: number
+): Promise<PageCommandResponse> {
+  if (command === "translate-page" || command === "toggle-page") {
+    const problem = await ensureContentScript(tabId);
+    if (problem) {
+      return { ok: false, error: problem };
+    }
+  }
+  try {
+    const result = (await chrome.tabs.sendMessage(tabId, {
+      type: "PAGE_COMMAND",
+      command
+    } satisfies ExtensionMessage)) as PageCommandResponse | undefined;
+    if (!result) {
+      return { ok: false, error: "页面没有响应，请刷新页面后重试。" };
+    }
+    return result;
+  } catch {
+    if (command === "page-state" || command === "restore-page") {
+      // No content script means nothing on the page was translated.
+      return { ok: true, translated: false };
+    }
+    return { ok: false, error: "无法与当前页面通信。请刷新页面后重试。" };
+  }
+}
+
+/** Null once a content script answers in the tab, otherwise why it cannot. */
+async function ensureContentScript(tabId: number): Promise<string | null> {
+  if (await contentScriptAnswers(tabId)) {
+    return null;
+  }
+  try {
+    await chrome.scripting.executeScript({ target: { tabId }, files: ["content/index.js"] });
+  } catch {
+    return "这个页面不允许扩展运行（例如 Chrome 内部页面、应用商店或 PDF 预览），无法翻译。";
+  }
+  for (let attempt = 0; attempt < 20; attempt += 1) {
+    if (await contentScriptAnswers(tabId)) {
+      return null;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 50));
+  }
+  return "页面脚本没有响应，请刷新页面后重试。";
+}
+
+async function contentScriptAnswers(tabId: number): Promise<boolean> {
+  try {
+    const answer = (await chrome.tabs.sendMessage(tabId, {
+      type: "PING"
+    } satisfies ExtensionMessage)) as { ok?: unknown } | undefined;
+    return answer?.ok === true;
+  } catch {
+    return false;
+  }
 }
 
 async function localMtPermissionMissing(settings: TranslationSettings): Promise<boolean> {
@@ -792,7 +1159,7 @@ async function localMtPermissionMissing(settings: TranslationSettings): Promise<
 async function handlePageCommand(
   command: PageCommand,
   tabId?: number
-): Promise<{ ok: boolean; error?: string; message?: string }> {
+): Promise<PageCommandResponse> {
   if (command === "enable-meeting-hosts") {
     // Only the meeting origins, never the all-sites grant: the user is
     // authorizing one meeting platform and should see exactly that domain.
@@ -824,54 +1191,49 @@ async function handlePageCommand(
   }
 
   if (command === "ensure-hosts") {
-    const granted = await chrome.permissions.request({
-      origins: ["https://*/*", "http://*/*", "http://127.0.0.1/*", "http://localhost/*"]
-    });
-    if (!granted) {
-      return { ok: false, error: "未获得网站访问授权。" };
+    // Granted by the popup, from the user's click; this only registers.
+    if (!(await chrome.permissions.contains({ origins: ALL_SITES_ORIGINS }))) {
+      return { ok: false, error: "未获得访问所有网站的授权。" };
     }
-    const registered = await registeredContentScriptIds();
-    if (registered.has(MEETING_CONTENT_SCRIPT_ID)) {
-      // Subsumed by the all-pages registration below; leaving it would inject
-      // the content script twice on Meet.
-      try {
-        await chrome.scripting.unregisterContentScripts({ ids: [MEETING_CONTENT_SCRIPT_ID] });
-      } catch {
-        // Nothing registered under that id after all.
-      }
-    }
-    if (!registered.has(ALL_PAGES_CONTENT_SCRIPT_ID)) {
-      try {
-        await chrome.scripting.registerContentScripts([
-          {
-            id: ALL_PAGES_CONTENT_SCRIPT_ID,
-            matches: ["https://*/*", "http://*/*"],
-            js: ["content/index.js"],
-            runAt: "document_idle",
-            persistAcrossSessions: true
-          }
-        ]);
-      } catch {
-        // Already registered from a previous grant.
-      }
-    }
-    return { ok: true, message: "全站权限已就绪，请刷新目标网页后再用。" };
+    await registerAllPagesScript();
+    return { ok: true, message: "已在所有网站启用划词翻译，刷新已打开的网页后生效。" };
   }
 
   if (tabId === undefined) {
     return { ok: false, error: "没有活动标签页。" };
   }
-  try {
-    const result = (await chrome.tabs.sendMessage(tabId, {
-      type: "PAGE_COMMAND",
-      command
-    } satisfies ExtensionMessage)) as { ok?: boolean; message?: string; error?: string } | undefined;
-    if (result && result.ok === false) {
-      return { ok: false, error: result.error ?? result.message ?? "页面操作失败。" };
+  return runPageCommandInTab(command, tabId);
+}
+
+/** Puts the content script on every site once the all-sites grant exists. */
+async function registerAllPagesScript(): Promise<void> {
+  if (!(await chrome.permissions.contains({ origins: ALL_SITES_ORIGINS }))) {
+    return;
+  }
+  const registered = await registeredContentScriptIds();
+  if (registered.has(MEETING_CONTENT_SCRIPT_ID)) {
+    // Subsumed by the all-pages registration below; leaving it would inject
+    // the content script twice on Meet.
+    try {
+      await chrome.scripting.unregisterContentScripts({ ids: [MEETING_CONTENT_SCRIPT_ID] });
+    } catch {
+      // Nothing registered under that id after all.
     }
-    return { ok: true, message: result?.message };
-  } catch {
-    return { ok: false, error: "无法与当前页面通信。请刷新页面后重试，或先点击「启用全站」。" };
+  }
+  if (!registered.has(ALL_PAGES_CONTENT_SCRIPT_ID)) {
+    try {
+      await chrome.scripting.registerContentScripts([
+        {
+          id: ALL_PAGES_CONTENT_SCRIPT_ID,
+          matches: ALL_SITES_ORIGINS,
+          js: ["content/index.js"],
+          runAt: "document_idle",
+          persistAcrossSessions: true
+        }
+      ]);
+    } catch {
+      // Already registered from a previous grant.
+    }
   }
 }
 
@@ -1280,6 +1642,8 @@ async function broadcastPublicSettings(): Promise<void> {
     type: "SETTINGS_UPDATED",
     settings: publicSettings(await getSettings())
   };
+  // The side panel follows the target language and channel as they change.
+  sendToExtensionPages(message);
   const tabs = await chrome.tabs.query({});
   await Promise.all(
     tabs.flatMap((tab) =>

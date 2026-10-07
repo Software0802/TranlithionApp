@@ -1,7 +1,7 @@
 {
   "name": "tranlithion-subtitle-translator",
   "version": "0.3.0",
-  "description": "Video captions via DeepL; page/selection via local LibreTranslate",
+  "description": "Caption translation for YouTube / Netflix / Meet, plus crash-safe whole-page, selection and side-panel translation",
   "private": true,
   "type": "module",
   "scripts": {

@@ -44,8 +44,8 @@ function lineInput(overrides: Partial<Parameters<typeof appendTranscriptLine>[1]
 }
 
 describe("meeting mode defaults", () => {
-  it("keeps the mascot out of meetings unless the user asks for it", () => {
-    expect(DEFAULT_SETTINGS.meetingMascot).toBe(false);
+  it("keeps the selection buttons out of meetings unless the user asks for them", () => {
+    expect(DEFAULT_SETTINGS.meetingSelectionToolbar).toBe(false);
   });
 
   it("defaults the meeting caption to the cheap machine-translation channel", () => {
@@ -86,7 +86,7 @@ describe("meeting mode defaults", () => {
     const settings = normalizeSettings({
       meetingMode: false,
       meetingFinalChannel: "local-mt",
-      meetingMascot: true,
+      meetingSelectionToolbar: true,
       meetingOverlayHidden: true,
       meetingTranscript: false,
       meetingTranscriptRetentionDays: 30
@@ -95,7 +95,7 @@ describe("meeting mode defaults", () => {
     expect(settings).toMatchObject({
       meetingMode: false,
       meetingFinalChannel: "local-mt",
-      meetingMascot: true,
+      meetingSelectionToolbar: true,
       meetingOverlayHidden: true,
       meetingTranscript: false,
       meetingTranscriptRetentionDays: 30
